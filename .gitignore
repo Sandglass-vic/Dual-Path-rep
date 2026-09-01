@@ -1,0 +1,46 @@
+# Secrets and local credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.token
+.credentials
+credentials/
+secrets/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Containers, models, and caches
+*.sqsh
+images/
+models/
+kv-cache/
+cache/
+.cache/
+
+# Experiment runtime artifacts
+logs/
+results/
+profiles/
+traces/generated/
+core
+core.*
+*.log
+*.prof
+*.nsys-rep
+*.sqlite
+
+# Editors and OS
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
