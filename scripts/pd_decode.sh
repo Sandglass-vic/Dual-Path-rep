@@ -7,10 +7,84 @@ set -euo pipefail
 
 IB_DEVICE=${IB_DEVICE:-mlx5_0}
 DECODE_PORT=${DECODE_PORT:-30000}
+MEM_FRACTION_STATIC=${MEM_FRACTION_STATIC:-0.75}
+CONTEXT_LENGTH=${CONTEXT_LENGTH:-4096}
+PD_TRANSFER_BACKEND=${PD_TRANSFER_BACKEND:-mooncake}
+HICACHE_STORAGE_BACKEND=${HICACHE_STORAGE_BACKEND:-file}
+DECODE_OFFLOAD_KVCACHE=${DECODE_OFFLOAD_KVCACHE:-${ENABLE_HICACHE_L3:-0}}
 if [[ -n ${DECODE_ID:-} ]]; then
   DECODE_LOG="$LOG_DIR/decode-$DECODE_ID.log"
 else
   DECODE_LOG="$LOG_DIR/decode.log"
+fi
+if [[ -n ${RUN_ID:-} ]]; then
+  DECODE_LOG="${DECODE_LOG%.log}-$RUN_ID.log"
+fi
+
+hicache_args=()
+if [[ ${ENABLE_HICACHE_L3:-0} == 1 ]]; then
+  : "${CACHE_DIR:?CACHE_DIR is required when ENABLE_HICACHE_L3=1}"
+  if [[ "$HICACHE_STORAGE_BACKEND" == file ]]; then
+    export SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR=$CACHE_DIR
+    hicache_extra_config='{"prefetch_threshold":64,"prefetch_timeout_base":10,"prefetch_timeout_per_ki_token":2}'
+  elif [[ "$HICACHE_STORAGE_BACKEND" == mooncake ]]; then
+    : "${MOONCAKE_MASTER:?MOONCAKE_MASTER is required for Mooncake HiCache}"
+    : "${MOONCAKE_TE_META_DATA_SERVER:?MOONCAKE_TE_META_DATA_SERVER is required}"
+    : "${MOONCAKE_OFFLOAD_FILE_STORAGE_PATH:?Mooncake FileStorage path is required}"
+    mkdir -p "$MOONCAKE_OFFLOAD_FILE_STORAGE_PATH"
+    hicache_extra_config=$(python - <<'PY'
+import json
+import os
+
+print(json.dumps({
+    "master_server_address": os.environ["MOONCAKE_MASTER"],
+    "metadata_server": os.environ["MOONCAKE_TE_META_DATA_SERVER"],
+    "local_hostname": os.environ["DECODE_HOST"],
+    "global_segment_size": os.environ.get(
+        "MOONCAKE_GLOBAL_SEGMENT_SIZE", "32gb"
+    ),
+    "protocol": os.environ.get("MOONCAKE_PROTOCOL", "rdma"),
+    "device_name": os.environ.get("MOONCAKE_DEVICE", ""),
+    "check_server": False,
+    "replica_num": 1,
+    "dfs_replica_num": 1,
+    "enable_ssd_offload": True,
+    "ssd_offload_path": os.environ["MOONCAKE_OFFLOAD_FILE_STORAGE_PATH"],
+}))
+PY
+)
+  else
+    echo "Unsupported HICACHE_STORAGE_BACKEND=$HICACHE_STORAGE_BACKEND" >&2
+    exit 2
+  fi
+  hicache_args=(
+    --page-size 64
+    --enable-metrics
+    --hicache-ratio "${HICACHE_RATIO:-1.2}"
+    --hicache-size 0
+    --hicache-mem-layout page_first_direct
+    --hicache-io-backend direct
+    --hicache-write-policy write_through
+    --hicache-storage-backend "$HICACHE_STORAGE_BACKEND"
+    --hicache-storage-prefetch-policy wait_complete
+    --hicache-storage-backend-extra-config
+    "$hicache_extra_config"
+  )
+fi
+if [[ "$DECODE_OFFLOAD_KVCACHE" == 1 ]]; then
+  if [[ ${ENABLE_HICACHE_L3:-0} != 1 ]]; then
+    echo "DECODE_OFFLOAD_KVCACHE=1 requires ENABLE_HICACHE_L3=1" >&2
+    exit 2
+  fi
+  hicache_args+=(--disaggregation-decode-enable-offload-kvcache)
+elif [[ "$DECODE_OFFLOAD_KVCACHE" != 0 ]]; then
+  echo "DECODE_OFFLOAD_KVCACHE must be 0 or 1" >&2
+  exit 2
+fi
+
+timing_args=()
+if [[ ${ENABLE_BENCHMARK_TIMING:-0} == 1 ]]; then
+  timing_args+=(--enable-request-time-stats-logging)
 fi
 
 mkdir -p "$LOG_DIR"
@@ -24,9 +98,11 @@ exec python -m sglang.launch_server \
   --tp-size 8 \
   --dtype bfloat16 \
   --kv-cache-dtype auto \
-  --context-length 4096 \
-  --mem-fraction-static 0.75 \
+  --context-length "$CONTEXT_LENGTH" \
+  --mem-fraction-static "$MEM_FRACTION_STATIC" \
   --disaggregation-mode decode \
-  --disaggregation-transfer-backend mooncake \
+  --disaggregation-transfer-backend "$PD_TRANSFER_BACKEND" \
   --disaggregation-ib-device "$IB_DEVICE" \
+  "${timing_args[@]}" \
+  "${hicache_args[@]}" \
   >"$DECODE_LOG" 2>&1

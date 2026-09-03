@@ -1,0 +1,156 @@
+#!/usr/bin/env bash
+# Formal 1P2D Mooncake Store dynamic full-rollout latency matrix.
+#SBATCH --job-name=qwen32b-1p2d-bench
+#SBATCH --partition=GAIA
+#SBATCH --nodes=3
+#SBATCH --ntasks=3
+#SBATCH --ntasks-per-node=1
+#SBATCH --gres=gpu:8
+#SBATCH --exclusive
+#SBATCH --time=06:00:00
+# Known platform-faulty nodes; keep in sync with docs/platform.md.
+#SBATCH --exclude=dgx-gaia-30,dgx-gaia-46,dgx-gaia-53
+#SBATCH --output=/mnt/lustre/users/sezhou/dual-path/logs/slurm-1p2d-benchmark-%j.out
+
+set -euo pipefail
+
+CODE_HOME=${CODE_HOME:-/labhome/sezhou/dual-path}
+RUNTIME_HOME=${RUNTIME_HOME:-/mnt/lustre/users/sezhou/dual-path}
+IMAGE=${IMAGE:-$RUNTIME_HOME/images/sglang:26.01-py3-mooncake0.3.13.post1-timing.sqsh}
+MODEL_DIR=${MODEL_DIR:-$RUNTIME_HOME/models/Qwen2.5-32B}
+LOG_DIR=${LOG_DIR:-$RUNTIME_HOME/logs/latency-benchmark/$SLURM_JOB_ID}
+RESULT_DIR=${RESULT_DIR:-$RUNTIME_HOME/results/latency-benchmark/$SLURM_JOB_ID}
+CACHE_DIR=${CACHE_DIR:-$RUNTIME_HOME/kv-cache/latency-benchmark/$SLURM_JOB_ID}
+REPO_RESULT_DIR=${REPO_RESULT_DIR:-$CODE_HOME/results/latency-benchmark/$SLURM_JOB_ID}
+IB_DEVICE=${IB_DEVICE:-mlx5_0}
+PREFILL_PORT=${PREFILL_PORT:-30000}
+DECODE_PORT=${DECODE_PORT:-30000}
+BOOTSTRAP_PORT=${BOOTSTRAP_PORT:-8998}
+ROUTER_PORT=${ROUTER_PORT:-8000}
+SERVER_TIMEOUT=${SERVER_TIMEOUT:-1200}
+REPETITIONS=${REPETITIONS:-3}
+MAX_TURNS=${MAX_TURNS:-0}
+TRAJECTORY_OFFSET=${TRAJECTORY_OFFSET:-0}
+MAX_LENGTHS=${MAX_LENGTHS:-"32"}
+AGENT_COUNTS=${AGENT_COUNTS:-"32 64 128"}
+ABLATION_PROFILE=${ABLATION_PROFILE:-full}
+PAPER_EXPAND_AGENTS=${PAPER_EXPAND_AGENTS:-1}
+PAPER_SYNTHETIC_APPEND_TOKENS=${PAPER_SYNTHETIC_APPEND_TOKENS:-1}
+ARCHITECTURE=1P2D
+
+# shellcheck source=scripts/ablation_profiles.sh
+source "$CODE_HOME/scripts/ablation_profiles.sh"
+# shellcheck source=scripts/pd_benchmark_lib.sh
+source "$CODE_HOME/scripts/pd_benchmark_lib.sh"
+apply_ablation_profile "$ABLATION_PROFILE"
+
+mapfile -t hosts < <(scontrol show hostnames "$SLURM_JOB_NODELIST")
+if [[ ${#hosts[@]} -ne 3 ]]; then
+  echo "Expected exactly three nodes, got: ${hosts[*]}" >&2
+  exit 1
+fi
+
+export PREFILL_HOST=${hosts[0]}
+export DECODE0_HOST=${hosts[1]}
+export DECODE1_HOST=${hosts[2]}
+export DECODE_HOSTS="$DECODE0_HOST $DECODE1_HOST"
+dualpath_export_common_env
+
+mkdir -p "$LOG_DIR" "$RESULT_DIR" "$CACHE_DIR" "$REPO_RESULT_DIR"
+cache_marker="$CACHE_DIR/.dual-path-test-cache-$SLURM_JOB_ID"
+touch "$cache_marker"
+printf '%s\n' "${hosts[@]}" >"$RESULT_DIR/nodes.txt"
+print_ablation_profile | tee "$RESULT_DIR/ablation-profile.env"
+printf 'ARCHITECTURE=%s\n' "$ARCHITECTURE" | tee -a "$RESULT_DIR/ablation-profile.env"
+
+step_pids=()
+cleanup() {
+  dualpath_stop_steps
+  if [[ -f "$cache_marker" ]]; then
+    rm -rf -- "$CACHE_DIR"
+    echo "Removed test KV cache: $CACHE_DIR"
+  fi
+}
+trap cleanup EXIT INT TERM
+
+launch_cluster() {
+  local run_id=$1
+  local run_cache_dir=$2
+  local start_mooncake_master=1
+  if [[ "$MEASURED_PREFILL_L3" == 0 && "$MEASURED_DECODE_OFFLOAD" == 0 ]]; then
+    start_mooncake_master=0
+  fi
+  export MOONCAKE_DFS_ROOT_DIR="$run_cache_dir/dfs"
+  export MOONCAKE_OFFLOAD_FILE_STORAGE_PATH="$run_cache_dir/client-init/prefill"
+  mkdir -p "$MOONCAKE_DFS_ROOT_DIR" "$MOONCAKE_OFFLOAD_FILE_STORAGE_PATH"
+  touch "$run_cache_dir/.dual-path-run-cache-$SLURM_JOB_ID"
+  export RUN_ID=$run_id
+
+  dualpath_container_srun "$PREFILL_HOST" \
+    env ENABLE_HICACHE_L3="$MEASURED_PREFILL_L3" \
+      START_MOONCAKE_MASTER="$start_mooncake_master" \
+      MOONCAKE_OFFLOAD_FILE_STORAGE_PATH="$run_cache_dir/client-init/prefill" \
+      bash scripts/pd_prefill_router.sh &
+  step_pids+=("$!")
+  prefill_step_pid=$!
+
+  dualpath_container_srun "$DECODE0_HOST" \
+    env ENABLE_HICACHE_L3="$MEASURED_DECODE_OFFLOAD" \
+      DECODE_OFFLOAD_KVCACHE="$MEASURED_DECODE_OFFLOAD" \
+      MOONCAKE_OFFLOAD_FILE_STORAGE_PATH="$run_cache_dir/client-init/decode-0" \
+      DECODE_ID=0 DECODE_HOST="$DECODE0_HOST" bash scripts/pd_decode.sh &
+  step_pids+=("$!")
+  decode0_step_pid=$!
+
+  dualpath_container_srun "$DECODE1_HOST" \
+    env ENABLE_HICACHE_L3="$MEASURED_DECODE_OFFLOAD" \
+      DECODE_OFFLOAD_KVCACHE="$MEASURED_DECODE_OFFLOAD" \
+      MOONCAKE_OFFLOAD_FILE_STORAGE_PATH="$run_cache_dir/client-init/decode-1" \
+      DECODE_ID=1 DECODE_HOST="$DECODE1_HOST" bash scripts/pd_decode.sh &
+  step_pids+=("$!")
+  decode1_step_pid=$!
+
+  dualpath_wait_for_url decode0 "http://$DECODE0_HOST:$DECODE_PORT" "$decode0_step_pid"
+  dualpath_wait_for_url decode1 "http://$DECODE1_HOST:$DECODE_PORT" "$decode1_step_pid"
+  dualpath_wait_for_url router "http://$PREFILL_HOST:$ROUTER_PORT" "$prefill_step_pid"
+  echo "$run_id cluster is healthy"
+}
+
+remove_run_cache() {
+  local run_cache_dir=$1
+  if [[ ! -f "$run_cache_dir/.dual-path-run-cache-$SLURM_JOB_ID" ]]; then
+    echo "Refusing to remove unmarked run cache: $run_cache_dir" >&2
+    return 1
+  fi
+  rm -rf -- "$run_cache_dir"
+  echo "Removed completed run KV cache: $run_cache_dir"
+}
+
+for max_len in $MAX_LENGTHS; do
+  dataset="$RUNTIME_HOME/test/dataset/dualpath_fake_${max_len}k.jsonl"
+  for repetition in $(seq 1 "$REPETITIONS"); do
+    for agents in $AGENT_COUNTS; do
+      run_dir="$RESULT_DIR/${max_len}k/agents-${agents}/rep-${repetition}"
+      run_id="${max_len}k-a${agents}-r${repetition}"
+      run_cache_dir="$CACHE_DIR/$run_id"
+      mkdir -p "$run_dir"
+      launch_cluster "$run_id" "$run_cache_dir"
+      dualpath_write_run_json \
+        "$run_dir/run.json" "$ARCHITECTURE" "$max_len" "$agents" "$repetition"
+      dualpath_run_replay \
+        "$dataset" "$agents" "$run_dir" \
+        "bench-${ARCHITECTURE,,}-${max_len}k-a${agents}-r${repetition}-"
+      dualpath_stop_steps
+      remove_run_cache "$run_cache_dir"
+    done
+  done
+done
+
+python "$CODE_HOME/scripts/collect_benchmark_metrics.py" \
+  --result-dir "$RESULT_DIR" \
+  --log-dir "$LOG_DIR" \
+  --repo-result-dir "$REPO_RESULT_DIR" \
+  --code-home "$CODE_HOME"
+
+echo "BENCHMARK_COMPLETE architecture=$ARCHITECTURE result_dir=$RESULT_DIR"
+echo "BENCHMARK_REPO_RESULTS=$REPO_RESULT_DIR"

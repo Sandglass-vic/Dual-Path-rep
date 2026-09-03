@@ -26,9 +26,11 @@ kv-cache/
 cache/
 .cache/
 
-# Experiment runtime artifacts
-logs/
+# Labhome repo-side experiment products (not Lustre runtime paths)
+# CODE_HOME/results/ and legacy CODE_HOME/artifacts/ — do not commit charts/CSV.
 results/
+artifacts/
+logs/
 profiles/
 traces/generated/
 core

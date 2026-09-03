@@ -1,0 +1,165 @@
+# Benchmark、workload 与观测规范
+
+> 返回 [文档索引](README.md)
+
+## Phase 5：论文瓶颈趋势
+
+完成 Phase 4 后执行以下基线矩阵：
+
+| 组别 | 架构 | 外部 KV | 用途 |
+|---|---|---|---|
+| U0 | Unified TP=8 | 关闭 | 模型计算基线 |
+| U1 | Unified TP=8 | Lustre L3 | 外存开销 |
+| P0 | 1P1D | 关闭 | PD 本身开销 |
+| P1 | 1P2D | 关闭 | Decode 扩展效果 |
+| B | 1P2D | 仅 PE 从 Lustre 读 | 论文 Basic 近似基线 |
+| O | 1P2D | 跳过 L3 读与 PD transfer | Oracle 近似上界 |
+
+主 workload：
+
+- Max Agent Length：32K、48K、64K；
+- 每档 500 条基础 trajectory；
+- 小规模 smoke：8、32 agents；
+- 论文 Figure 7 正式离线 batch size：512、1024、2048、4096 agents；
+- Append scale：`1×, 1.5×, 2×, 3×`；
+- Generation scale：`1×, 1.5×, 2×, 3×`；
+- 每个正式配置至少重复 3 次，报告中位数及 min/max 或置信区间；
+- 每组测试前明确采用 warm-cache 还是 cold-cache，二者不可混报。
+
+已根据论文 Table 2 生成三档各 500 条 length-only fake trajectory：
+
+```text
+/mnt/lustre/users/sezhou/dual-path/test/dataset/dualpath_fake_32k.jsonl
+/mnt/lustre/users/sezhou/dual-path/test/dataset/dualpath_fake_48k.jsonl
+/mnt/lustre/users/sezhou/dual-path/test/dataset/dualpath_fake_64k.jsonl
+```
+
+生成脚本为 `scripts/generate_fake_agent_traces.py`，完整统计解释、合成算法、
+JSONL schema 和重放要求见 `docs/fake_dataset.md`。论文公开的五个均值不能由
+固定 turn 数和固定 per-turn 长度同时满足，因此该数据使用 turn 数与每轮长度
+负相关的两个轨迹群体，并明确记录合成统计口径，不能宣称恢复了原始私有 trace。
+
+离线 replay：所有 agent 同时开始，记录最后一个 trajectory 完成时的 JCT。
+
+当 agent 数超过 500 时，严格采用论文附录 A.3 的扩增语义：采样已有 trajectory，
+在前面增加随机 `A1` 和 `g1=1` 的 synthetic round。当前 client 使用固定 seed
+均匀有放回采样；由于论文未公开 `A1` 长度，本项目将其作为显式参数记录。详见
+[Fake 数据集](fake_dataset.md#论文的-5004096-agents-扩增方法)。
+
+当前范围不包含 Poisson arrival 或 APS sweep；本阶段统一采用 barrier 同步启动的
+离线 replay，避免把 offered-load 与固定 agent 数混为同一横轴。
+
+### 1P2D+L3 latency matrix
+
+当前先执行一个成本受控的离线矩阵：
+
+```text
+架构：1P2D + Lustre L3
+数据档：32K / 48K / 64K
+Agents：4 / 8 / 16
+Turns：每条 trajectory 的前 4 轮
+Repetitions：3
+总 measured runs：27
+```
+
+该 `4/8/16 agents × 前4轮` 矩阵仅为工程 smoke/趋势测试。正式 Figure 7
+实验运行完整 trajectory，使用 `512/1024/2048/4096` agents，设置
+`MAX_TURNS=0`、`PAPER_EXPAND_AGENTS=1` 和 `TRAJECTORY_OFFSET=0`。
+
+正式入口已改为论文式动态 rollout：
+
+- 每个配置从独立、空的 Mooncake Store namespace 开始；
+- 不预先 populate，不重启进入 measured 阶段；
+- 不逐轮 flush L1/L2，不等待 L3 文件增长或静默；
+- 不设置固定 inter-turn sleep；
+- Decode 在 rollout 中持续把 KV 发布到 Mooncake Store，后续 turn 自然查询；
+- JCT 从 barrier 释放计到最后一条 trajectory 完成，不包含服务启动和清理。
+
+论文正文与附录没有描述“每轮调用服务端 cache flush”或“等待存储静默后再发
+下一轮”。相反，§4.1 说明 Decode 每形成一个完整 block（示例为 64 tokens）
+就立即持久化，§A.3 说明 agent 从 round 0 连续 replay 到最后一轮，§A.4 说明
+SGL(MC) 的 hit length 由 HiCache 与 Mooncake Store 内部状态决定。因此旧脚本
+中的 flush/sleep/storage wait 是本项目早期的命中归因手段，不是论文方法。
+
+Mooncake 的 `PutStart/PutEnd` 完整对象发布替代旧 SGLang file backend 的
+`.bin` 并发覆盖，因此不再使用 Decode scratch 目录规避 `Short read`。每个
+run 使用独立 DFS root 是实验间 cold-start 隔离，不是请求 critical path
+中的等待。Job 退出后仍删除该 Job 的临时 KV 目录。
+
+Job `65032` 是历史诊断矩阵：它使用 Populate/Measured、服务重启、cache flush
+和存储静默等待，只能用于早期正确性与趋势分析，不能作为论文性能结果，也不再
+是正式脚本的执行语义。
+
+必须注意：`32K/48K/64K` 是源数据集的 MaxLen 分类。按当前约定直接取原始前
+4 轮，因此实际 prompt context 远小于对应 MaxLen。图中必须标注实测
+`prompt_tokens_min/max`，不能将结果解释为请求已经达到 32K/48K/64K。
+
+JCT、TTFT、TTST、TPOT、ITL、cache hit、request/L3/P→D timing、两套 TTFT
+breakdown、字段和有效性阈值统一见 [指标规范](metrics.md)。本文只定义 workload
+和实验协议。
+
+实现入口：
+
+- `scripts/replay_fake_agent_traces.py`
+- `scripts/infra/patch_sglang_benchmark_timing.py`
+- `scripts/infra/build_benchmark_timing_image.sbatch`
+- `scripts/pd_1p1d_benchmark.sbatch` / `pd_1p2d_benchmark.sbatch` /
+  `pd_2p2d_benchmark.sbatch`
+- `scripts/collect_benchmark_metrics.py`
+- `scripts/summarize_latency_benchmark.py` / `summarize_ttft_fullchain.py`
+- `scripts/plot/`（`plot_agent_compare.py` 等）
+
+历史 Job `65032` 为旧 file-backend / 隔离口径矩阵，不得与正式 Mooncake
+动态 rollout 混报。指标与产物口径见 [指标规范](metrics.md)；仓库侧图表在
+`results/latency-benchmark/<JOBID>/`（`REPO_RESULT_DIR`，勿与 Lustre
+`RESULT_DIR` 混淆）。
+
+数据路径、实际 chunk 传输边界和 `ABLATION_PROFILE` 一键配置见
+[当前数据流与消融开关](dataflow-and-ablation.md)。
+
+## Benchmark 与观测
+
+### 服务 smoke benchmark
+
+先使用 SGLang 自带客户端验证端到端服务：
+
+```bash
+python -m sglang.bench_serving \
+  --backend sglang-oai \
+  --base-url "http://$PREFILL_HOST:8000" \
+  --model "$MODEL_DIR" \
+  --dataset-name random \
+  --random-input-len 4096 \
+  --random-output-len 128 \
+  --random-range-ratio 1 \
+  --num-prompts 80 \
+  --max-concurrency 16 \
+  --request-rate inf \
+  --output-file "$RESULT_DIR/smoke.jsonl" \
+  --output-details
+```
+
+稳态 serving benchmark 的 `num-prompts` 至少应为 `5 × max-concurrency`。该工具适合 smoke、TTFT/TPOT 与固定长度请求，不能替代论文的多轮 trajectory replay 客户端。
+
+多轮离线 replay 使用 `scripts/replay_fake_agent_traces.py`，其数据格式、调用方法
+和当前非流式指标限制见 [Fake 数据集文档](fake_dataset.md#6-生成和重放)。
+
+### 观测范围
+
+当前已自动采集的客户端、cache 和服务端 timing，以及尚未接入的 IB/Lustre/GPU
+硬件计数器，统一列在 [指标规范](metrics.md#7-当前自动采集流水线) 和
+[有效性检查](metrics.md#9-有效性检查)。环境与复现元数据见
+[复现与安全](reproducibility-and-security.md)。
+
+### 实验有效性检查
+
+每次正式运行前后检查：
+
+1. 所有节点 GPU/NIC 健康且无其他作业干扰；
+2. 模型和镜像完全一致；
+3. 采样参数固定，强制恰好生成 `gen_len`，忽略 EOS；
+4. trace 顺序和随机种子固定；
+5. cache 初始状态符合 cold/warm 定义；
+6. 服务错误率为 0，或明确报告失败；
+7. Lustre 未出现明显外部拥塞；若出现则废弃该次结果；
+8. 每次只改变一个主要变量。

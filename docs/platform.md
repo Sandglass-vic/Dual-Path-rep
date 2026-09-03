@@ -1,6 +1,6 @@
-# GAIA 实验平台记录
+# GAIA 平台、网络与 Lustre
 
-本文只记录与 DualPath 复现实验直接相关的平台事实、验证命令和待确认项。标记为“已实测”的信息来自 2026-08-31 的登录节点或一次 GAIA 计算节点探测；集群配置可能变化，正式实验应把同样的信息写入每个结果目录。
+> 返回 [文档索引](README.md)
 
 ## 1. Slurm
 
@@ -62,18 +62,41 @@ scontrol show job "$SLURM_JOB_ID"
 scontrol show hostnames "$SLURM_JOB_NODELIST"
 ```
 
-2026-09-01 的 2P2D 调试中发现两个节点级异常：
+### 已知故障节点（临时排除）
 
-- `dgx-gaia-30` 已获得整节点 GPU allocation，但 CUDA 初始化返回
-  `CUDA-capable device(s) is/are busy or unavailable`；
-- `dgx-gaia-46` 的 Enroot NVIDIA hook 报告找不到
-  `nvidia-container-cli`，Pyxis 容器无法启动。
+以下节点在本项目作业中曾出现平台级故障。在管理员确认恢复前，正式多节点
+作业一律排除，不要用改 SGLang / Mooncake 参数去掩盖：
 
-这两项是当时的平台状态，不代表节点永久不可用。自动化 smoke 若在模型加载前
-遇到相同错误，应保存日志、取消剩余 server step，并临时通过
-`sbatch --exclude=<nodes>` 重试，同时向平台管理员报告；不要通过修改 SGLang
-模型或 PD 参数掩盖节点故障。排除上述节点后，Job `64860` 在
-`dgx-gaia-[51-54]` 上完成 2P2D 验证。
+| 节点 | 首次相关 Job | 现象 |
+|---|---|---|
+| `dgx-gaia-30` | `64855` | 已拿到整节点 GPU allocation，CUDA 初始化仍报 `CUDA-capable device(s) is/are busy or unavailable` |
+| `dgx-gaia-46` | `64858` | Enroot NVIDIA hook 找不到 `nvidia-container-cli`，Pyxis 无法启动容器 |
+| `dgx-gaia-53` | `65566` | 32-agent 完整 rollout 中 Decode 突然停写日志；Router `HostUnreachable` / `No route to host`；Prefill `KVTransferError` 与 bootstrap 300 s 超时 |
+
+统一排除列表：
+
+```text
+dgx-gaia-30,dgx-gaia-46,dgx-gaia-53
+```
+
+正式 benchmark 脚本（`pd_1p1d_benchmark.sbatch` /
+`pd_1p2d_benchmark.sbatch` / `pd_2p2d_benchmark.sbatch`）已写入对应
+`#SBATCH --exclude=...`。临时覆盖提交时也应显式带上同一列表，例如：
+
+```bash
+sbatch --exclude=dgx-gaia-30,dgx-gaia-46,dgx-gaia-53 --time=08:00:00 \
+  scripts/pd_1p2d_benchmark.sbatch
+```
+
+自动化 smoke 若在模型加载前遇到同类节点错误：保存日志、取消剩余 server
+step，按上表扩大 exclude，并向平台管理员报告。排除 `dgx-gaia-30/46` 后，
+Job `64860` 曾在 `dgx-gaia-[51-54]` 完成 2P2D 验证。
+
+Job `65566` 细节：节点 `dgx-gaia-[51-53]`，Decode-1=`dgx-gaia-53` 约在
+`22:17:29` 失联（当时约 11 running / 8 transfer，token usage ≈ 0.34，无
+CUDA OOM/segfault/traceback）；客户端仅 2/32 trajectory 完成，其余为空流或
+短生成，正式汇总图未生成。Job `65592` 曾只排除 `dgx-gaia-53`，但又被分到
+含 `dgx-gaia-30` 的 `dgx-gaia-[29-31]`，因此取消后改为排除全部三节点重提。
 
 ## 2. 计算节点硬件
 
@@ -240,262 +263,11 @@ stripe 参数不能凭经验直接固定。先使用 1、4、8 个 OST 和 1 MiB
 
 不应通过删除系统 cache 或影响其他用户的方式制造 cold-cache。若无管理员支持，使用全新文件/key namespace，并在结果中说明其近似性。
 
-## 5. Enroot 与 Pyxis
+## 尚待确认的平台事项
 
-登录节点未发现 `enroot`，计算节点已实测：
-
-```text
-Enroot: /usr/bin/enroot
-版本: 3.2.0
-Pyxis: 已集成到 srun
-```
-
-`srun --help` 已确认支持：
-
-```text
---container-image=[USER@][REGISTRY#]IMAGE[:TAG]|PATH
---container-mounts=SRC:DST[:FLAGS][,SRC:DST...]
-```
-
-推荐预先把大镜像导入 Lustre 上的 `.sqsh`，避免每次作业重新拉取。项目当前指定的镜像源为 NVIDIA 内部 GitLab registry：
-
-```text
-gitlab-master.nvidia.com/dl/dgx/sglang:25.08-py3-devel
-```
-
-Enroot URI 使用 `#` 分隔 registry host 与 repository。私有 registry 的凭据应写入 `$HOME/.config/enroot/.credentials`，示意格式如下，其中占位符不能原样使用：
-
-```text
-machine gitlab-master.nvidia.com login <gitlab-user> password <access-token>
-```
-
-执行：
-
-```bash
-export ENROOT_CONFIG_PATH=$HOME/.config/enroot
-chmod 600 "$ENROOT_CONFIG_PATH/.credentials"
-
-enroot import \
-  --output /mnt/lustre/gaia/<user>/dual-path/images/sglang-25.08-py3-devel.sqsh \
-  'docker://gitlab-master.nvidia.com#dl/dgx/sglang:25.08-py3-devel'
-```
-
-容器 smoke test：
-
-```bash
-srun --partition=GAIA \
-  --nodes=1 \
-  --ntasks=1 \
-  --gres=gpu:8 \
-  --time=00:10:00 \
-  --container-image=/mnt/lustre/gaia/<user>/dual-path/images/sglang-25.08-py3-devel.sqsh \
-  --container-mounts=/mnt/lustre:/mnt/lustre \
-  --no-container-mount-home \
-  bash -lc '
-    nvidia-smi
-    python -c "import sglang, torch; print(sglang.__version__, torch.__version__)"
-  '
-```
-
-原则：
-
-- 正式作业使用 sqsh 的绝对路径；
-- 默认不使用 `--container-writable`；
-- 显式 mount 项目、模型、缓存和结果目录；
-- 不自动 mount home，避免把 credential 和无关文件带入容器；
-- 如确需 Hugging Face、NGC 或内部 GitLab token，只挂载最小只读 credential 文件；
-- 导入后记录 `sha256sum`，不要仅记录可变 tag。
-
-`25.08-py3-devel` 是当前用户指定的内部开发镜像。tag 中的年月不能证明其内部 SGLang 源码比公开镜像更新，因此导入后必须记录：
-
-```bash
-sha256sum "$IMAGE_DIR/sglang-25.08-py3-devel.sqsh"
-python -c 'import sglang; print(sglang.__version__)'
-git -C /opt/sglang rev-parse HEAD 2>/dev/null || true
-```
-
-若镜像没有保留 `.git`，至少记录 `/opt/sglang` 的版本文件、Python package version 及 PD/HiCache 参数探测结果。参考脚本提到的 `sglang-25.11.sqsh` 路径已实测不存在，不能直接作为当前实验依赖。
-
-## 6. 软件状态
-
-裸计算节点环境中未安装 Python `sglang` 和 `mooncake` 包，实验依赖必须来自容器或项目自建环境。
-
-每个候选容器都要记录：
-
-```bash
-python - <<'PY'
-import torch
-import sglang
-print("sglang", sglang.__version__)
-print("torch", torch.__version__)
-print("cuda", torch.version.cuda)
-PY
-
-python -m sglang.launch_server --help
-python -m sglang_router.launch_router --help
-nvidia-smi
-```
-
-还需确认：
-
-- `mooncake-transfer-engine` 是否可 import；
-- Router 是否已包含在镜像；
-- PD backend 支持 `mooncake` 或 `nixl`；
-- HiCache 是否支持 `file`、`mooncake` 和 dynamic backend；
-- Qwen2.5-32B、BF16、TP=8、64K context 的兼容性；
-- NCCL 是否正确选择 8 个 compute NIC。
-
-## 7. 1P2D 的平台资源布局
-
-推荐最初使用三个完整 DGX 节点：
-
-```text
-Prefill node: 8 × H100，TP=8
-Decode node 0: 8 × H100，TP=8
-Decode node 1: 8 × H100，TP=8
-Router: 与 Prefill 同节点，绑定少量 CPU
-```
-
-这样与论文的 Qwen SGLang 基线 `TP=8` 对齐，也避免在同一节点混放 P/D 导致 HBM、PCIe、NIC 和 CPU 资源互相干扰。
-
-建议绑定：
-
-- SGLang 模型进程使用整节点 GPU；
-- Lustre 走 `mlx5_1`（由系统路由决定）；
-- PD transfer 显式选择 compute-fabric device，初测可用 `mlx5_0`；
-- Router 不占 GPU；
-- 指标采集进程限制 CPU，避免影响 SGLang。
-
-若三个并行 `srun` step 无法同时启动，检查 step 的 `--exclusive`、节点约束和 GPU TRES 分配。不要通过重复启动三个独立 allocation 代替同一 1P2D 作业，否则节点生命周期和失败清理更难控制。
-
-## 8. 平台基线与实验记录模板
-
-每次正式实验在结果目录保存：
-
-```text
-metadata/
-├── slurm_job.txt
-├── nodes.txt
-├── nvidia_smi.txt
-├── nvidia_topo.txt
-├── ib_devices.txt
-├── routes.txt
-├── lustre_mount.txt
-├── lustre_stripe.txt
-├── container_versions.txt
-├── container_sha256.txt
-└── command_and_env.txt
-```
-
-`command_and_env.txt` 必须过滤以下内容：
-
-- NGC API Key；
-- Hugging Face token；
-- `.credentials` 内容；
-- 其他 bearer token、密码和私钥。
-
-推荐的结果元数据字段：
-
-```text
-timestamp
-slurm_job_id
-node_names
-git_commit
-model_id
-model_revision
-image_path
-image_sha256
-sglang_version
-cuda_version
-driver_version
-transfer_backend
-pd_ib_device
-lustre_path
-lustre_stripe_count
-lustre_stripe_size
-precision
-kv_dtype
-tp_size
-pd_ratio
-context_length
-trace_id
-seed
-cache_state
-```
-
-## 9. 已确认事实与待确认事项
-
-已确认：
-
-- GAIA 使用 Slurm，默认分区为 `GAIA`；
-- 一个标准节点有 8 × H100 80GB、约 2 TiB DRAM；
-- 计算节点有 Enroot 3.2.0 和 Pyxis；
-- 计算节点有 `/raid` 本地盘与 `/mnt/lustre` 共享 Lustre；
-- Lustre 在登录节点不可见；
-- 实测节点有 8 个 active 400G compute-fabric 候选 NIC；
-- Lustre 路由使用一个 active 200G device `mlx5_1`；
-- 裸节点不提供 SGLang/Mooncake Python 包；
-- 当前用户尚无已确认的 Lustre 项目目录；
-- 可从内部 registry 获取 `dl/dgx/sglang:25.08-py3-devel`；
-- 参考的 `sglang-25.11.sqsh` 文件当前不存在。
-
-待确认，确认后应更新本文：
-
-1. 当前用户正式的 Lustre 路径、quota 和 inode 限额；
-2. 模型 checkpoint 的实际路径与 revision；
-3. `sglang-25.08-py3-devel.sqsh` 导入结果和 SHA-256；
-4. 容器内 SGLang、Mooncake、NIXL、CUDA、NCCL 版本；
-5. 三节点间 PD transfer 的最佳 IB device/list；
-6. Lustre 的推荐 stripe 与实测单节点/三节点带宽；
-7. 用户是否有权限获取 Lustre OST 与 IB port telemetry；
-8. 是否允许配置 IB QoS/VL，及需要联系的管理员；
-9. `/raid` 的清理和持久化策略；
-10. GAIA 作业的推荐 CPU/NUMA 绑定参数。
-
-## 10. Git 管理
-
-项目根目录 `/labhome/sezhou/dual-path` 使用 Git 管理。Git 只保存代码、配置模板、文档和小型结果摘要，不保存大文件与运行时数据。
-
-应纳入版本控制：
-
-- `docs/` 中的 Markdown 文档；
-- Slurm/Enroot 启动脚本；
-- trace 生成器、replay client、指标采集和分析代码；
-- 不含凭据的配置样例；
-- 实验 manifest 和小型汇总结果。
-
-默认不纳入版本控制：
-
-- `*.sqsh` 容器镜像；
-- 模型权重及 Hugging Face cache；
-- KV-cache block、segment 和索引；
-- 原始 benchmark 日志、profile、core dump；
-- `.credentials`、`.env`、token 和私钥；
-- 大型 trace 和原始结果。
-
-每次正式实验记录当前代码版本：
-
-```bash
-git status --short
-git rev-parse HEAD
-git diff --stat
-```
-
-若工作区非 clean，必须将 `git diff` 随实验元数据归档；推荐正式结果只从已提交 commit 运行。镜像、模型、trace 和数据不依赖 Git 文件内容寻址，应在 manifest 中额外记录 SHA-256 或仓库 revision。
-
-论文 PDF 属于静态研究输入，可以直接纳入 Git；若后续加入大量论文或大于仓库政策限制的二进制文件，再启用 Git LFS。不要在没有配置远端 LFS 的情况下只提交 LFS pointer。
-
-## 11. 安全说明
-
-参考脚本中包含明文 NGC API Key。该凭据已经暴露在普通文本中，应视为泄露：
-
-1. 在 NGC API Keys 页面立即吊销；
-2. 生成新 key；
-3. 仅写入 `$HOME/.config/enroot/.credentials`；
-4. 执行 `chmod 600`；
-5. 检查 shell history、作业日志和版本库中是否还有副本；
-6. 不在本文或后续脚本中填写真实 token。
-
-内部 GitLab access token 采用相同规则，并确保 `.credentials`、`.env` 和本地 secret 文件被 `.gitignore` 排除。
-
-本文不会记录登录节点 IP、个人凭据或未经当前环境验证的网络拓扑宣传资料。对于会影响结论的平台信息，以作业节点实时采集结果为准。
+1. Lustre quota、inode 限额、stripe 和单/多节点带宽；
+2. 64K context 的容器兼容性和资源余量；
+3. 多节点 PD transfer 的最佳 IB device/list；
+4. OST 与 IB port telemetry 权限；
+5. IB QoS/VL 配置权限与管理员流程；
+6. `/raid` 清理策略以及推荐 CPU/NUMA 绑定。
