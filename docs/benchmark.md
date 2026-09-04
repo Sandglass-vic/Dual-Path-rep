@@ -34,7 +34,7 @@
 /mnt/lustre/users/sezhou/dual-path/test/dataset/dualpath_fake_64k.jsonl
 ```
 
-生成脚本为 `scripts/generate_fake_agent_traces.py`，完整统计解释、合成算法、
+生成脚本为 `scripts/benchmark/generate_fake_agent_traces.py`，完整统计解释、合成算法、
 JSONL schema 和重放要求见 `docs/fake_dataset.md`。论文公开的五个均值不能由
 固定 turn 数和固定 per-turn 长度同时满足，因此该数据使用 turn 数与每轮长度
 负相关的两个轨迹群体，并明确记录合成统计口径，不能宣称恢复了原始私有 trace。
@@ -101,13 +101,14 @@ breakdown、字段和有效性阈值统一见 [指标规范](metrics.md)。本�
 
 实现入口：
 
-- `scripts/replay_fake_agent_traces.py`
+- `scripts/benchmark/replay_fake_agent_traces.py`
 - `scripts/infra/patch_sglang_benchmark_timing.py`
 - `scripts/infra/build_benchmark_timing_image.sbatch`
 - `scripts/pd_1p1d_benchmark.sbatch` / `pd_1p2d_benchmark.sbatch` /
   `pd_2p2d_benchmark.sbatch`
-- `scripts/collect_benchmark_metrics.py`
-- `scripts/summarize_latency_benchmark.py` / `summarize_ttft_fullchain.py`
+- `scripts/benchmark/collect_benchmark_metrics.py`
+- `scripts/benchmark/summarize_latency_benchmark.py` /
+  `scripts/benchmark/summarize_ttft_fullchain.py`
 - `scripts/plot/`（longest/all-trajectories 与 task 级 JCT 作图）
 
 三个正式 sbatch 都接受任意长度的 dataset、agent 和 repetition 配置。标准
@@ -157,7 +158,7 @@ python -m sglang.bench_serving \
 
 稳态 serving benchmark 的 `num-prompts` 至少应为 `5 × max-concurrency`。该工具适合 smoke、TTFT/TPOT 与固定长度请求，不能替代论文的多轮 trajectory replay 客户端。
 
-多轮离线 replay 使用 `scripts/replay_fake_agent_traces.py`，其数据格式、调用方法
+多轮离线 replay 使用 `scripts/benchmark/replay_fake_agent_traces.py`，其数据格式、调用方法
 和当前非流式指标限制见 [Fake 数据集文档](fake_dataset.md#6-生成和重放)。
 
 ### 观测范围

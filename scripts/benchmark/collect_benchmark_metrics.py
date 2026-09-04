@@ -85,11 +85,12 @@ def main() -> None:
         help="Labhome repo-side charts/aggregates under CODE_HOME/results/",
     )
     parser.add_argument(
-        "--code-home", type=Path, default=Path(__file__).resolve().parents[1]
+        "--code-home", type=Path, default=Path(__file__).resolve().parents[2]
     )
     args = parser.parse_args()
 
     scripts = args.code_home / "scripts"
+    benchmark_dir = scripts / "benchmark"
     plot_dir = scripts / "plot"
     args.repo_result_dir.mkdir(parents=True, exist_ok=True)
     summary_dir = args.result_dir / "summary"
@@ -98,7 +99,7 @@ def main() -> None:
     run(
         [
             sys.executable,
-            str(scripts / "summarize_latency_benchmark.py"),
+            str(benchmark_dir / "summarize_latency_benchmark.py"),
             "--result-dir",
             str(args.result_dir),
             "--log-dir",
@@ -140,7 +141,7 @@ def main() -> None:
         run(
             [
                 sys.executable,
-                str(scripts / "summarize_ttft_fullchain.py"),
+                str(benchmark_dir / "summarize_ttft_fullchain.py"),
                 "--rounds",
                 str(run_dir / "rounds.jsonl"),
                 "--log-dir",

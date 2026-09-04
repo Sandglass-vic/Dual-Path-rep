@@ -137,7 +137,7 @@ SGLang 固定 `stream_interval=1`。如果单个 SSE payload 同时新增多个 
 ### 代表轨迹（trajectory-* 图）
 
 `longest-trajectory/` **不是**多 agent 平均，而是
-`collect_benchmark_metrics.py` 选出的 **一条最长轨迹**：
+`scripts/benchmark/collect_benchmark_metrics.py` 选出的 **一条最长轨迹**：
 
 1. 读该 run 的 `trajectories.jsonl`；
 2. 取 `elapsed_seconds`（trajectory JCT）最大的 `trajectory_id`，再以
@@ -338,7 +338,8 @@ abs(accounting_error_seconds) <= 1e-6
 turn 特写；本仓库 breakdown 图是 **离线全量 request 均值 × #Agents**，横轴也
 不是 APS。当前 `benchmark.md` 明确尚未做 APS sweep。
 
-正式路径不输出单轨迹 fullchain 切片。`collect_benchmark_metrics.py` 对每个
+正式路径不输出单轨迹 fullchain 切片。
+`scripts/benchmark/collect_benchmark_metrics.py` 对每个
 dataset/agents/rep 分别生成该 run 的全量 fullchain。
 
 ## 7. 当前自动采集流水线
@@ -351,7 +352,7 @@ scripts/pd_1p2d_benchmark.sbatch
 scripts/pd_2p2d_benchmark.sbatch
 ```
 
-Job 结束时统一调用 `collect_benchmark_metrics.py`。
+Job 结束时统一调用 `scripts/benchmark/collect_benchmark_metrics.py`。
 
 三个入口统一接受 `TASK_NAME`、`DATASETS`、`AGENT_COUNTS`、`REPETITIONS` /
 `REP_LIST`。新运行的目录固定为：
@@ -382,7 +383,7 @@ Job 结束时统一调用 `collect_benchmark_metrics.py`。
 客户端：
 
 ```text
-replay_fake_agent_traces.py
+scripts/benchmark/replay_fake_agent_traces.py
   -> rounds.jsonl
   -> trajectories.jsonl
   -> summary.json
@@ -403,11 +404,11 @@ Prefill/Decode logs
 Job 级汇总与作图（脚本布局：`scripts/plot/` 作图，`scripts/infra/` 镜像补丁）：
 
 ```text
-collect_benchmark_metrics.py
-  -> summarize_latency_benchmark.py
+scripts/benchmark/collect_benchmark_metrics.py
+  -> scripts/benchmark/summarize_latency_benchmark.py
        -> <TASK>/data/{merged_rounds.jsonl,validation.json}
        -> <TASK>/csv/{runs.csv,aggregate.csv}
-  -> summarize_ttft_fullchain.py
+  -> scripts/benchmark/summarize_ttft_fullchain.py
        -> <run>/data/fullchain/fullchain_rounds.jsonl   # 当前 run 全量 request
        -> <run>/data/fullchain/fullchain_summary.json
   -> scripts/plot/plot_trajectory_metrics.py

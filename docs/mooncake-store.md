@@ -60,7 +60,7 @@ root 和新 master，避免跨 run 污染。
 - 每个 run 从独立空 Store/DFS namespace 开始；
 - run 结束后删除本 Job 的 DFS shard 与 client-init 目录。
 
-`scripts/replay_fake_agent_traces.py` 支持
+`scripts/benchmark/replay_fake_agent_traces.py` 支持
 `--flush-local-cache-between-turns` / `--flush-cache-url` /
 `--storage-settle-seconds`。`trajectory_jct` 不含 flush/settle；batch
 `wall_seconds` 含墙钟。
@@ -87,8 +87,8 @@ memory segment；另一节点随后按 key 从 Store 读取，逐对象验证长
 
 验证入口：
 
-- `scripts/mooncake_store_dfs_smoke.py`
-- `scripts/mooncake_store_lustre_smoke.sbatch`
+- `scripts/smoke/mooncake_store_dfs_smoke.py`
+- `scripts/smoke/mooncake_store_lustre_smoke.sbatch`
 - `scripts/pd_1p1d_benchmark.sbatch`（正式 1P1D；含 L3/Mooncake）
 
 ## 已完成 SGLang HiCache 集成验证

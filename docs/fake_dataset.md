@@ -99,7 +99,7 @@ log-normal 扰动。生成器二分搜索衰减系数，使 `Context` 匹配论�
 
 ```bash
 srun --partition=GAIA --nodes=1 --ntasks=1 --time=00:05:00 \
-  python scripts/generate_fake_agent_traces.py \
+  python scripts/benchmark/generate_fake_agent_traces.py \
   --output-dir /mnt/lustre/users/sezhou/dual-path/test/dataset
 ```
 
@@ -111,7 +111,7 @@ Replay client 应：
 4. 不保存假的生成内容到数据集，实际 replay 时记录每轮真实响应；
 5. 在比较不同系统时固定 JSONL、seed、到达顺序和 cold/warm cache 状态。
 
-离线 replay client 已实现为 `scripts/replay_fake_agent_traces.py`。它使用固定
+离线 replay client 已实现为 `scripts/benchmark/replay_fake_agent_traces.py`。它使用固定
 seed 为每轮构造普通词表范围内的伪随机 token IDs，通过 SGLang `/generate`
 发送 `input_ids`，强制精确生成目标长度，并把响应中的真实 `output_ids` 拼入
 下一轮 context。不同 trajectory 可并发执行，同一 trajectory 内严格串行。
@@ -147,7 +147,7 @@ synthetic `A1` 的具体 token 数，因此默认 1 token 是本项目的明确�
 最小调用示例：
 
 ```bash
-python scripts/replay_fake_agent_traces.py \
+python scripts/benchmark/replay_fake_agent_traces.py \
   --dataset "$DATASET_DIR/dualpath_fake_32k.jsonl" \
   --base-url "http://$PREFILL_HOST:8000" \
   --output-dir "$RESULT_DIR/fake-32k" \
@@ -187,7 +187,7 @@ Prefill timing log 关联的稳定 request ID。当前范围只使用 barrier �
 正式 replay 从第一轮连续运行到最后一轮：
 
 ```bash
-python scripts/replay_fake_agent_traces.py \
+python scripts/benchmark/replay_fake_agent_traces.py \
   --dataset "$DATASET_DIR/dualpath_fake_32k.jsonl" \
   --base-url "http://$PREFILL_HOST:8000" \
   --output-dir "$RESULT_DIR/full-32k" \

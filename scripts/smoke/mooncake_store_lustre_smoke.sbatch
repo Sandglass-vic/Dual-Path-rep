@@ -95,7 +95,7 @@ while time.monotonic() < deadline:
 else:
     raise SystemExit("Mooncake master startup timeout")
 PY
-      python scripts/mooncake_store_dfs_smoke.py \
+      python scripts/smoke/mooncake_store_dfs_smoke.py \
         --role write --host '"$writer_host"' \
         --master '"$master"' --metadata-server '"$metadata"' \
         --manifest '"$manifest"'
@@ -125,7 +125,7 @@ srun --nodes=1 --ntasks=1 --nodelist="$reader_host" \
   --no-container-mount-home \
   env "${common_env[@]}" \
     MOONCAKE_OFFLOAD_FILE_STORAGE_PATH="$TEST_DIR/client-init/reader" \
-    python scripts/mooncake_store_dfs_smoke.py \
+    python scripts/smoke/mooncake_store_dfs_smoke.py \
       --role read --host "$reader_host" \
       --master "$master" --metadata-server "$metadata" \
       --manifest "$manifest"

@@ -220,7 +220,7 @@ dualpath_run_replay() {
     echo "COLLECT_L3_STORAGE_SNAPSHOT must be 0 or 1" >&2
     return 2
   fi
-  python scripts/replay_fake_agent_traces.py \
+  python scripts/benchmark/replay_fake_agent_traces.py \
     --dataset "$dataset" \
     --base-url "http://$PREFILL_HOST:$ROUTER_PORT" \
     --output-dir "$output_dir" \

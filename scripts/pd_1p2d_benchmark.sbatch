@@ -160,7 +160,7 @@ for dataset_spec in $DATASETS; do
   done
 done
 
-python "$CODE_HOME/scripts/collect_benchmark_metrics.py" \
+python "$CODE_HOME/scripts/benchmark/collect_benchmark_metrics.py" \
   --result-dir "$RESULT_DIR" \
   --log-dir "$LOG_DIR" \
   --repo-result-dir "$REPO_RESULT_DIR" \

@@ -10,10 +10,12 @@
 /labhome/sezhou/dual-path/          Git 根目录，登录节点随时可查
 ├── docs/                           设计、平台和实验记录
 ├── scripts/
+│   ├── benchmark/                  数据生成、replay、collect 与 summarize
+│   ├── smoke/                      Mooncake Store/DFS smoke
 │   ├── plot/                       画图脚本
 │   ├── infra/                      SGLang patch 与镜像构建
 │   ├── pd_*_benchmark.sbatch       正式 PD 矩阵入口
-│   └── collect_benchmark_metrics.py
+│   └── pd_benchmark_lib.sh         正式入口共享库
 ├── results/                        仓库侧图表/汇总（REPO_RESULT_DIR；gitignore）
 └── ...
 

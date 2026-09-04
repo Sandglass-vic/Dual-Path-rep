@@ -394,7 +394,8 @@ Job 64914 的 94 轮模型执行和结果文件完整，但 Slurm 最终状态�
 wrapper 断言失败解释为推理或 L3 数据流失败。
 
 这个测试不是性能 benchmark：每轮主动 flush，并等待异步落盘增长，会人为增加
-wall time。该方案已经从 `replay_fake_agent_traces.py` 和正式 sbatch 中删除；
+wall time。该方案已经从 `scripts/benchmark/replay_fake_agent_traces.py` 和正式
+sbatch 中删除；
 Job `64914/65502` 仅保留为历史命中归因证据。
 
 ## Phase 6：DualPath 近似实现

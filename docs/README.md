@@ -41,7 +41,8 @@
 ```text
 scripts/
   pd_*_benchmark.sbatch + pd_benchmark_lib.sh   # 正式矩阵
-  collect_benchmark_metrics.py / summarize_*.py
+  benchmark/                                    # generate/replay/collect/summarize
+  smoke/                                        # Mooncake Store/DFS smoke
   plot/                                         # 画图
   infra/                                        # patch + 镜像构建
   replay_*.py / generate_*.py / pd_{prefill,decode}*.sh
