@@ -53,6 +53,7 @@ hiradix = (root / "mem_cache/hiradix_cache.py").read_text()
 schedule_batch = (root / "managers/schedule_batch.py").read_text()
 prefill = (root / "disaggregation/prefill.py").read_text()
 decode = (root / "disaggregation/decode.py").read_text()
+mooncake_conn = (root / "disaggregation/mooncake/conn.py").read_text()
 output_processor = (
     root / "managers/scheduler_output_processor_mixin.py"
 ).read_text()
@@ -75,12 +76,19 @@ assert '"DUALPATH_TTFT_P_TRANSFER_V2 rid=%s ' in prefill
 assert "dualpath_transfer_page_count" in prefill
 assert "page_aligned_tokens=%d" in prefill
 assert "DUALPATH_TTFT_D_RECEIVE" in decode
+assert "SGLANG_MOONCAKE_MAX_TRANSFER_BATCH_INDICES" in mooncake_conn
+assert "prefill_data_indices.size <= max_batch_indices" in mooncake_conn
 assert "DUALPATH_TTFT_D_DISPATCH" in output_processor
 assert "DUALPATH_TTFT_HTTP_YIELD" in http_server
 compile(hiradix, str(root / "mem_cache/hiradix_cache.py"), "exec")
 compile(schedule_batch, str(root / "managers/schedule_batch.py"), "exec")
 compile(prefill, str(root / "disaggregation/prefill.py"), "exec")
 compile(decode, str(root / "disaggregation/decode.py"), "exec")
+compile(
+    mooncake_conn,
+    str(root / "disaggregation/mooncake/conn.py"),
+    "exec",
+)
 compile(
     output_processor,
     str(root / "managers/scheduler_output_processor_mixin.py"),

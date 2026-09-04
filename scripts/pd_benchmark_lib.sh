@@ -14,6 +14,7 @@ dualpath_export_common_env() {
   # Mooncake defaults synchronous transfers to 30s. Long-context concurrent
   # PD batches can exceed that and permanently invalidate the RDMA session.
   export MC_TRANSFER_TIMEOUT=${MC_TRANSFER_TIMEOUT:-120}
+  export SGLANG_MOONCAKE_MAX_TRANSFER_BATCH_INDICES=${SGLANG_MOONCAKE_MAX_TRANSFER_BATCH_INDICES:-1024}
   export MOONCAKE_MASTER_PORT=${MOONCAKE_MASTER_PORT:-50051}
   export MOONCAKE_METADATA_PORT=${MOONCAKE_METADATA_PORT:-8080}
   export MOONCAKE_MASTER="$PREFILL_HOST:$MOONCAKE_MASTER_PORT"
@@ -34,7 +35,7 @@ dualpath_export_common_env() {
   export COLLECT_L3_STORAGE_SNAPSHOT=${COLLECT_L3_STORAGE_SNAPSHOT:-1}
   export MODEL_DIR LOG_DIR CACHE_DIR IB_DEVICE PREFILL_PORT DECODE_PORT
   export BOOTSTRAP_PORT ROUTER_PORT SERVER_TIMEOUT
-  export MC_TRANSFER_TIMEOUT
+  export MC_TRANSFER_TIMEOUT SGLANG_MOONCAKE_MAX_TRANSFER_BATCH_INDICES
   export FLUSH_LOCAL_CACHE_BETWEEN_TURNS STORAGE_SETTLE_SECONDS
   export COLLECT_L3_STORAGE_SNAPSHOT
 }
@@ -101,7 +102,8 @@ dualpath_write_run_json() {
     "$MEASURED_DECODE_OFFLOAD" "$CHUNKED_PREFILL_SIZE" \
     "$DISABLE_OVERLAP_SCHEDULE" "$PAPER_EXPAND_AGENTS" \
     "$PAPER_SYNTHETIC_APPEND_TOKENS" "$flush_flag" "$settle" \
-    "$snapshot_flag" "$MC_TRANSFER_TIMEOUT" <<'PY'
+    "$snapshot_flag" "$MC_TRANSFER_TIMEOUT" \
+    "$SGLANG_MOONCAKE_MAX_TRANSFER_BATCH_INDICES" <<'PY'
 from pathlib import Path
 import json
 import sys
@@ -129,6 +131,7 @@ Path(sys.argv[1]).write_text(json.dumps({
     "storage_quiescence_wait": bool(float(sys.argv[16]) > 0),
     "collect_l3_storage_snapshot": bool(int(sys.argv[17])),
     "mooncake_transfer_timeout_seconds": int(sys.argv[18]),
+    "mooncake_max_transfer_batch_indices": int(sys.argv[19]),
     "l3_storage_snapshot_kind": "recursive apparent bytes and st_blocks allocated bytes",
     "kv_buffer_semantics": (
         "DualPath paper: staging/GPU buffers released after each request; "

@@ -77,6 +77,9 @@ Repetitions：3
 - `MC_TRANSFER_TIMEOUT=120`（Mooncake 默认 30 秒）：长上下文高并发 PD 同步
   batch 若超过默认阈值，Mooncake 会将 RDMA session 永久标记为 failed；
   实际值写入 `run.json.mooncake_transfer_timeout_seconds`；
+- `SGLANG_MOONCAKE_MAX_TRANSFER_BATCH_INDICES=1024`：将过大的 all-layer
+  同步 PD transfer 按 KV page index 有序分批，避免单次调用耗尽 Mooncake
+  瞬态资源；实际值写入 `run.json.mooncake_max_transfer_batch_indices`；
 - 默认 `STORAGE_SETTLE_SECONDS=1`，避免 Store 尚未可见就发下一轮；
 - Decode 在 rollout 中持续把 KV 发布到 Mooncake Store，下一轮从 L3 加载；
 - JCT：`trajectory_jct` / turn_wall **不含** flush/settle；batch `wall_seconds`

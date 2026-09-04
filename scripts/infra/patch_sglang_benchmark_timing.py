@@ -118,6 +118,81 @@ def patch_schedule_batch(path: Path) -> None:
     print(f"Patched: {path}")
 
 
+def patch_mooncake_bounded_transfer(path: Path) -> None:
+    """Bound all-layer Mooncake calls by KV-index count.
+
+    Backport of sglang#32758 for the 0.5.7 image. Large synchronous calls can
+    exhaust transient Mooncake resources and permanently fail the RDMA session.
+    """
+    source = path.read_text()
+    marker = "SGLANG_MOONCAKE_MAX_TRANSFER_BATCH_INDICES"
+    if marker in source:
+        print(f"Already patched: {path}")
+        return
+
+    source = replace_once(
+        source,
+        "        self.init_engine()\n"
+        "        self.register_buffer_to_engine()\n"
+        "        if self.disaggregation_mode == DisaggregationMode.PREFILL:\n",
+        "        self.init_engine()\n"
+        "        self.register_buffer_to_engine()\n"
+        "        self.max_transfer_batch_indices = get_int_env_var(\n"
+        "            \"SGLANG_MOONCAKE_MAX_TRANSFER_BATCH_INDICES\", 1024\n"
+        "        )\n"
+        "        if self.disaggregation_mode == DisaggregationMode.PREFILL:\n",
+        "initialize bounded Mooncake transfer size",
+    )
+    source = replace_once(
+        source,
+        "        else:\n"
+        "            # Combining all layers' params in one batch transfer is more efficient\n"
+        "            # compared to using multiple threads\n"
+        "            return process_layers(layers_params)\n"
+        "\n"
+        "        return 0\n",
+        "        else:\n"
+        "            # Combining all layers is faster for short transfers. For long\n"
+        "            # transfers, bound each synchronous Mooncake call by KV-index\n"
+        "            # count before contiguous address ranges are formed.\n"
+        "            max_batch_indices = self.max_transfer_batch_indices\n"
+        "            if (\n"
+        "                max_batch_indices <= 0\n"
+        "                or prefill_data_indices.size <= max_batch_indices\n"
+        "            ):\n"
+        "                return process_layers(layers_params)\n"
+        "            for start in range(\n"
+        "                0, prefill_data_indices.size, max_batch_indices\n"
+        "            ):\n"
+        "                prefill_blocks, decode_blocks = group_concurrent_contiguous(\n"
+        "                    prefill_data_indices[start : start + max_batch_indices],\n"
+        "                    dst_data_indices[start : start + max_batch_indices],\n"
+        "                )\n"
+        "                transfer_blocks = []\n"
+        "                for src_ptr, dst_ptr, item_len in layers_params:\n"
+        "                    for prefill_index, decode_index in zip(\n"
+        "                        prefill_blocks, decode_blocks\n"
+        "                    ):\n"
+        "                        transfer_blocks.append(\n"
+        "                            (\n"
+        "                                src_ptr + int(prefill_index[0]) * item_len,\n"
+        "                                dst_ptr + int(decode_index[0]) * item_len,\n"
+        "                                item_len * len(prefill_index),\n"
+        "                            )\n"
+        "                        )\n"
+        "                status = self._transfer_data(\n"
+        "                    mooncake_session_id, transfer_blocks\n"
+        "                )\n"
+        "                if status != 0:\n"
+        "                    return status\n"
+        "\n"
+        "        return 0\n",
+        "bound all-layer Mooncake transfer batches",
+    )
+    path.write_text(source)
+    print(f"Patched: {path}")
+
+
 def patch_prefill_transfer(path: Path) -> None:
     source = path.read_text()
     marker = "DUALPATH_TTFT_P_TRANSFER_V2"
@@ -311,6 +386,9 @@ def main() -> None:
     srt = args.site_packages / "sglang/srt"
     patch_hiradix(srt / "mem_cache/hiradix_cache.py")
     patch_schedule_batch(srt / "managers/schedule_batch.py")
+    patch_mooncake_bounded_transfer(
+        srt / "disaggregation/mooncake/conn.py"
+    )
     patch_prefill_transfer(srt / "disaggregation/prefill.py")
     patch_decode_receive(srt / "disaggregation/decode.py")
     patch_first_token_dispatch(
