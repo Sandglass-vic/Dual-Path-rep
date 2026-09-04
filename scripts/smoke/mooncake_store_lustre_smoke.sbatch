@@ -5,7 +5,7 @@
 #SBATCH --ntasks=2
 #SBATCH --ntasks-per-node=1
 #SBATCH --exclusive
-#SBATCH --exclude=dgx-gaia-18,dgx-gaia-30,dgx-gaia-46,dgx-gaia-53
+#SBATCH --exclude=dgx-gaia-12,dgx-gaia-18,dgx-gaia-30,dgx-gaia-46,dgx-gaia-53
 #SBATCH --time=00:15:00
 #SBATCH --output=/mnt/lustre/users/sezhou/dual-path/logs/mooncake-store-smoke-%j.out
 

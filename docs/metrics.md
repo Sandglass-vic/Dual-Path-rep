@@ -20,7 +20,7 @@
 正式 32K × 32/64/128 agents × 3 rep 完整 rollout 属于第一类。Job `65566`
 因 Decode-1 节点 `dgx-gaia-53` 失联失败；Job `65592` 仅排除 `53` 后又分到
 含历史故障节点 `dgx-gaia-30` 的组，已取消。当前正式作业排除
-`dgx-gaia-18,dgx-gaia-30,dgx-gaia-46,dgx-gaia-53`（见 [平台说明](platform.md)）。完成后检查两类 **results**（名称相同、语义不同，不可混用）：
+`dgx-gaia-12,dgx-gaia-18,dgx-gaia-30,dgx-gaia-46,dgx-gaia-53`（见 [平台说明](platform.md)）。完成后检查两类 **results**（名称相同、语义不同，不可混用）：
 
 ```text
 # Lustre runtime results：原始 rounds / trajectories / run.json（RESULT_DIR）

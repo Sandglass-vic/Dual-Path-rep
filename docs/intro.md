@@ -34,7 +34,7 @@
 - 禁用逐请求 release 的 L1/L2 保留路径仅作对照，不得当作正式结果。
 - Job `65566` 的 32K × 32/64/128-agent 正式矩阵在首轮失败：Decode-1 节点
   `dgx-gaia-53` 高负载下失联；另有历史故障节点 `dgx-gaia-30`、`dgx-gaia-46`。
-  正式作业统一排除 `dgx-gaia-18,dgx-gaia-30,dgx-gaia-46,dgx-gaia-53`。详见
+  正式作业统一排除 `dgx-gaia-12,dgx-gaia-18,dgx-gaia-30,dgx-gaia-46,dgx-gaia-53`。详见
   [平台说明](platform.md)。
 - Job `65593` 已按完整排除列表重提同一矩阵，运行节点为 `dgx-gaia-[14-16]`。
 - 指标、字段与预期产物见 [指标规范](metrics.md)。

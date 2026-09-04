@@ -73,11 +73,12 @@ scontrol show hostnames "$SLURM_JOB_NODELIST"
 | `dgx-gaia-46` | `64858` | Enroot NVIDIA hook 找不到 `nvidia-container-cli`，Pyxis 无法启动容器 |
 | `dgx-gaia-53` | `65566` | 32-agent 完整 rollout 中 Decode 突然停写日志；Router `HostUnreachable` / `No route to host`；Prefill `KVTransferError` 与 bootstrap 300 s 超时 |
 | `dgx-gaia-18` | `65658` | 1P2D 1-agent 启动时 Decode-1 上 Mooncake Store `warmup()` `put` 断言失败；日志含 `Failed to get segment descriptor for segment dgx-gaia-16:...`；Prefill/Decode-0 已健康但 Decode-1 未就绪 |
+| `dgx-gaia-12` | `66412` | Mooncake warmup 前 `mlx5_0` 连续报告 RDMA port error/inactive，随后 `AddressNotRegistered`，Store `put` 断言失败，Prefill 无法启动 |
 
 统一排除列表：
 
 ```text
-dgx-gaia-18,dgx-gaia-30,dgx-gaia-46,dgx-gaia-53
+dgx-gaia-12,dgx-gaia-18,dgx-gaia-30,dgx-gaia-46,dgx-gaia-53
 ```
 
 正式 benchmark 脚本（`pd_1p1d_benchmark.sbatch` /
@@ -85,7 +86,7 @@ dgx-gaia-18,dgx-gaia-30,dgx-gaia-46,dgx-gaia-53
 `#SBATCH --exclude=...`。临时覆盖提交时也应显式带上同一列表，例如：
 
 ```bash
-sbatch --exclude=dgx-gaia-18,dgx-gaia-30,dgx-gaia-46,dgx-gaia-53 --time=08:00:00 \
+sbatch --exclude=dgx-gaia-12,dgx-gaia-18,dgx-gaia-30,dgx-gaia-46,dgx-gaia-53 --time=08:00:00 \
   scripts/pd_1p2d_benchmark.sbatch
 ```
 

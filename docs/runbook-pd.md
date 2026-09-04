@@ -284,7 +284,7 @@ P/D 双侧 round-robin 分流和跨节点 RDMA 数据面已经通过最小验证
 指标或带 request ID 的 tracing 验证。
 
 正式成功前的平台故障节点，不应误记为软件配置失败。当前统一排除列表为
-`dgx-gaia-18,dgx-gaia-30,dgx-gaia-46,dgx-gaia-53`，完整表见
+`dgx-gaia-12,dgx-gaia-18,dgx-gaia-30,dgx-gaia-46,dgx-gaia-53`，完整表见
 [已知故障节点](platform.md#已知故障节点临时排除)：
 
 - Job `64855`：`dgx-gaia-30`，CUDA `busy or unavailable`；
@@ -297,7 +297,7 @@ P/D 双侧 round-robin 分流和跨节点 RDMA 数据面已经通过最小验证
 提交示例：
 
 ```bash
-sbatch --exclude=dgx-gaia-18,dgx-gaia-30,dgx-gaia-46,dgx-gaia-53 --time=08:00:00 \
+sbatch --exclude=dgx-gaia-12,dgx-gaia-18,dgx-gaia-30,dgx-gaia-46,dgx-gaia-53 --time=08:00:00 \
   scripts/pd_1p2d_benchmark.sbatch
 ```
 
