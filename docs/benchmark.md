@@ -66,20 +66,21 @@ Repetitions：3
 实验运行完整 trajectory，使用 `512/1024/2048/4096` agents，设置
 `MAX_TURNS=0`、`PAPER_EXPAND_AGENTS=1` 和 `TRAJECTORY_OFFSET=0`。
 
-正式入口已改为论文式动态 rollout：
+正式入口为论文对齐的动态 rollout：
 
 - 每个配置从独立、空的 Mooncake Store namespace 开始；
 - 不预先 populate，不重启进入 measured 阶段；
-- 不逐轮 flush L1/L2，不等待 L3 文件增长或静默；
-- 不设置固定 inter-turn sleep；
-- Decode 在 rollout 中持续把 KV 发布到 Mooncake Store，后续 turn 自然查询；
-- JCT 从 barrier 释放计到最后一条 trajectory 完成，不包含服务启动和清理。
+- **每轮结束后 Prefill `/flush_cache`**，释放本地 L1/L2（近似论文 staging/GPU
+  buffer 用完即放）；**不**清 Mooncake Store；
+- 默认 `STORAGE_SETTLE_SECONDS=1`，避免 Store 尚未可见就发下一轮；
+- Decode 在 rollout 中持续把 KV 发布到 Mooncake Store，下一轮从 L3 加载；
+- JCT：`trajectory_jct` / turn_wall **不含** flush/settle；batch `wall_seconds`
+  含真实墙钟。
 
-论文正文与附录没有描述“每轮调用服务端 cache flush”或“等待存储静默后再发
-下一轮”。相反，§4.1 说明 Decode 每形成一个完整 block（示例为 64 tokens）
-就立即持久化，§A.3 说明 agent 从 round 0 连续 replay 到最后一轮，§A.4 说明
-SGL(MC) 的 hit length 由 HiCache 与 Mooncake Store 内部状态决定。因此旧脚本
-中的 flush/sleep/storage wait 是本项目早期的命中归因手段，不是论文方法。
+论文 §4.1 明确 Decode 在 H2D 后释放 CPU buffer，跨轮依赖存储而非本地 DRAM
+cache。旧“不 flush、吃 L1/L2 顺风车”的路径（Job `65694`）与论文不符，仅作
+对照。更早的 Populate/Measured + 长 storage wait（`65032`）是诊断手段，也不是
+当前正式口径。
 
 Mooncake 的 `PutStart/PutEnd` 完整对象发布替代旧 SGLang file backend 的
 `.bin` 并发覆盖，因此不再使用 Decode scratch 目录规避 `Short read`。每个

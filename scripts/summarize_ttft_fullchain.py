@@ -27,7 +27,7 @@ L3 = re.compile(
     r"read_s=(?P<duration>[0-9.]+) tokens=(?P<tokens>\d+)"
 )
 P_TRANSFER = re.compile(
-    r"DUALPATH_TTFT_P_TRANSFER rid=(?P<rid>\S+) "
+    r"DUALPATH_TTFT_P_TRANSFER(?:_V2)? rid=(?P<rid>\S+) "
     r"transfer_start=(?P<start>[0-9.]+) "
     r"transfer_end=(?P<end>[0-9.]+)"
 )

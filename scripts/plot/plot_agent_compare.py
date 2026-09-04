@@ -207,8 +207,8 @@ def write_agent_boxplots(
     panels = [
         (
             "trajectory_jct_seconds",
-            "Trajectory completion time across agents",
-            "Trajectory JCT (s)",
+            "trajectory_jct across agents",
+            "trajectory_jct (s)",
             1.0,
             1,
         ),
@@ -290,7 +290,121 @@ def write_agent_boxplots(
         }
         for agents, values in by_agents.items()
     }
-    return summary
+    return summary, by_agents, max_len_k
+
+
+def write_jct_max_by_agents(
+    runs: list[tuple[int, int, Path]],
+    by_agents: dict[int, dict[str, list[float]]],
+    max_len_k: int,
+    output: Path,
+) -> dict[str, Any]:
+    """Bar chart of max trajectory_jct vs #Agents (batch critical-path JCT)."""
+    points: dict[int, dict[str, float]] = {}
+    for _, agents, run_dir in runs:
+        jcts = by_agents[agents]["trajectory_jct_seconds"]
+        summary = json.loads((run_dir / "summary.json").read_text())
+        points[agents] = {
+            "trajectory_jct_max_seconds": max(jcts),
+            "trajectory_jct_min_seconds": min(jcts),
+            "trajectory_jct_mean_seconds": statistics.fmean(jcts),
+            "batch_wall_seconds": float(summary["wall_seconds"]),
+            "n_agents": float(len(jcts)),
+        }
+
+    width, height = 900, 480
+    plot_left, plot_right = 90.0, 720.0
+    plot_top, plot_bottom = 80.0, 400.0
+    agent_counts = sorted(points)
+    y_max = (
+        max(points[a]["trajectory_jct_max_seconds"] for a in agent_counts) * 1.15
+        or 1.0
+    )
+    elements = [
+        f'<rect width="{width}" height="{height}" fill="white"/>',
+        text(
+            width / 2,
+            28,
+            f"Batch JCT · max trajectory_jct · MaxLen={max_len_k}K",
+            16,
+            weight="bold",
+        ),
+        text(
+            width / 2,
+            48,
+            "Each bar = max agent trajectory_jct (critical path); "
+            "marker = summary.json wall_seconds",
+            11,
+        ),
+    ]
+    for tick in range(6):
+        value = y_max * tick / 5
+        y = plot_bottom - (plot_bottom - plot_top) * tick / 5
+        elements.append(
+            f'<line x1="{plot_left}" y1="{y:.1f}" x2="{plot_right}" '
+            f'y2="{y:.1f}" stroke="#e5e7eb"/>'
+        )
+        elements.append(text(plot_left - 8, y + 4, f"{value:.0f}", 10, "end"))
+
+    bar_width = min(100.0, 380.0 / max(len(agent_counts), 1))
+    span = plot_right - plot_left
+    for index, agents in enumerate(agent_counts):
+        item = points[agents]
+        x = plot_left + span * (index + 0.5) / len(agent_counts)
+        height_px = item["trajectory_jct_max_seconds"] / y_max * (
+            plot_bottom - plot_top
+        )
+        y = plot_bottom - height_px
+        elements.append(
+            f'<rect x="{x - bar_width / 2:.1f}" y="{y:.1f}" '
+            f'width="{bar_width:.1f}" height="{max(height_px, 0.0):.1f}" '
+            'fill="#fb923c" stroke="#9a3412"/>'
+        )
+        wall_y = plot_bottom - item["batch_wall_seconds"] / y_max * (
+            plot_bottom - plot_top
+        )
+        elements.append(
+            f'<circle cx="{x:.1f}" cy="{wall_y:.1f}" r="5" fill="#1d4ed8"/>'
+        )
+        elements.append(text(x, 425, str(agents), 12))
+        elements.append(
+            text(
+                x,
+                y - 10,
+                f"{item['trajectory_jct_max_seconds']:.1f}s",
+                11,
+            )
+        )
+
+    elements.append(text((plot_left + plot_right) / 2, 450, "#Agents", 12))
+    elements.append(
+        '<text x="28" y="240" font-family="sans-serif" font-size="12" '
+        'text-anchor="middle" transform="rotate(-90 28 240)">'
+        "Seconds</text>"
+    )
+    elements.append(
+        f'<rect x="740" y="100" width="14" height="14" fill="#fb923c" '
+        'stroke="#9a3412"/>'
+    )
+    elements.append(text(760, 112, "max trajectory_jct", 11, "start"))
+    elements.append(f'<circle cx="747" cy="140" r="5" fill="#1d4ed8"/>')
+    elements.append(text(760, 144, "batch wall_seconds", 11, "start"))
+    elements.append(
+        text(
+            width / 2,
+            468,
+            "Equals batch critical-path JCT when all agents share one barrier; "
+            "not the sum of agent JCTs.",
+            10,
+        )
+    )
+    output.write_text(
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" '
+        f'height="{height}" viewBox="0 0 {width} {height}">\n'
+        + "\n".join(elements)
+        + "\n</svg>\n"
+    )
+    return points
 
 
 def write_fullchain_by_agents(
@@ -416,11 +530,20 @@ def main() -> None:
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     runs = discover_runs(args.result_dir)
-    box_summary = write_agent_boxplots(
+    box_summary, by_agents, max_len_k = write_agent_boxplots(
         runs, args.output_dir / "agent_latency_boxplots.svg"
     )
     (args.output_dir / "agent_latency_boxplots.json").write_text(
         json.dumps(box_summary, indent=2) + "\n"
+    )
+    jct_max = write_jct_max_by_agents(
+        runs,
+        by_agents,
+        max_len_k,
+        args.output_dir / "trajectory_jct_max_by_agents.svg",
+    )
+    (args.output_dir / "trajectory_jct_max_by_agents.json").write_text(
+        json.dumps(jct_max, indent=2) + "\n"
     )
 
     if args.fullchain_root is not None:
@@ -432,7 +555,6 @@ def main() -> None:
                 fullchain_dirs[agents] = agents_dir
         if not fullchain_dirs:
             raise RuntimeError(f"No full-chain outputs under {args.fullchain_root}")
-        max_len_k = runs[0][0]
         means = write_fullchain_by_agents(
             fullchain_dirs,
             args.output_dir / "ttft_fullchain_by_agents.svg",

@@ -72,11 +72,12 @@ scontrol show hostnames "$SLURM_JOB_NODELIST"
 | `dgx-gaia-30` | `64855` | 已拿到整节点 GPU allocation，CUDA 初始化仍报 `CUDA-capable device(s) is/are busy or unavailable` |
 | `dgx-gaia-46` | `64858` | Enroot NVIDIA hook 找不到 `nvidia-container-cli`，Pyxis 无法启动容器 |
 | `dgx-gaia-53` | `65566` | 32-agent 完整 rollout 中 Decode 突然停写日志；Router `HostUnreachable` / `No route to host`；Prefill `KVTransferError` 与 bootstrap 300 s 超时 |
+| `dgx-gaia-18` | `65658` | 1P2D 1-agent 启动时 Decode-1 上 Mooncake Store `warmup()` `put` 断言失败；日志含 `Failed to get segment descriptor for segment dgx-gaia-16:...`；Prefill/Decode-0 已健康但 Decode-1 未就绪 |
 
 统一排除列表：
 
 ```text
-dgx-gaia-30,dgx-gaia-46,dgx-gaia-53
+dgx-gaia-18,dgx-gaia-30,dgx-gaia-46,dgx-gaia-53
 ```
 
 正式 benchmark 脚本（`pd_1p1d_benchmark.sbatch` /
@@ -84,7 +85,7 @@ dgx-gaia-30,dgx-gaia-46,dgx-gaia-53
 `#SBATCH --exclude=...`。临时覆盖提交时也应显式带上同一列表，例如：
 
 ```bash
-sbatch --exclude=dgx-gaia-30,dgx-gaia-46,dgx-gaia-53 --time=08:00:00 \
+sbatch --exclude=dgx-gaia-18,dgx-gaia-30,dgx-gaia-46,dgx-gaia-53 --time=08:00:00 \
   scripts/pd_1p2d_benchmark.sbatch
 ```
 
@@ -97,6 +98,10 @@ Job `65566` 细节：节点 `dgx-gaia-[51-53]`，Decode-1=`dgx-gaia-53` 约在
 CUDA OOM/segfault/traceback）；客户端仅 2/32 trajectory 完成，其余为空流或
 短生成，正式汇总图未生成。Job `65592` 曾只排除 `dgx-gaia-53`，但又被分到
 含 `dgx-gaia-30` 的 `dgx-gaia-[29-31]`，因此取消后改为排除全部三节点重提。
+
+Job `65658` 细节：节点 `dgx-gaia-[16-18]`，Decode-1=`dgx-gaia-18` 在 Mooncake
+Store warmup 阶段失败（`AssertionError` on `store.put`），约 4.5 分钟后
+FAILED；未进入 replay，无正式 metrics。随后将 `dgx-gaia-18` 并入排除列表重提。
 
 ## 2. 计算节点硬件
 

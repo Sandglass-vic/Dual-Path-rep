@@ -73,7 +73,7 @@ GPU：NVIDIA H100 80GB HBM3
 派生镜像：
 
 ```text
-/mnt/lustre/users/sezhou/dual-path/images/sglang:26.01-py3-mooncake0.3.13.post1-timing.sqsh
+/mnt/lustre/users/sezhou/dual-path/images/sglang:26.01-py3-mooncake0.3.13.post1-timing-v2.sqsh
 最终构建 Job：65556，COMPLETED，ExitCode=0:0
 SHA-256：eb3c03f883820bb19f9f5b37ca0f12bbbcc7cc275ab88079d5dcf7bfd35cf3d3
 ```

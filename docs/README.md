@@ -13,7 +13,9 @@
 9. [Mooncake Store 与 Lustre POSIX DFS](mooncake-store.md)：版本、原子发布、配置、实测和限制。
 10. [Fake 数据集](fake_dataset.md)：length-only 轨迹合成、格式和 replay 要求。
 11. [Benchmark 规范](benchmark.md)：论文式动态 rollout 和实验矩阵。
-12. [指标规范](metrics.md)：JCT、TTFT/TTST/TPOT、cache、timing、**full-chain**、产物。
+12. [指标规范](metrics.md)：唯一 metric 来源——**trajectory_jct**、
+    per-agent mean TTFT/TPOT（agent 内先平均）、代表轨迹 vs 全量 fullchain、
+    产物布局。
 13. [当前数据流与消融开关](dataflow-and-ablation.md)：L3、P→D、chunk 传输边界和一键 profile。
 14. [四轮延迟结果](latency-results.md)：历史 Job `65032`（诊断口径）。
 15. [TTFT 全链路历史测例](ttft-fullchain.md)：历史 Job `65144` 数值。
@@ -31,7 +33,8 @@
 - Fake trace 算法和统计：`fake_dataset.md`
 - KV-cache 层次语义：`hicache-and-dualpath.md`
 - Mooncake Store/Lustre backend：`mooncake-store.md`
-- 指标、字段、full-chain 与产物：`metrics.md`（唯一 metric 来源）
+- 指标、字段、trajectory_jct / per-agent mean / 代表轨迹 / full-chain 与产物：
+  `metrics.md`（唯一 metric 来源；见其中「口径速查」）
 
 ## 脚本布局（摘要）
 

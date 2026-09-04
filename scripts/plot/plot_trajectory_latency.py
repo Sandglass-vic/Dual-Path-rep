@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Plot per-turn latency metrics and a trajectory-JCT decomposition."""
+"""Plot per-turn latency metrics and trajectory_jct (per-turn wall stack)."""
 
 from __future__ import annotations
 
@@ -101,7 +101,7 @@ def plot_lines(
     write_svg(output, elements, width, height)
 
 
-def plot_jct_breakdown(
+def plot_trajectory_jct(
     rows: list[dict[str, object]], trajectory_jct: float, output: Path
 ) -> None:
     width, height = 1480, 560
@@ -111,11 +111,11 @@ def plot_jct_breakdown(
     bar_width = max(2.0, min(18.0, spacing * 0.78))
     elements = [
         f'<rect width="{width}" height="{height}" fill="white"/>',
-        text(740, 25, "Per-turn Latency Breakdown", 17),
+        text(740, 25, "trajectory_jct", 17),
         text(
             740,
             48,
-            f"Sum of all turn bars = trajectory JCT = {trajectory_jct:.3f} s",
+            f"Sum of all turn bars = trajectory_jct = {trajectory_jct:.3f} s",
             11,
         ),
     ]
@@ -176,7 +176,7 @@ def main() -> None:
         json.loads(line) for line in args.trajectories.read_text().splitlines()
     ]
     if len(trajectories) != 1:
-        raise RuntimeError("Per-turn JCT plot currently requires one trajectory")
+        raise RuntimeError("trajectory_jct plot currently requires one trajectory")
     required = (
         "ttft_seconds",
         "ttst_seconds",
@@ -192,12 +192,12 @@ def main() -> None:
         error = float(row["turn_wall_seconds"]) - component_sum
         if abs(error) > 1e-6:
             raise RuntimeError(
-                f"turn {row['turn_id']} JCT breakdown error is {error}"
+                f"turn {row['turn_id']} trajectory_jct component error is {error}"
             )
     trajectory_jct = float(trajectories[0]["elapsed_seconds"])
     turn_sum = sum(float(row["turn_wall_seconds"]) for row in rows)
     if abs(trajectory_jct - turn_sum) > 1e-6:
-        raise RuntimeError("turn wall times do not close to trajectory JCT")
+        raise RuntimeError("turn wall times do not close to trajectory_jct")
 
     plot_lines(
         rows,
@@ -221,11 +221,15 @@ def main() -> None:
             name,
             args.output_dir / f"trajectory_{name.lower()}.svg",
         )
-    plot_jct_breakdown(
+    plot_trajectory_jct(
         rows,
         trajectory_jct,
-        args.output_dir / "trajectory_jct_breakdown.svg",
+        args.output_dir / "trajectory_jct.svg",
     )
+    # Drop legacy filename from older collects.
+    legacy = args.output_dir / "trajectory_jct_breakdown.svg"
+    if legacy.exists():
+        legacy.unlink()
     print(f"Wrote per-turn latency plots for {len(rows)} turns")
 
 

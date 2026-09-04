@@ -11,13 +11,19 @@
   `64 layers × 8 KV heads × 128 head_dim × K/V × 2 bytes = 262144 bytes/token`
 
 Job 完成后已自动删除其 KV-cache 测试目录；仓库侧旧
-`artifacts/trajectory-metrics/65502/` 已清理。下列结论仍有效；正式产物布局见
-[指标规范](metrics.md)。
+`artifacts/trajectory-metrics/65502/` 已清理。下列结论仍有效。
+
+正式口径（勿与本历史页混淆）：当前 `trajectory-*` 图是 **一条代表轨迹**
+（非多 agent 平均）；单轨迹 JCT 图名为 **`trajectory_jct`**；跨 agent 箱线的
+TTFT 是 **agent 内多 turn 先平均再跨 agent**。定义与产物布局见
+[指标规范 · 口径速查](metrics.md#口径速查常见混淆)。
 
 Job `65502` 是旧 file backend 的命中归因实验，不是性能结果。逐轮 flush、
-1 秒静默采样和 storage wait 均已从正式 replay 客户端移除；其中的 JCT、
-physical snapshot 和带宽曲线只能用于理解旧实现，不能与新 Mooncake Store
-动态 rollout 的 JCT 混报。
+长 storage wait 属于历史实现；当前正式 replay 恢复了论文对齐所需的逐轮
+Prefill flush，并在短 `STORAGE_SETTLE_SECONDS` 后采样 Mooncake DFS 的
+`st_blocks`。flush、settle 和扫描耗时均不进入 trajectory JCT。Job `65502`
+的 JCT、physical snapshot 和旧带宽曲线仍不能与新 Mooncake Store 动态
+rollout 混报。
 
 ## 命中率锯齿的来源
 
@@ -49,12 +55,13 @@ L3 已发布前缀长度不变，而完整 prompt 持续增长，所以命中率
      跳增约 1.203 GiB。这解释了它为什么不能与前十轮约 0.990 GiB 的逻辑 KV
      累加值逐点比较。图例已改为 `Observed L3 snapshot (async)`。
 4. `trajectory_pd_bandwidth.svg`
-   - 计算：`prompt_tokens × 256 KiB / pd_transfer_seconds`。
+   - 新口径计算：`page_count × page_size × 256 KiB /
+     pd_transfer_seconds`，即实际提交的 page-aligned 逻辑 payload。
    - Job 65502 的旧 timing 镜像从最后一个 Prefill chunk 提交开始计时，因此历史
      曲线仍是“完成窗口逻辑有效带宽”。
    - 新 timing patch 在 `send_kv_chunk()` 第一次真正调用 Mooncake sender 前记录
-     起点，并在最终 `KVPoll.Success` 结束。未来结果将覆盖从首个实际 chunk 提交
-     到全部传输完成的完整窗口。
+     起点，并在最终 `KVPoll.Success` 结束，覆盖从首个实际 chunk 提交到全部
+     传输完成的完整窗口。
 5. `trajectory_l3_bandwidth.svg`
    - 计算：`l3_read_tokens × 256 KiB / l3_read_seconds`。
    - Job 65502 的历史曲线使用 tp_rank=0 的 wall duration。
@@ -83,6 +90,12 @@ L3 已发布前缀长度不变，而完整 prompt 持续增长，所以命中率
 本页公式与字段仅用于解释 Job `65502`。当前正式运行的 JCT、TTFT/TTST/TPOT、
 request/L3/P→D timing、八个 TP rank 聚合、cache hit、产物和闭合规则统一见
 [指标规范](metrics.md)。
+
+修正版 Job `66097`（1P2D、32K、1 agent、26 turns）验证结果：L3 allocated
+snapshot 最终为 6.932 GiB，P→D timing coverage 为 100%，P→D 有效带宽中位数
+为 9.483 GB/s；6 个发生 L3 read 的 requests 的 TP=8 聚合加载带宽中位数为
+43.837 GB/s。Mooncake 稀疏 shard 的 apparent size 固定为 256 GiB，不表示实际
+落盘量。
 
 Job `65502` 是非流式历史结果，因此没有逐轮 TTFT/TTST/TPOT；不得从缺失字段
 推导零值。其他历史结果见 Job `65032` 的 [四轮延迟结果](latency-results.md)

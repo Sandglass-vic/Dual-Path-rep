@@ -71,7 +71,7 @@
 当前已完成 Mooncake 派生镜像、1P1D/1P2D/2P2D 短请求 RDMA smoke、
 Mooncake Lustre DFS 正确性、流式指标和历史四轮矩阵。Job `65566` 因
 `dgx-gaia-53` 失联失败；正式作业统一排除
-`dgx-gaia-30,dgx-gaia-46,dgx-gaia-53` 后重提 32K 完整 rollout 的
+`dgx-gaia-18,dgx-gaia-30,dgx-gaia-46,dgx-gaia-53` 后重提 32K 完整 rollout 的
 32/64/128-agent 矩阵（当前 Job `65593`，节点 `dgx-gaia-[14-16]`）。指标口径见
 [指标规范](metrics.md)；节点故障记录见 [平台说明](platform.md)。DualPath
 DE-read 与 layer-wise streaming 尚未完成。

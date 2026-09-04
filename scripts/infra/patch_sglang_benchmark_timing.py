@@ -120,7 +120,7 @@ def patch_schedule_batch(path: Path) -> None:
 
 def patch_prefill_transfer(path: Path) -> None:
     source = path.read_text()
-    marker = "DUALPATH_TTFT_P_TRANSFER"
+    marker = "DUALPATH_TTFT_P_TRANSFER_V2"
     if marker in source:
         print(f"Already patched: {path}")
         return
@@ -128,10 +128,18 @@ def patch_prefill_transfer(path: Path) -> None:
     source = replace_once(
         source,
         "        req.disagg_kv_sender.send(page_indices, state_indices)\n",
-        "        if req.time_stats.prefill_transfer_queue_entry_time == 0:\n"
-        "            req.time_stats.prefill_transfer_queue_entry_time = time.perf_counter()\n"
+        "        # DUALPATH_TTFT_P_TRANSFER_V2: use an independent timestamp for\n"
+        "        # the first actual send.  prefill_transfer_queue_entry_time is\n"
+        "        # already assigned when the request enters the transfer queue.\n"
+        "        if not hasattr(req, \"dualpath_transfer_start\"):\n"
+        "            req.dualpath_transfer_start = time.perf_counter()\n"
+        "            req.dualpath_transfer_logical_tokens = 0\n"
+        "            req.dualpath_transfer_page_count = 0\n"
+        "            req.dualpath_transfer_page_size = page_size\n"
+        "        req.dualpath_transfer_logical_tokens += max(0, end_idx - start_idx)\n"
+        "        req.dualpath_transfer_page_count += len(page_indices)\n"
         "        req.disagg_kv_sender.send(page_indices, state_indices)\n",
-        "record first actual KV chunk submission",
+        "record actual KV chunks and first submission",
     )
     source = replace_once(
         source,
@@ -140,15 +148,30 @@ def patch_prefill_transfer(path: Path) -> None:
         "            elif poll == KVPoll.Success:  # transfer done\n"
         "                dualpath_transfer_end = time.perf_counter()\n"
         "                if self.attn_tp_rank == 0:\n"
+        "                    dualpath_transfer_start = getattr(\n"
+        "                        req, \"dualpath_transfer_start\", dualpath_transfer_end\n"
+        "                    )\n"
+        "                    dualpath_logical_tokens = getattr(\n"
+        "                        req, \"dualpath_transfer_logical_tokens\", 0\n"
+        "                    )\n"
+        "                    dualpath_page_count = getattr(\n"
+        "                        req, \"dualpath_transfer_page_count\", 0\n"
+        "                    )\n"
+        "                    dualpath_page_size = getattr(\n"
+        "                        req, \"dualpath_transfer_page_size\", 0\n"
+        "                    )\n"
         "                    logger.info(\n"
-        "                        \"DUALPATH_TTFT_P_TRANSFER rid=%s transfer_start=%.9f \"\n"
-        "                        \"transfer_end=%.9f transfer_s=%.9f logical_tokens=%d\",\n"
+        "                        \"DUALPATH_TTFT_P_TRANSFER_V2 rid=%s transfer_start=%.9f \"\n"
+        "                        \"transfer_end=%.9f transfer_s=%.9f logical_tokens=%d \"\n"
+        "                        \"page_aligned_tokens=%d page_count=%d page_size=%d\",\n"
         "                        req.rid,\n"
-        "                        req.time_stats.prefill_transfer_queue_entry_time,\n"
+        "                        dualpath_transfer_start,\n"
         "                        dualpath_transfer_end,\n"
-        "                        dualpath_transfer_end\n"
-        "                        - req.time_stats.prefill_transfer_queue_entry_time,\n"
-        "                        len(req.origin_input_ids),\n"
+        "                        dualpath_transfer_end - dualpath_transfer_start,\n"
+        "                        dualpath_logical_tokens,\n"
+        "                        dualpath_page_count * dualpath_page_size,\n"
+        "                        dualpath_page_count,\n"
+        "                        dualpath_page_size,\n"
         "                    )\n"
         "                release_kv_cache(req, self.tree_cache)  # unlock the tree\n",
         "record final KV transfer completion",

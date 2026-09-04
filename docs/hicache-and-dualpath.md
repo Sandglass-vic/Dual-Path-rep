@@ -4,29 +4,77 @@
 
 ## Phase 4：HiCache + Lustre
 
-### 目标语义：只复用 L3，不使用 L2 cache
+### 目标语义：与论文 DualPath 对齐——跨 request 不复用 L1/L2
 
-本项目需要的逻辑层次为：
+论文 §4.1：PE/DE **staging buffer** 与 **GPU buffer** 在单次 request 的加载/
+计算/传输后释放（Decode 在 H2D 完成后释放 CPU buffer）；跨轮 KV 复用依赖
+**外部存储（本复现为 Mooncake Store / Lustre DFS）**，而不是把上一轮 KV 留在
+本地 L1/L2 供下一轮直接命中。
+
+本项目逻辑层次：
 
 ```text
-L1：GPU KV-cache，仅服务当前计算和短期调度
-L2：不作为 KV-cache 命中层，不允许实验收益来自 host DRAM cache
-L3：共享外部 KV-cache，负责跨轮次、跨实例和重启后的前缀复用
+L1：GPU KV，仅服务当前 request 的计算与短期调度（用完即释放）
+L2/host staging：容量受控的搬运缓冲，不是跨 turn 命中层
+L3：Mooncake Store，负责跨轮次前缀复用
 ```
-
-“不使用 L2”指不在 host DRAM 中保留可再次命中的 KV 副本。实现上允许存在容量受控、生命周期短的 host staging/ring buffer，用于 L3→GPU、GPU→L3 和 PE→DE 搬运；staging buffer 不是缓存，数据传输完成后即可覆盖。
 
 期望的第二轮数据流：
 
 ```text
 1. 请求携带完整累积上下文到 Prefill。
-2. Prefill 根据 token prefix 查询 L3。
-3. L3 将命中的 Full Blocks 加载到 Prefill。
+2. Prefill 本地 L1/L2 无上一轮前缀（已 flush/释放）→ 查询 L3。
+3. L3 将命中的 Full Blocks 加载到 Prefill staging → GPU。
 4. Prefill 只计算 append/cache-miss tokens 的 KV。
-5. Prefill 将“L3 命中的 KV + 新计算的 KV”组成完整 prompt KV。
-6. Mooncake Transfer Engine 通过 RDMA 将完整 prompt KV 发送给 Decode。
-7. Decode 生成新 token，并把新产生的 KV 写回 L3，供下一轮使用。
+5. Prefill 将“L3 命中的 KV + 新计算的 KV”组成完整 prompt KV，P→D 传给 Decode。
+6. Decode 生成并写回 L3；本 request 的 staging/GPU 缓冲随后释放。
 ```
+
+### SGLang 近似实现
+
+SGLang HiCache **无法**关闭 L2 pool（`--hicache-size 0` 仍按 ratio 分配，且
+强制 L2>L1）。正式路径用客户端近似论文“用完即放”：
+
+1. 每轮 generate **之后**对 Prefill 调用 `/flush_cache`，清除 L1/L2 与 radix
+   metadata；
+2. **不**调用 `/clear_hicache_storage_backend`，保留 Mooncake Store；
+3. 可选 `STORAGE_SETTLE_SECONDS`（默认 1s），等待 Decode→Store 发布可见；
+4. `cache_flush_seconds` / `storage_settle_seconds` 单独记账，**不计入**
+   `turn_wall_seconds` / `trajectory_jct`；batch `wall_seconds` 仍含真实墙钟
+   （含 flush/settle）。
+
+环境变量（`pd_benchmark_lib.sh` 默认）：
+
+```bash
+FLUSH_LOCAL_CACHE_BETWEEN_TURNS=1
+STORAGE_SETTLE_SECONDS=1
+```
+
+Job `65694` 未 flush，prefix hit 来自 L1/L2，`l3_timing_coverage=0`，**不得**
+当作论文 L3 路径结果。
+
+### 当前 SGLang 0.5.7 的限制
+
+当前镜像源码的 host pool 分配逻辑为：
+
+```python
+if host_size > 0:
+    size = host_size
+else:
+    size = device_pool.size * host_to_device_ratio
+
+assert host_pool.size > device_pool.size
+```
+
+所以：
+
+- `--hicache-size 0` 表示按 `--hicache-ratio` 分配 L2，不是关闭 L2；
+- 当前协议强制 L2 大于 L1；
+- 仅靠命令行无法得到严格 L3-only；正式路径依赖 **逐轮 `/flush_cache`**。
+
+多 agent 并发时 flush 会清空整机 Prefill 本地层（与论文“每 request 独立从
+存储加载”一致），但可能与 in-flight 请求竞态；若出现 flush 失败，改为更小
+并发或排查 SGLang idle 要求。
 
 因此必须同时存在两种独立能力：
 
@@ -68,16 +116,14 @@ assert host_pool.size > device_pool.size
 - 仅靠现有命令行参数无法得到严格的 L3-only HiCache；
 - 文档和实验中不得把 `--hicache-size 0` 宣称为“禁用 L2”。
 
-本项目当前接受 SGLang 原生 L1/L2/L3 层次，不再把严格 L3-only 作为复现要求，
-也不计划修改 SGLang 的 Host cache admission/lookup。需要证明命中来自 L3 时，
-使用以下隔离方法之一：
+本项目当前接受 SGLang 原生 L1/L2/L3 **池子**存在，但正式性能路径通过逐轮
+`/flush_cache` 禁止跨 turn 的 L1/L2 命中，使可复用前缀来自 Mooncake Store。
+需要额外证明时仍可用完全重启 Prefill 做隔离对照。
 
-1. 完全重启 Prefill，消除进程内 L1/L2 和 radix metadata；
-2. 调用 `/flush_cache` 清空本地层，但不调用
-   `/clear_hicache_storage_backend`；
-3. 使用超过本地 cache 容量的 working set，并同时检查 storage prefetch 指标。
+文档必须区分：
 
-文档仍必须如实区分“L3 命中验证”和普通层次缓存命中。
+- **论文对齐路径**：flush L1/L2，跨 turn 走 L3（正式 benchmark 默认）；
+- **层次缓存顺风车**：不 flush（如 Job `65694`），`cached_tokens` 主要来自 L1/L2。
 
 ### 测试 KV 数据清理
 

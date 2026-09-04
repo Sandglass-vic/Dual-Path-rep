@@ -53,17 +53,17 @@ root 和新 master，避免跨 run 污染。
 `scripts/pd_1p1d_benchmark.sbatch` / `pd_1p2d_benchmark.sbatch` /
 `pd_2p2d_benchmark.sbatch`：
 
-- 单次 rollout 内 Decode 持续 Put，后续 turn 自然 Get；
+- 单次 rollout 内 Decode 持续 Put，下一 turn 在 **flush L1/L2 之后** 从 Store Get；
 - 不预 Populate、不重启进入 measured；
-- 不逐轮 flush、sleep 或等待 storage quiescence；
+- 默认 `FLUSH_LOCAL_CACHE_BETWEEN_TURNS=1`（论文 buffer 释放近似）；
+- 默认 `STORAGE_SETTLE_SECONDS=1`（Store 可见性，非旧长静默）；
 - 每个 run 从独立空 Store/DFS namespace 开始；
 - run 结束后删除本 Job 的 DFS shard 与 client-init 目录。
 
-`scripts/replay_fake_agent_traces.py` 已移除
-`--flush-local-cache-between-turns`、`--inter-turn-delay`、
-`--storage-dir` 和 `--storage-sync-timeout` 等正确性测试参数。JCT 只分为模型
-请求与不可避免的 client runtime。空流响应也不再随机 backoff/retry；正式
-run 遇到服务错误直接失败并报告。
+`scripts/replay_fake_agent_traces.py` 支持
+`--flush-local-cache-between-turns` / `--flush-cache-url` /
+`--storage-settle-seconds`。`trajectory_jct` 不含 flush/settle；batch
+`wall_seconds` 含墙钟。
 
 ## 已完成 Store 验证
 

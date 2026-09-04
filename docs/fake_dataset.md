@@ -198,10 +198,10 @@ python scripts/replay_fake_agent_traces.py \
   --stream
 ```
 
-client 不再包含逐轮 `/flush_cache`、固定 inter-turn delay 或等待 L3 文件增长
-的选项。Mooncake Store 在 rollout 中按自身完成状态发布 KV；agent 收到本轮
-输出后立即构造下一轮。多 agent 仍由 barrier 同时开始。
+client 正式默认开启逐轮 Prefill `/flush_cache`（保留 Mooncake Store）与短暂
+`STORAGE_SETTLE_SECONDS`，对齐论文 staging/GPU 用完即放、跨 turn 走 L3。
+`cache_flush_seconds` / `storage_settle_seconds` 写入 rounds，但不计入
+`turn_wall_seconds`。多 agent 仍由 barrier 同时开始。
 
-Job `64914/64984/65032/65502` 使用的 flush、Populate/Recover 或 storage wait
-属于旧 file backend 的正确性诊断，不是论文性能方法。历史结果保留，但正式
-JCT 不引用这些作业。
+Job `64914/64984/65032/65502` 的长 storage wait / Populate，以及 Job `65694`
+未 flush 的 L1/L2 路径，均不是当前正式口径。

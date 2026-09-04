@@ -23,8 +23,16 @@ dualpath_export_common_env() {
   export MOONCAKE_DFS_ALIGNMENT=${MOONCAKE_DFS_ALIGNMENT:-4096}
   export MOONCAKE_DFS_SINGLE_TENANT=true
   export MOONCAKE_ENABLE_DFS=1
+  # Paper DualPath: staging/GPU buffers are released after each request; the next
+  # request must reload from L3. SGLang approximates this by Prefill /flush_cache
+  # (L1/L2 only) while keeping Mooncake Store. Default ON for formal runs.
+  export FLUSH_LOCAL_CACHE_BETWEEN_TURNS=${FLUSH_LOCAL_CACHE_BETWEEN_TURNS:-1}
+  export STORAGE_SETTLE_SECONDS=${STORAGE_SETTLE_SECONDS:-1}
+  export COLLECT_L3_STORAGE_SNAPSHOT=${COLLECT_L3_STORAGE_SNAPSHOT:-1}
   export MODEL_DIR LOG_DIR CACHE_DIR IB_DEVICE PREFILL_PORT DECODE_PORT
   export BOOTSTRAP_PORT ROUTER_PORT SERVER_TIMEOUT
+  export FLUSH_LOCAL_CACHE_BETWEEN_TURNS STORAGE_SETTLE_SECONDS
+  export COLLECT_L3_STORAGE_SNAPSHOT
 }
 
 dualpath_wait_for_url() {
@@ -74,11 +82,21 @@ dualpath_write_run_json() {
   local max_len=$3
   local agents=$4
   local repetition=$5
+  local flush_flag=0
+  local snapshot_flag=0
+  local settle="${STORAGE_SETTLE_SECONDS:-0}"
+  if [[ "${FLUSH_LOCAL_CACHE_BETWEEN_TURNS:-1}" == 1 ]]; then
+    flush_flag=1
+  fi
+  if [[ "${COLLECT_L3_STORAGE_SNAPSHOT:-1}" == 1 ]]; then
+    snapshot_flag=1
+  fi
   python - "$path" "$architecture" "$max_len" "$agents" "$repetition" \
     "$MAX_TURNS" "$ABLATION_PROFILE" "$MEASURED_PREFILL_L3" \
     "$MEASURED_DECODE_OFFLOAD" "$CHUNKED_PREFILL_SIZE" \
     "$DISABLE_OVERLAP_SCHEDULE" "$PAPER_EXPAND_AGENTS" \
-    "$PAPER_SYNTHETIC_APPEND_TOKENS" <<'PY'
+    "$PAPER_SYNTHETIC_APPEND_TOKENS" "$flush_flag" "$settle" \
+    "$snapshot_flag" <<'PY'
 from pathlib import Path
 import json
 import sys
@@ -96,12 +114,20 @@ Path(sys.argv[1]).write_text(json.dumps({
     "disable_overlap_schedule": bool(int(sys.argv[11])),
     "paper_expand_agents": bool(int(sys.argv[12])),
     "paper_synthetic_append_tokens": int(sys.argv[13]),
-    "cache_policy": "dynamic-full-rollout",
+    "cache_policy": "paper-aligned-l3-reload",
     "cache_initial_state": "empty",
     "storage_backend": "mooncake-dfs-posix-lustre",
     "artificial_inter_turn_delay": False,
-    "per_turn_cache_flush": False,
-    "storage_quiescence_wait": False,
+    "per_turn_cache_flush": bool(int(sys.argv[14])),
+    "storage_settle_seconds": float(sys.argv[15]),
+    "storage_quiescence_wait": bool(float(sys.argv[15]) > 0),
+    "collect_l3_storage_snapshot": bool(int(sys.argv[16])),
+    "l3_storage_snapshot_kind": "recursive apparent bytes and st_blocks allocated bytes",
+    "kv_buffer_semantics": (
+        "DualPath paper: staging/GPU buffers released after each request; "
+        "cross-turn reuse via L3 only. SGLang approx: Prefill /flush_cache "
+        "drops L1/L2 radix; Mooncake Store retained."
+    ),
 }, indent=2) + "\n")
 PY
 }
@@ -113,6 +139,9 @@ dualpath_run_replay() {
   local prefix=$4
   local paper_args=()
   local turn_args=()
+  local flush_args=()
+  local storage_args=()
+  local host
   if (( MAX_TURNS > 0 )); then
     turn_args+=(--max-turns "$MAX_TURNS")
   fi
@@ -123,6 +152,28 @@ dualpath_run_replay() {
     )
   elif [[ "$PAPER_EXPAND_AGENTS" != 0 ]]; then
     echo "PAPER_EXPAND_AGENTS must be 0 or 1" >&2
+    return 2
+  fi
+  if [[ "${FLUSH_LOCAL_CACHE_BETWEEN_TURNS:-1}" == 1 ]]; then
+    flush_args+=(--flush-local-cache-between-turns)
+    # Flush every Prefill instance (1P* uses PREFILL_HOST; 2P2D also lists PREFILL_HOSTS).
+    if [[ -n ${PREFILL_HOSTS:-} ]]; then
+      for host in $PREFILL_HOSTS; do
+        flush_args+=(--flush-cache-url "http://$host:$PREFILL_PORT/flush_cache")
+      done
+    else
+      flush_args+=(--flush-cache-url "http://$PREFILL_HOST:$PREFILL_PORT/flush_cache")
+    fi
+    flush_args+=(--storage-settle-seconds "${STORAGE_SETTLE_SECONDS:-1}")
+  elif [[ "${FLUSH_LOCAL_CACHE_BETWEEN_TURNS:-1}" != 0 ]]; then
+    echo "FLUSH_LOCAL_CACHE_BETWEEN_TURNS must be 0 or 1" >&2
+    return 2
+  fi
+  if [[ "${COLLECT_L3_STORAGE_SNAPSHOT:-1}" == 1 ]]; then
+    : "${MOONCAKE_DFS_ROOT_DIR:?MOONCAKE_DFS_ROOT_DIR is required for L3 snapshots}"
+    storage_args+=(--storage-dir "$MOONCAKE_DFS_ROOT_DIR")
+  elif [[ "${COLLECT_L3_STORAGE_SNAPSHOT:-1}" != 0 ]]; then
+    echo "COLLECT_L3_STORAGE_SNAPSHOT must be 0 or 1" >&2
     return 2
   fi
   python scripts/replay_fake_agent_traces.py \
@@ -136,5 +187,7 @@ dualpath_run_replay() {
     --max-context-tokens "$CONTEXT_LENGTH" \
     --request-id-prefix "$prefix" \
     "${paper_args[@]}" \
+    "${flush_args[@]}" \
+    "${storage_args[@]}" \
     --stream
 }

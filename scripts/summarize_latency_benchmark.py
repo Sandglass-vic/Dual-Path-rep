@@ -25,8 +25,10 @@ L3_PATTERN = re.compile(
     r"read_s=(?P<read>[0-9.]+) tokens=(?P<tokens>\d+)"
 )
 P_TRANSFER_PATTERN = re.compile(
-    r"DUALPATH_TTFT_P_TRANSFER rid=(?P<rid>\S+) .*?"
+    r"DUALPATH_TTFT_P_TRANSFER(?:_V2)? rid=(?P<rid>\S+) .*?"
     r"transfer_s=(?P<seconds>[0-9.]+) logical_tokens=(?P<tokens>\d+)"
+    r"(?: page_aligned_tokens=(?P<page_tokens>\d+) "
+    r"page_count=(?P<page_count>\d+) page_size=(?P<page_size>\d+))?"
 )
 KV_BYTES_PER_TOKEN = 64 * 8 * 128 * 2 * 2
 
@@ -79,6 +81,15 @@ def parse_timing_logs(
                 )
                 transfer_values[rid]["tokens"].append(
                     float(match.group("tokens"))
+                )
+                transfer_values[rid]["page_tokens"].append(
+                    float(match.group("page_tokens") or 0)
+                )
+                transfer_values[rid]["page_count"].append(
+                    float(match.group("page_count") or 0)
+                )
+                transfer_values[rid]["page_size"].append(
+                    float(match.group("page_size") or 0)
                 )
 
     requests = {
@@ -205,6 +216,9 @@ def main() -> None:
             request = request_timing.get(rid, {})
             l3 = l3_timing.get(rid, {})
             pd = pd_timing.get(rid, {})
+            pd_payload_tokens = int(
+                pd.get("page_tokens", 0) or pd.get("tokens", 0)
+            )
             sch = float(request.get("queue", 0.0))
             alloc = float(request.get("alloc", 0.0))
             read = float(l3.get("read", 0.0))
@@ -230,8 +244,16 @@ def main() -> None:
                     "has_l3_timing": bool(l3),
                     "pd_transfer_seconds": float(pd.get("seconds", 0.0)),
                     "pd_transfer_tokens": int(pd.get("tokens", 0)),
+                    "pd_transfer_page_aligned_tokens": int(
+                        pd.get("page_tokens", 0)
+                    ),
+                    "pd_transfer_page_count": int(pd.get("page_count", 0)),
+                    "pd_transfer_page_size": int(pd.get("page_size", 0)),
+                    "pd_transfer_payload_bytes": (
+                        pd_payload_tokens * KV_BYTES_PER_TOKEN
+                    ),
                     "pd_effective_bandwidth_gbps": (
-                        float(pd.get("tokens", 0))
+                        float(pd_payload_tokens)
                         * KV_BYTES_PER_TOKEN
                         / float(pd["seconds"])
                         / 1e9

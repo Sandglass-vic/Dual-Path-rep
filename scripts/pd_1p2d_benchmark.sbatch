@@ -9,14 +9,14 @@
 #SBATCH --exclusive
 #SBATCH --time=06:00:00
 # Known platform-faulty nodes; keep in sync with docs/platform.md.
-#SBATCH --exclude=dgx-gaia-30,dgx-gaia-46,dgx-gaia-53
+#SBATCH --exclude=dgx-gaia-18,dgx-gaia-30,dgx-gaia-46,dgx-gaia-53
 #SBATCH --output=/mnt/lustre/users/sezhou/dual-path/logs/slurm-1p2d-benchmark-%j.out
 
 set -euo pipefail
 
 CODE_HOME=${CODE_HOME:-/labhome/sezhou/dual-path}
 RUNTIME_HOME=${RUNTIME_HOME:-/mnt/lustre/users/sezhou/dual-path}
-IMAGE=${IMAGE:-$RUNTIME_HOME/images/sglang:26.01-py3-mooncake0.3.13.post1-timing.sqsh}
+IMAGE=${IMAGE:-$RUNTIME_HOME/images/sglang:26.01-py3-mooncake0.3.13.post1-timing-v2.sqsh}
 MODEL_DIR=${MODEL_DIR:-$RUNTIME_HOME/models/Qwen2.5-32B}
 LOG_DIR=${LOG_DIR:-$RUNTIME_HOME/logs/latency-benchmark/$SLURM_JOB_ID}
 RESULT_DIR=${RESULT_DIR:-$RUNTIME_HOME/results/latency-benchmark/$SLURM_JOB_ID}

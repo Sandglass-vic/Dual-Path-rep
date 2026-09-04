@@ -11,7 +11,7 @@ set -euo pipefail
 CODE_HOME=${CODE_HOME:-/labhome/sezhou/dual-path}
 RUNTIME_HOME=${RUNTIME_HOME:-/mnt/lustre/users/sezhou/dual-path}
 BASE_IMAGE=${BASE_IMAGE:-$RUNTIME_HOME/images/sglang:26.01-py3.sqsh}
-OUTPUT_IMAGE=${OUTPUT_IMAGE:-$RUNTIME_HOME/images/sglang:26.01-py3-mooncake0.3.13.post1-timing.sqsh}
+OUTPUT_IMAGE=${OUTPUT_IMAGE:-$RUNTIME_HOME/images/sglang:26.01-py3-mooncake0.3.13.post1-timing-v2.sqsh}
 MOONCAKE_VERSION=${MOONCAKE_VERSION:-0.3.13.post1}
 CONTAINER_NAME=sglang-timing-"$SLURM_JOB_ID"
 
@@ -68,8 +68,9 @@ assert "config.dfs_replica_num = self.dfs_replica_num" in mooncake_backend
 assert "DUALPATH_L3_TIMING" in hiradix
 assert "prefill_engine=%s" in hiradix
 assert "DUALPATH_REQ_TIMING" in schedule_batch
-assert "DUALPATH_TTFT_P_TRANSFER" in prefill
-assert "prefill_transfer_queue_entry_time == 0" in prefill
+assert '"DUALPATH_TTFT_P_TRANSFER_V2 rid=%s ' in prefill
+assert "dualpath_transfer_page_count" in prefill
+assert "page_aligned_tokens=%d" in prefill
 assert "DUALPATH_TTFT_D_RECEIVE" in decode
 assert "DUALPATH_TTFT_D_DISPATCH" in output_processor
 assert "DUALPATH_TTFT_HTTP_YIELD" in http_server

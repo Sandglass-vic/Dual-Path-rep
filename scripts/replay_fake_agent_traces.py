@@ -29,6 +29,10 @@ class ReplayConfig:
     token_id_min: int
     token_id_max: int
     max_context_tokens: int | None
+    flush_cache_urls: tuple[str, ...]
+    storage_settle_seconds: float
+    flush_lock: threading.Lock | None
+    storage_dirs: tuple[Path, ...]
 
 
 def synthetic_token_ids(
@@ -172,6 +176,51 @@ def extract_output_ids(response: dict[str, Any]) -> list[int]:
     return output_ids
 
 
+def flush_local_caches(urls: tuple[str, ...], timeout: float) -> float:
+    """Clear Prefill L1/L2 radix; keep Mooncake Store / L3 intact.
+
+    Approximates DualPath paper semantics where staging/GPU buffers are released
+    after a request, so the next request must reload KV from L3 storage.
+    """
+    if not urls:
+        return 0.0
+    started = time.perf_counter()
+    for url in urls:
+        request = urllib.request.Request(url, method="POST", data=b"")
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            response.read()
+    return time.perf_counter() - started
+
+
+def snapshot_storage(paths: tuple[Path, ...]) -> dict[str, int | float]:
+    """Return a recursive Lustre snapshot without following symlinks.
+
+    Mooncake DFS shard files may be sparse/preallocated.  Apparent bytes are
+    useful for describing the namespace, while allocated bytes (st_blocks)
+    represent filesystem blocks currently charged to the files.
+    """
+    started = time.perf_counter()
+    apparent_bytes = 0
+    allocated_bytes = 0
+    file_count = 0
+    for root in paths:
+        if not root.exists():
+            continue
+        for path in root.rglob("*"):
+            if not path.is_file() or path.is_symlink():
+                continue
+            stat = path.stat()
+            apparent_bytes += stat.st_size
+            allocated_bytes += stat.st_blocks * 512
+            file_count += 1
+    return {
+        "l3_apparent_bytes_after_turn": apparent_bytes,
+        "l3_allocated_bytes_after_turn": allocated_bytes,
+        "l3_file_count_after_turn": file_count,
+        "storage_snapshot_seconds": time.perf_counter() - started,
+    }
+
+
 def replay_trajectory(
     trajectory: dict[str, Any],
     config: ReplayConfig,
@@ -187,7 +236,7 @@ def replay_trajectory(
     if max_turns is not None:
         turns = turns[:max_turns]
 
-    for turn in turns:
+    for turn_index, turn in enumerate(turns):
         turn_started = time.perf_counter()
         turn_id = int(turn["turn_id"])
         append_tokens = int(turn["append_tokens"])
@@ -257,6 +306,46 @@ def replay_trajectory(
             }
         )
 
+        # Paper DualPath: release staging/GPU after the request. On SGLang we
+        # approximate by flushing Prefill L1/L2 while keeping Mooncake Store.
+        # Flush/settle are recorded separately and are NOT part of turn_wall.
+        if config.flush_cache_urls and turn_index + 1 < len(turns):
+            flush_seconds = 0.0
+            settle_seconds = 0.0
+            lock = config.flush_lock
+            if lock is not None:
+                lock.acquire()
+            try:
+                flush_seconds = flush_local_caches(
+                    config.flush_cache_urls, config.timeout
+                )
+                if config.storage_settle_seconds > 0:
+                    settle_started = time.perf_counter()
+                    time.sleep(config.storage_settle_seconds)
+                    settle_seconds = time.perf_counter() - settle_started
+            finally:
+                if lock is not None:
+                    lock.release()
+            round_results[-1]["cache_flush_seconds"] = flush_seconds
+            round_results[-1]["storage_settle_seconds"] = settle_seconds
+        else:
+            round_results[-1]["cache_flush_seconds"] = 0.0
+            round_results[-1]["storage_settle_seconds"] = 0.0
+        if config.storage_dirs:
+            # The last turn has no following-request flush branch, but still
+            # needs a short visibility delay before the final filesystem
+            # snapshot observes asynchronous Decode -> Store writes.
+            if (
+                turn_index + 1 == len(turns)
+                and config.storage_settle_seconds > 0
+            ):
+                settle_started = time.perf_counter()
+                time.sleep(config.storage_settle_seconds)
+                round_results[-1]["storage_settle_seconds"] = (
+                    time.perf_counter() - settle_started
+                )
+            round_results[-1].update(snapshot_storage(config.storage_dirs))
+
     elapsed_seconds = sum(
         float(item["turn_wall_seconds"]) for item in round_results
     )
@@ -271,6 +360,12 @@ def replay_trajectory(
         ),
         "turn_client_runtime_seconds": sum(
             float(item["turn_client_runtime_seconds"]) for item in round_results
+        ),
+        "cache_flush_seconds": sum(
+            float(item.get("cache_flush_seconds", 0.0)) for item in round_results
+        ),
+        "storage_settle_seconds": sum(
+            float(item.get("storage_settle_seconds", 0.0)) for item in round_results
         ),
         "jct_accounting_error_seconds": sum(
             float(item["turn_accounting_error_seconds"]) for item in round_results
@@ -405,10 +500,46 @@ def main() -> None:
     parser.add_argument("--token-id-min", type=int, default=1000)
     parser.add_argument("--token-id-max", type=int, default=30000)
     parser.add_argument("--max-context-tokens", type=int)
+    parser.add_argument(
+        "--flush-local-cache-between-turns",
+        action="store_true",
+        help=(
+            "After each turn, POST Prefill /flush_cache to drop L1/L2 while "
+            "keeping Mooncake Store (paper DualPath buffer-release approx)."
+        ),
+    )
+    parser.add_argument(
+        "--flush-cache-url",
+        action="append",
+        default=[],
+        help="Prefill flush_cache URL; repeat for multi-Prefill. Required with flush.",
+    )
+    parser.add_argument(
+        "--storage-settle-seconds",
+        type=float,
+        default=0.0,
+        help="Sleep after flush to let Decode→Mooncake Store publish become visible.",
+    )
+    parser.add_argument(
+        "--storage-dir",
+        type=Path,
+        action="append",
+        default=[],
+        help=(
+            "Mooncake DFS directory to snapshot after each turn. Repeatable; "
+            "records apparent and allocated bytes separately."
+        ),
+    )
     args = parser.parse_args()
 
     if args.token_id_min < 0 or args.token_id_max <= args.token_id_min:
         parser.error("invalid token ID range")
+    if args.flush_local_cache_between_turns and not args.flush_cache_url:
+        parser.error(
+            "--flush-local-cache-between-turns requires at least one --flush-cache-url"
+        )
+    if args.storage_settle_seconds < 0:
+        parser.error("--storage-settle-seconds must be >= 0")
     if args.paper_expand_agents:
         if args.trajectory_offset != 0:
             parser.error("--paper-expand-agents requires --trajectory-offset=0")
@@ -436,6 +567,14 @@ def main() -> None:
             )
     workers = args.max_workers or len(trajectories)
     workers = min(workers, len(trajectories))
+    flush_urls = tuple(url.rstrip("/") for url in args.flush_cache_url)
+    if args.flush_local_cache_between_turns:
+        flush_urls = tuple(
+            url if url.endswith("/flush_cache") else f"{url}/flush_cache"
+            for url in flush_urls
+        )
+    else:
+        flush_urls = ()
     config = ReplayConfig(
         endpoint=args.base_url.rstrip("/") + "/generate",
         timeout=args.timeout,
@@ -446,6 +585,12 @@ def main() -> None:
         token_id_min=args.token_id_min,
         token_id_max=args.token_id_max,
         max_context_tokens=args.max_context_tokens,
+        flush_cache_urls=flush_urls,
+        storage_settle_seconds=(
+            args.storage_settle_seconds if args.flush_local_cache_between_turns else 0.0
+        ),
+        flush_lock=threading.Lock() if flush_urls else None,
+        storage_dirs=tuple(args.storage_dir),
     )
     start_event = threading.Event()
     all_rounds: list[dict[str, Any]] = []
@@ -527,6 +672,19 @@ def main() -> None:
         summary["batched_token_chunks"] = sum(
             int(item.get("batched_token_chunks", 0)) for item in all_rounds
         )
+    summary["flush_local_cache_between_turns"] = bool(flush_urls)
+    summary["flush_cache_urls"] = list(flush_urls)
+    summary["storage_settle_seconds_config"] = config.storage_settle_seconds
+    summary["cache_flush_seconds_total"] = sum(
+        float(item.get("cache_flush_seconds", 0.0)) for item in all_rounds
+    )
+    summary["storage_settle_seconds_total"] = sum(
+        float(item.get("storage_settle_seconds", 0.0)) for item in all_rounds
+    )
+    summary["storage_snapshot_seconds_total"] = sum(
+        float(item.get("storage_snapshot_seconds", 0.0)) for item in all_rounds
+    )
+    summary["storage_snapshot_dirs"] = [str(path) for path in config.storage_dirs]
     (args.output_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     print(json.dumps(summary, indent=2))
     if errors:

@@ -5,7 +5,7 @@
 #SBATCH --ntasks=2
 #SBATCH --ntasks-per-node=1
 #SBATCH --exclusive
-#SBATCH --exclude=dgx-gaia-30,dgx-gaia-46,dgx-gaia-53
+#SBATCH --exclude=dgx-gaia-18,dgx-gaia-30,dgx-gaia-46,dgx-gaia-53
 #SBATCH --time=00:15:00
 #SBATCH --output=/mnt/lustre/users/sezhou/dual-path/logs/mooncake-store-smoke-%j.out
 
@@ -13,7 +13,7 @@ set -euo pipefail
 
 CODE_HOME=${CODE_HOME:-/labhome/sezhou/dual-path}
 RUNTIME_HOME=${RUNTIME_HOME:-/mnt/lustre/users/sezhou/dual-path}
-IMAGE=${IMAGE:-$RUNTIME_HOME/images/sglang:26.01-py3-mooncake0.3.13.post1-timing.sqsh}
+IMAGE=${IMAGE:-$RUNTIME_HOME/images/sglang:26.01-py3-mooncake0.3.13.post1-timing-v2.sqsh}
 TEST_DIR=${TEST_DIR:-$RUNTIME_HOME/kv-cache/mooncake-store-smoke/$SLURM_JOB_ID}
 LOG_DIR=${LOG_DIR:-$RUNTIME_HOME/logs/mooncake-store-smoke/$SLURM_JOB_ID}
 MASTER_PORT=${MASTER_PORT:-50051}

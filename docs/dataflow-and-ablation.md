@@ -17,20 +17,17 @@
    Mooncake Store；Store 同时创建一个 memory replica 和一个 Lustre POSIX
    DFS replica。
 
-正式性能路径不等待额外 `fsync` 或文件静默。Mooncake `PutEnd` 只在完整对象
-写入成功后发布该对象，读者不会看到部分对象；这解决的是旧 file backend 的
-可见性/`Short read` 问题，不代表 DFS 已执行 `fsync`。
-
-当前 latency benchmark 是同一次 rollout 内的动态反馈环：
+正式路径与论文 §4.1 对齐：每轮结束后 Prefill `/flush_cache` 释放 L1/L2，下一轮
+从 Mooncake Store 加载；默认短暂 `STORAGE_SETTLE_SECONDS` 仅保证 Put 可见。
 
 ```text
-turn N:   Prefill 查询 Store -> PD transfer -> Decode -> Store Put
-turn N+1: Prefill 使用当时已经发布的最长可复用前缀
+turn N:   Prefill（本地无上轮前缀）-> L3 prefetch -> PD -> Decode -> Store Put
+          -> /flush_cache (+ optional settle)
+turn N+1: 再次从 Store 加载已发布前缀
 ```
 
-没有 Populate/Measured、逐轮 cache flush、固定 sleep、storage wait 或 Decode
-scratch。每个独立 run 使用新的 Mooncake master 和 DFS root，避免不同实验之间
-缓存污染。
+没有 Populate/Measured。每个独立 run 使用新的 Mooncake master 和 DFS root。
+Job `65694` 未 flush，属于 L1/L2 顺风车对照，不是正式口径。
 
 ## Prefill 与 P→D 传输粒度
 

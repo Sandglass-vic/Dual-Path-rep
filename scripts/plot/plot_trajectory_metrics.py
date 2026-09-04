@@ -18,8 +18,10 @@ GIB = 1024**3
 GB = 10**9
 
 P_TRANSFER = re.compile(
-    r"DUALPATH_TTFT_P_TRANSFER rid=(?P<rid>\S+) .*?"
+    r"DUALPATH_TTFT_P_TRANSFER(?:_V2)? rid=(?P<rid>\S+) .*?"
     r"transfer_s=(?P<seconds>[0-9.]+) logical_tokens=(?P<tokens>\d+)"
+    r"(?: page_aligned_tokens=(?P<page_tokens>\d+) "
+    r"page_count=(?P<page_count>\d+) page_size=(?P<page_size>\d+))?"
 )
 L3_READ = re.compile(
     r"DUALPATH_L3_TIMING rid=(?P<rid>\S+) "
@@ -32,10 +34,12 @@ def parse_logs(
     log_dir: Path,
     log_glob: str = "prefill*.log",
 ) -> tuple[
-    dict[str, tuple[float, int]],
+    dict[str, tuple[float, int, int, int, int]],
     dict[str, dict[str, dict[int, tuple[float, int]]]],
 ]:
-    transfer_values: dict[str, list[tuple[float, int]]] = defaultdict(list)
+    transfer_values: dict[
+        str, list[tuple[float, int, int, int, int]]
+    ] = defaultdict(list)
     read_values: dict[
         str, dict[str, dict[int, list[tuple[float, int]]]]
     ] = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
@@ -49,6 +53,9 @@ def parse_logs(
                     (
                         float(transfer_match.group("seconds")),
                         int(transfer_match.group("tokens")),
+                        int(transfer_match.group("page_tokens") or 0),
+                        int(transfer_match.group("page_count") or 0),
+                        int(transfer_match.group("page_size") or 0),
                     )
                 )
                 continue
@@ -67,6 +74,9 @@ def parse_logs(
         rid: (
             statistics.median(item[0] for item in items),
             round(statistics.median(item[1] for item in items)),
+            round(statistics.median(item[2] for item in items)),
+            round(statistics.median(item[3] for item in items)),
+            round(statistics.median(item[4] for item in items)),
         )
         for rid, items in transfer_values.items()
     }
@@ -98,16 +108,32 @@ def build_rows(
     engine_rank_rows: dict[
         str, list[dict[str, float | int | str]]
     ] = defaultdict(list)
-    previous_storage = 0
+    previous_storage: int | None = None
     for item in rounds:
         rid = item["request_id"]
         prompt_tokens = int(item["prompt_tokens"])
         generated_tokens = int(item["actual_generate_tokens"])
         append_tokens = int(item["append_tokens"])
         cached_tokens = int(item["cached_tokens"])
-        storage_bytes = int(item.get("storage_bytes_after_turn", 0))
-        transfer_seconds, transfer_tokens = transfer.get(
-            rid, (0.0, prompt_tokens)
+        storage_raw = item.get(
+            "l3_allocated_bytes_after_turn",
+            item.get("storage_bytes_after_turn"),
+        )
+        storage_bytes = int(storage_raw) if storage_raw is not None else None
+        storage_apparent_raw = item.get("l3_apparent_bytes_after_turn")
+        storage_apparent_bytes = (
+            int(storage_apparent_raw)
+            if storage_apparent_raw is not None
+            else None
+        )
+        (
+            transfer_seconds,
+            transfer_tokens,
+            transfer_page_tokens,
+            transfer_page_count,
+            transfer_page_size,
+        ) = transfer.get(
+            rid, (0.0, 0, 0, 0, 0)
         )
         request_engines = l3_read.get(rid, {})
         if len(request_engines) > 1:
@@ -134,7 +160,10 @@ def build_rows(
             engine_rank_rows[prefill_engine].append(rank_row)
         else:
             slowest_rank, l3_seconds, l3_tokens = -1, 0.0, 0
-        transfer_bytes = transfer_tokens * KV_BYTES_PER_TOKEN
+        # Page-aligned tokens estimate actual KV payload sent by all TP ranks.
+        # V1 logs lack page fields and fall back to logical tokens.
+        transfer_payload_tokens = transfer_page_tokens or transfer_tokens
+        transfer_bytes = transfer_payload_tokens * KV_BYTES_PER_TOKEN
         l3_bytes = l3_tokens * KV_BYTES_PER_TOKEN
         rows.append(
             {
@@ -170,11 +199,25 @@ def build_rows(
                 ),
                 "l3_physical_increment_gib": max(
                     0, storage_bytes - previous_storage
-                )
-                / GIB,
-                "l3_physical_total_gib": storage_bytes / GIB,
-                "l3_physical_snapshot_gib": storage_bytes / GIB,
+                ) / GIB
+                if storage_bytes is not None and previous_storage is not None
+                else None,
+                "l3_physical_total_gib": (
+                    storage_bytes / GIB if storage_bytes is not None else None
+                ),
+                "l3_physical_snapshot_gib": (
+                    storage_bytes / GIB if storage_bytes is not None else None
+                ),
+                "l3_apparent_snapshot_gib": (
+                    storage_apparent_bytes / GIB
+                    if storage_apparent_bytes is not None
+                    else None
+                ),
                 "pd_transfer_tokens": transfer_tokens,
+                "pd_transfer_page_aligned_tokens": transfer_page_tokens,
+                "pd_transfer_page_count": transfer_page_count,
+                "pd_transfer_page_size": transfer_page_size,
+                "pd_transfer_payload_bytes": transfer_bytes,
                 "pd_transfer_seconds": transfer_seconds,
                 "pd_effective_bandwidth_gbps": (
                     transfer_bytes / transfer_seconds / GB
@@ -187,7 +230,8 @@ def build_rows(
                 ),
             }
         )
-        previous_storage = storage_bytes
+        if storage_bytes is not None:
+            previous_storage = storage_bytes
     return rows, dict(engine_rank_rows)
 
 
@@ -337,16 +381,25 @@ def main() -> None:
         "New KV Data by Turn",
         args.output_dir / "trajectory_new_kv.svg",
     )
-    plot(
-        rows,
-        (
-            ("total_logical_kv_gib", "Total logical context KV", "#0f766e"),
+    total_kv_series = [
+        ("total_logical_kv_gib", "Total logical context KV", "#0f766e")
+    ]
+    physical_values = [
+        row.get("l3_physical_snapshot_gib")
+        for row in rows
+        if row.get("l3_physical_snapshot_gib") not in (None, "")
+    ]
+    if physical_values:
+        total_kv_series.append(
             (
                 "l3_physical_snapshot_gib",
-                "Observed L3 snapshot (async)",
+                "Lustre allocated blocks (async snapshot)",
                 "#7c3aed",
-            ),
-        ),
+            )
+        )
+    plot(
+        rows,
+        tuple(total_kv_series),
         "GiB",
         "Total KV Data by Turn",
         args.output_dir / "trajectory_total_kv.svg",
@@ -454,9 +507,16 @@ def main() -> None:
         ),
         "final_cache_hit_rate": float(rows[-1]["cache_hit_rate"]),
         "final_logical_kv_gib": float(rows[-1]["total_logical_kv_gib"]),
-        "final_l3_physical_gib": float(rows[-1]["l3_physical_total_gib"]),
-        "final_observed_l3_snapshot_gib": float(
-            rows[-1]["l3_physical_snapshot_gib"]
+        "l3_storage_snapshot_available": bool(physical_values),
+        "final_l3_physical_gib": (
+            float(rows[-1]["l3_physical_total_gib"])
+            if rows[-1].get("l3_physical_total_gib") not in (None, "")
+            else None
+        ),
+        "final_observed_l3_snapshot_gib": (
+            float(rows[-1]["l3_physical_snapshot_gib"])
+            if rows[-1].get("l3_physical_snapshot_gib") not in (None, "")
+            else None
         ),
         "median_pd_effective_bandwidth_gbps": statistics.median(
             float(row["pd_effective_bandwidth_gbps"]) for row in rows
