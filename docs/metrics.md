@@ -370,10 +370,10 @@ Job 结束时统一调用 `scripts/benchmark/collect_benchmark_metrics.py`。
 - latency：`turn.svg`、`ttft.svg`、`ttst.svg`、`tpot.svg`；JCT 与 turn 图信息
   重复，不单独画；
 - KV/cache：`kv-new.svg`、`kv-total.svg`、`cache-hit.svg`；
-- 每个 Prefill engine：
-  `l3-read-data-engine-<ID>.svg`、`l3-read-time-engine-<ID>.svg`；
-  1P* 只有 engine 0；2P2D 的 engine 0/1 共享 Mooncake DFS namespace，但一个
-  request 只由 Router 选中的 Prefill engine 发起 L3 read，因此按 engine 分图；
+- L3 read：`l3-read-data.svg` 汇总最长轨迹每个 turn 的 TP 聚合逻辑读取量，不在
+  文件名中使用有歧义的 engine 0；`l3-read-time-prefill-<ID>.svg` 才按 Prefill
+  replica 区分并展示其 TP ranks。1P* 只有 replica 0；2P2D 的 replica 0/1 共享
+  Mooncake DFS namespace，但一个 request 只由 Router 选中的 replica 发起读取；
 - bandwidth：`l3-bandwidth.svg`、`pd-bandwidth.svg`。
 
 `all-trajectories/latency.svg` 同时展示每个 agent 的 trajectory JCT、agent 内
@@ -415,7 +415,8 @@ scripts/benchmark/collect_benchmark_metrics.py
   -> scripts/plot/plot_trajectory_latency.py
        -> <run>/longest-trajectory/{turn,ttft,ttst,tpot}.svg
        -> <run>/longest-trajectory/{kv-new,kv-total,cache-hit}.svg
-       -> <run>/longest-trajectory/l3-read-{data,time}-engine-<ID>.svg
+       -> <run>/longest-trajectory/l3-read-data.svg
+       -> <run>/longest-trajectory/l3-read-time-prefill-<ID>.svg
        -> <run>/longest-trajectory/{l3-bandwidth,pd-bandwidth}.svg
   -> scripts/plot/plot_run_summary.py
        -> <run>/all-trajectories/latency.svg

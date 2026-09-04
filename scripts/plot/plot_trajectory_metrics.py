@@ -452,6 +452,22 @@ def main() -> None:
         "#65a30d",
         "#7c2d12",
     )
+    all_l3_rows = sorted(
+        (
+            row
+            for rank_rows in engine_rank_rows.values()
+            for row in rank_rows
+        ),
+        key=lambda row: int(row["turn_id"]),
+    )
+    if all_l3_rows:
+        plot(
+            all_l3_rows,
+            (("l3_read_gib", "Logical KV read (TP aggregate)", "#0f766e"),),
+            "GiB",
+            "L3 Read Data by Turn",
+            args.output_dir / "l3-read-data.svg",
+        )
     for engine, rank_rows in sorted(engine_rank_rows.items()):
         for row in rank_rows:
             missing = [
@@ -495,17 +511,13 @@ def main() -> None:
             rank_rows,
             series,
             "Seconds",
-            f"Prefill Engine {engine}: L3 Read Time by TP Rank",
+            f"Prefill Replica {engine}: L3 Read Time by TP Rank",
             args.output_dir
-            / f"l3-read-time-engine-{safe_engine}.svg",
+            / f"l3-read-time-prefill-{safe_engine}.svg",
         )
-        plot(
-            rank_rows,
-            (("l3_read_gib", "Logical KV read", "#0f766e"),),
-            "GiB",
-            f"Prefill Engine {engine}: L3 Read Data by Turn",
-            args.output_dir / f"l3-read-data-engine-{safe_engine}.svg",
-        )
+    for pattern in ("l3-read-data-engine-*.svg", "l3-read-time-engine-*.svg"):
+        for legacy in args.output_dir.glob(pattern):
+            legacy.unlink()
     positive_l3 = [
         float(row["prefill_l3_effective_bandwidth_gbps"])
         for row in rows
