@@ -121,6 +121,10 @@ seed 为每轮构造普通词表范围内的伪随机 token IDs，通过 SGLang 
 线程。同步耗时写入 `cache_sync_wait_seconds`，不属于模型请求 latency 或
 trajectory JCT。
 
+若路由层返回 HTTP 200 但流中没有任何 output token，client 最多重试 2 次；每次
+使用带 `-stream-retry-N` 后缀的新 request ID，避免与已中止请求混淆，并在
+`stream_retry_count` 中显式记录。验证结果必须报告该计数，不能把重试静默隐藏。
+
 ### 论文的 500→4096 agents 扩增方法
 
 论文 Figure 7 的离线 agent batch size 为 `512/1024/2048/4096`，但每个 MaxLen

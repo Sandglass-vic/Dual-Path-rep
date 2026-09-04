@@ -117,11 +117,13 @@ def post_generate(
     generate_tokens: int,
     request_id: str,
 ) -> tuple[dict[str, Any], float, dict[str, Any], str, int]:
-    start = time.perf_counter()
     selection_deadline = time.monotonic() + config.server_selection_timeout
+    stream_retry_count = 0
+    effective_request_id = request_id
     while True:
+        attempt_start = time.perf_counter()
         payload = {
-            "rid": request_id,
+            "rid": effective_request_id,
             "input_ids": input_ids,
             "stream": config.stream,
             "sampling_params": {
@@ -142,7 +144,7 @@ def post_generate(
             with urllib.request.urlopen(request, timeout=config.timeout) as response:
                 if config.stream:
                     parsed, stream_metrics = read_streaming_response(
-                        response, start
+                        response, attempt_start
                     )
                     response_body = None
                 else:
@@ -159,7 +161,22 @@ def post_generate(
                 time.sleep(1)
                 continue
             raise RuntimeError(f"HTTP {error.code}: {detail}") from error
-    latency = time.perf_counter() - start
+        except RuntimeError as error:
+            if (
+                config.stream
+                and str(error).startswith(
+                    "Streaming response contained no output tokens"
+                )
+                and stream_retry_count < 2
+            ):
+                stream_retry_count += 1
+                effective_request_id = (
+                    f"{request_id}-stream-retry-{stream_retry_count}"
+                )
+                time.sleep(0.2)
+                continue
+            raise
+    latency = time.perf_counter() - attempt_start
     if not config.stream:
         parsed = json.loads(response_body)
         if isinstance(parsed, list):
@@ -172,8 +189,8 @@ def post_generate(
         parsed,
         latency,
         stream_metrics,
-        request_id,
-        0,
+        effective_request_id,
+        stream_retry_count,
     )
 
 
@@ -209,7 +226,10 @@ def read_streaming_response(
     if final_response is None:
         raise RuntimeError("Streaming response contained no JSON payload")
     if not token_times:
-        raise RuntimeError("Streaming response contained no output tokens")
+        detail = json.dumps(final_response, ensure_ascii=False)[:1000]
+        raise RuntimeError(
+            f"Streaming response contained no output tokens: {detail}"
+        )
 
     itls = [
         token_times[index] - token_times[index - 1]
