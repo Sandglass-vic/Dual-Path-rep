@@ -74,8 +74,8 @@ GPU：NVIDIA H100 80GB HBM3
 
 ```text
 /mnt/lustre/users/sezhou/dual-path/images/sglang:26.01-py3-mooncake0.3.13.post1-timing-v2.sqsh
-最终构建 Job：66119，COMPLETED，ExitCode=0:0
-SHA-256：792bffc289fe519803d4c97453d4fe56afeed92866aa4ceafc8de0b7691e8ef2
+最终构建 Job：66315，COMPLETED，ExitCode=0:0
+SHA-256：06574d825d4b68e1663c1ba1cc31915e31001b9672be6311a9dd41d0869c52f2
 ```
 
 镜像目录只保留上述最终派生版和最初基础版；Mooncake `0.3.9`、旧 timing 与
@@ -97,8 +97,9 @@ import/API/source compile 断言后导出新 sqsh。重新运行会覆盖同名�
 基础镜像执行 `pip check` 会报告 `triton-kernels` 缺少 `pytest`。这是基础镜像已有的开发/测试依赖缺口，不是 Mooncake 安装造成的运行依赖冲突，因此未为了消除该提示修改推理环境。
 
 构建脚本还回移了当前旧 SGLang Mooncake backend 缺少的 request-scoped DFS
-replica 配置，并加入 benchmark timing 埋点。上游对应功能为尚未合入的
-SGLang PR `#37390`；不能把该回移描述成 NVIDIA 26.01 原生能力。
+replica 配置、all-layer 同步 transfer 的 KV-index 分批，并加入 benchmark
+timing 埋点。前两项上游对应功能分别为 SGLang PR `#37390` 与 `#32758`；
+不能把这些回移描述成 NVIDIA 26.01 原生能力。
 
 派生镜像已经通过：
 
