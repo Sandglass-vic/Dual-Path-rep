@@ -89,6 +89,11 @@ flush 开启时为实测值，关闭时为 0。
 settle，再释放下一波请求。`cache_sync_wait_seconds` 记录该同步等待，同样不计入
 `turn_wall_seconds` / trajectory JCT。
 
+长上下文并发 PD 传输显式设置 `MC_TRANSFER_TIMEOUT=120` 秒，并写入 `run.json`。
+Mooncake 默认 30 秒；达到该阈值不仅会令当前 request abort，还会把对应 RDMA
+session 标记为 failed，后续 request 无法通过 client 重试恢复。若 120 秒仍被
+触发，应分块同步 transfer batch，而不是继续无限提高超时。
+
 ### Request latency
 
 `latency_seconds` 是 client 发出 `/generate` 请求到完整 streaming response
