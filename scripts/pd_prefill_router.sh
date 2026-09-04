@@ -91,7 +91,7 @@ PY
     --hicache-size 0
     --hicache-mem-layout page_first_direct
     --hicache-io-backend direct
-    --hicache-write-policy write_through
+    --hicache-write-policy "${PREFILL_HICACHE_WRITE_POLICY:-write_through_selective}"
     --hicache-storage-backend "$HICACHE_STORAGE_BACKEND"
     --hicache-storage-prefetch-policy wait_complete
     --hicache-storage-backend-extra-config

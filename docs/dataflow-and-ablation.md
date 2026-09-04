@@ -17,12 +17,13 @@
    Mooncake Store；Store 同时创建一个 memory replica 和一个 Lustre POSIX
    DFS replica。
 
-正式路径与论文 §4.1 对齐：每轮结束后 Prefill `/flush_cache` 释放 L1/L2，下一轮
-从 Mooncake Store 加载；默认短暂 `STORAGE_SETTLE_SECONDS` 仅保证 Put 可见。
+正式路径与论文 §4.1 对齐：Prefill 在每个 request 的 PD ACK 后解锁 radix
+引用并驱逐未被活跃请求引用的 L1/L2 page，下一轮从 Mooncake Store 加载；
+默认短暂 `STORAGE_SETTLE_SECONDS` 仅保证 Decode Put 可见。
 
 ```text
 turn N:   Prefill（本地无上轮前缀）-> L3 prefetch -> PD -> Decode -> Store Put
-          -> /flush_cache (+ optional settle)
+          -> Prefill per-request release (+ optional settle)
 turn N+1: 再次从 Store 加载已发布前缀
 ```
 

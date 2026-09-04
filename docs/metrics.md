@@ -7,10 +7,10 @@
 
 阅读结果时先区分以下三类：
 
-- **正式性能口径**：Mooncake Store 动态完整 rollout；不预 Populate；**逐轮
-  Prefill `/flush_cache`** 以对齐论文“staging/GPU buffer 用完即放、跨 turn 走
-  L3”；短 `STORAGE_SETTLE_SECONDS` 仅用于 Store 可见性，不是旧 file-backend
-  的长静默等待；不重试失败请求。
+- **正式性能口径**：Mooncake Store 动态完整 rollout；不预 Populate；Prefill
+  在每个 request 的 PD ACK 后释放 radix 引用并立即驱逐所有未被活跃请求引用的
+  L1/L2 page；不使用全局 `/flush_cache`。短 `STORAGE_SETTLE_SECONDS` 仅用于
+  Decode Store 可见性，不是旧 file-backend 的长静默等待。
 - **当前可自动汇总**：客户端 streaming 指标、request/L3/P→D timing、cache hit、
   聚合 CSV/JSON 和 SVG。
 - **历史/对照口径**：Job `65032/65144/65502` 旧 file backend / 预热隔离；Job
@@ -78,23 +78,25 @@ turn_wall_seconds
   + turn_accounting_error_seconds
 ```
 
-正式路径中的 accounting error 应只剩浮点误差。`cache_flush_seconds` 与
-`storage_settle_seconds` 在开启论文对齐 flush 时按轮记录，但**不进入**
-`turn_wall_seconds` 闭合式；旧的“永远记 0 后删除字段”做法已废止——现字段在
-flush 开启时为实测值，关闭时为 0。
+正式路径中的 accounting error 应只剩浮点误差。`storage_settle_seconds` 按轮
+记录但**不进入** `turn_wall_seconds` 闭合式。正式路径不调用全局 flush，因此
+`cache_flush_seconds=0`、`cache_sync_wait_seconds=0`；两字段仅保留给显式开启
+`FLUSH_LOCAL_CACHE_BETWEEN_TURNS=1` 的历史/控制实验。
 
-并发 agent 不能在其他请求仍活跃时直接调用 SGLang 的全局 `/flush_cache`
-（服务会返回 HTTP 400）。replay 使用 request-wave coordinator：任一 agent
-请求 flush 后阻止新请求进入，等待当前活跃请求排空，仅执行一次全局 flush 和
-settle，再释放下一波请求。`cache_sync_wait_seconds` 记录该同步等待，同样不计入
-`turn_wall_seconds` / trajectory JCT。
+`DUALPATH_PREFILL_CACHE_RELEASE` 在每个成功 PD ACK 后记录释放前后的 device
+evictable tokens。SGLang 已先通过 `release_kv_cache()` 解除当前 request 的
+radix lock；随后驱逐只处理 `lock_ref=0` 的叶节点，因此不会释放并发请求仍在
+使用的共享 prefix。Prefill 使用 `write_through_selective`，Decode 继续负责把
+完整上下文发布到 L3。
 
 长上下文并发 PD 传输显式设置 `MC_TRANSFER_TIMEOUT=120` 秒，并使用
-`SGLANG_MOONCAKE_MAX_TRANSFER_BATCH_INDICES=1024` 将过大的 all-layer 同步
+`SGLANG_MOONCAKE_MAX_TRANSFER_BATCH_INDICES=128` 将过大的 all-layer 同步
 transfer 按 KV page index 有序分批；两项均写入 `run.json`。Mooncake 默认超时
 为 30 秒；达到阈值不仅会令当前 request abort，还会把对应 RDMA session 标记为
 failed，后续 request 无法通过 client 重试恢复。分批限制参考并 backport
-SGLang upstream #32758 的修复。
+SGLang upstream #32758 的修复；上游 1024 是针对其他模型的保守值，当前
+Qwen2.5-32B TP8 实测在 agents=8 时仍会触发 session timeout，因此按
+`CHUNKED_PREFILL_SIZE=8192` / `page_size=64` 收紧为 128。
 
 ### Request latency
 
@@ -167,10 +169,11 @@ request 明细（见 §6）。
 
 - `cached_tokens`：SGLang response `meta_info.cached_tokens`。
 - `cache_hit_rate = cached_tokens / prompt_tokens`。
-- 它表示 HiCache 报告的可复用前缀；在**论文对齐路径**（逐轮 flush）下，turn≥2
-  的命中应主要来自 L3 prefetch，并与 `DUALPATH_L3_TIMING` / `l3_hit_rate`
-  对照。
-- 未 flush 时（如 Job `65694`）命中可来自 L1/L2，**不能**归因于 Lustre DFS。
+- 它表示 HiCache 报告的可复用前缀；正式路径在 PD ACK 后驱逐未锁定的 Prefill
+  L1/L2 page，因此后续 turn 的命中应主要来自 L3 prefetch，并与
+  `DUALPATH_L3_TIMING` / `l3_hit_rate` 对照。
+- 若关闭 `DUALPATH_PREFILL_RELEASE_LOCAL_CACHE`，命中可来自 L1/L2，不能直接
+  归因于 Lustre DFS。
 
 ### L3 read hit
 

@@ -116,10 +116,9 @@ seed 为每轮构造普通词表范围内的伪随机 token IDs，通过 SGLang 
 发送 `input_ids`，强制精确生成目标长度，并把响应中的真实 `output_ids` 拼入
 下一轮 context。不同 trajectory 可并发执行，同一 trajectory 内严格串行。
 
-开启逐轮 Prefill flush 且 agents>1 时，client 会在任一线程请求 flush 后关闭
-下一轮入口，等待当前服务请求排空，只执行一次全局 flush/settle，再释放等待
-线程。同步耗时写入 `cache_sync_wait_seconds`，不属于模型请求 latency 或
-trajectory JCT。
+正式路径不由 client 调用 Prefill 全局 flush。Prefill server 在每个 request 的
+PD ACK 后释放 radix 引用并驱逐未被活跃请求引用的 L1/L2 page；client 只在
+turn 间保留短 `storage_settle_seconds`，等待 Decode offload 对下一轮可见。
 
 若路由层返回 HTTP 200 但流中没有任何 output token，client 最多重试 2 次；每次
 使用带 `-stream-retry-N` 后缀的新 request ID，避免与已中止请求混淆，并在
@@ -207,10 +206,11 @@ python scripts/benchmark/replay_fake_agent_traces.py \
   --stream
 ```
 
-client 正式默认开启逐轮 Prefill `/flush_cache`（保留 Mooncake Store）与短暂
-`STORAGE_SETTLE_SECONDS`，对齐论文 staging/GPU 用完即放、跨 turn 走 L3。
-`cache_flush_seconds` / `storage_settle_seconds` 写入 rounds，但不计入
-`turn_wall_seconds`。多 agent 仍由 barrier 同时开始。
+正式默认启用 server 侧逐请求本地 cache release 和短暂
+`STORAGE_SETTLE_SECONDS`，对齐 staging/GPU 用完即放、跨 turn 走 L3。
+`storage_settle_seconds` 写入 rounds，但不计入 `turn_wall_seconds`；正式路径
+的 `cache_flush_seconds` / `cache_sync_wait_seconds` 为 0。多 agent 仍由
+barrier 同时开始，但不再因全局 flush 形成 request-wave barrier。
 
-Job `64914/64984/65032/65502` 的长 storage wait / Populate，以及 Job `65694`
-未 flush 的 L1/L2 路径，均不是当前正式口径。
+Job `64914/64984/65032/65502` 的长 storage wait / Populate、早期全局 flush，
+以及禁用逐请求 release 的 L1/L2 路径，均不是当前正式口径。

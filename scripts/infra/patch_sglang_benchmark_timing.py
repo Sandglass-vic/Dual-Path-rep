@@ -248,7 +248,23 @@ def patch_prefill_transfer(path: Path) -> None:
         "                        dualpath_page_count,\n"
         "                        dualpath_page_size,\n"
         "                    )\n"
-        "                release_kv_cache(req, self.tree_cache)  # unlock the tree\n",
+        "                release_kv_cache(req, self.tree_cache)  # unlock the tree\n"
+        "                if __import__(\"os\").environ.get(\n"
+        "                    \"DUALPATH_PREFILL_RELEASE_LOCAL_CACHE\", \"0\"\n"
+        "                ) == \"1\":\n"
+        "                    evictable_before = self.tree_cache.evictable_size()\n"
+        "                    self.tree_cache.evict(evictable_before)\n"
+        "                    if hasattr(self.tree_cache, \"evict_host\"):\n"
+        "                        self.tree_cache.evict_host(1 << 60)\n"
+        "                    evictable_after = self.tree_cache.evictable_size()\n"
+        "                    if self.attn_tp_rank == 0:\n"
+        "                        logger.info(\n"
+        "                            \"DUALPATH_PREFILL_CACHE_RELEASE rid=%s \"\n"
+        "                            \"evictable_before=%d evictable_after=%d\",\n"
+        "                            req.rid,\n"
+        "                            evictable_before,\n"
+        "                            evictable_after,\n"
+        "                        )\n",
         "record final KV transfer completion",
     )
     path.write_text(source)

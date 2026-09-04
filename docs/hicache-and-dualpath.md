@@ -23,7 +23,7 @@ L3：Mooncake Store，负责跨轮次前缀复用
 
 ```text
 1. 请求携带完整累积上下文到 Prefill。
-2. Prefill 本地 L1/L2 无上一轮前缀（已 flush/释放）→ 查询 L3。
+2. Prefill 本地 L1/L2 无上一轮前缀（上一 request 的未锁定 page 已释放）→ 查询 L3。
 3. L3 将命中的 Full Blocks 加载到 Prefill staging → GPU。
 4. Prefill 只计算 append/cache-miss tokens 的 KV。
 5. Prefill 将“L3 命中的 KV + 新计算的 KV”组成完整 prompt KV，P→D 传给 Decode。
@@ -33,20 +33,22 @@ L3：Mooncake Store，负责跨轮次前缀复用
 ### SGLang 近似实现
 
 SGLang HiCache **无法**关闭 L2 pool（`--hicache-size 0` 仍按 ratio 分配，且
-强制 L2>L1）。正式路径用客户端近似论文“用完即放”：
+强制 L2>L1）。正式路径在 server 内近似论文“用完即放”：
 
-1. 每轮 generate **之后**对 Prefill 调用 `/flush_cache`，清除 L1/L2 与 radix
-   metadata；
-2. **不**调用 `/clear_hicache_storage_backend`，保留 Mooncake Store；
-3. 可选 `STORAGE_SETTLE_SECONDS`（默认 1s），等待 Decode→Store 发布可见；
-4. `cache_flush_seconds` / `storage_settle_seconds` 单独记账，**不计入**
-   `turn_wall_seconds` / `trajectory_jct`；batch `wall_seconds` 仍含真实墙钟
-   （含 flush/settle）。
+1. SGLang 原生在 Prefill PD `KVPoll.Success` 后执行
+   `release_kv_cache(req, tree_cache)`，解除当前 request 的 radix lock；
+2. 补丁随后驱逐所有 `lock_ref=0` 的 L1/L2 page；其他活跃 request 共享的
+   prefix 仍受引用计数保护；
+3. **不**清 Mooncake Store；Decode 继续负责完整上下文 offload；
+4. `STORAGE_SETTLE_SECONDS`（默认 1s）只等待 Decode→Store 对下一 turn 可见，
+   不计入 `turn_wall_seconds` / `trajectory_jct`。
 
 环境变量（`pd_benchmark_lib.sh` 默认）：
 
 ```bash
-FLUSH_LOCAL_CACHE_BETWEEN_TURNS=1
+DUALPATH_PREFILL_RELEASE_LOCAL_CACHE=1
+PREFILL_HICACHE_WRITE_POLICY=write_through_selective
+FLUSH_LOCAL_CACHE_BETWEEN_TURNS=0
 STORAGE_SETTLE_SECONDS=1
 ```
 
@@ -70,11 +72,11 @@ assert host_pool.size > device_pool.size
 
 - `--hicache-size 0` 表示按 `--hicache-ratio` 分配 L2，不是关闭 L2；
 - 当前协议强制 L2 大于 L1；
-- 仅靠命令行无法得到严格 L3-only；正式路径依赖 **逐轮 `/flush_cache`**。
+- 仅靠命令行无法得到严格 L3-only；正式路径依赖 PD ACK 后的逐请求解锁与
+  lock-aware eviction 补丁。
 
-多 agent 并发时 flush 会清空整机 Prefill 本地层（与论文“每 request 独立从
-存储加载”一致），但可能与 in-flight 请求竞态；若出现 flush 失败，改为更小
-并发或排查 SGLang idle 要求。
+全局 `/flush_cache` 要求整个 Prefill idle，会阻塞并发并形成下一波 PD 流量
+突发，因此只保留为历史/控制开关，不用于正式多-agent benchmark。
 
 因此必须同时存在两种独立能力：
 

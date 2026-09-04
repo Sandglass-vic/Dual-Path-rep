@@ -70,25 +70,27 @@ Repetitions：3
 
 - 每个配置从独立、空的 Mooncake Store namespace 开始；
 - 不预先 populate，不重启进入 measured 阶段；
-- **每轮结束后 Prefill `/flush_cache`**，释放本地 L1/L2（近似论文 staging/GPU
-  buffer 用完即放）；**不**清 Mooncake Store；
-- 多 agent 时先阻止下一波请求进入并排空当前活跃请求，再只执行一次全局
-  `/flush_cache`；避免并发请求期间 flush 返回 HTTP 400；
+- Prefill 在每个 request 的 PD transfer ACK 后调用 SGLang 原生
+  `release_kv_cache()` 解锁 radix 路径，再驱逐全部 `lock_ref=0` 的 L1/L2
+  page；活跃请求共享的 prefix 保持受保护；
+- Prefill 使用 `write_through_selective`，避免重复承担 Decode 的完整 L3
+  offload；Decode 继续使用 `write_through` 发布完整上下文；
+- 正式路径不调用全局 `/flush_cache`，因此不阻塞或同步并发 agents；
 - `MC_TRANSFER_TIMEOUT=120`（Mooncake 默认 30 秒）：长上下文高并发 PD 同步
   batch 若超过默认阈值，Mooncake 会将 RDMA session 永久标记为 failed；
   实际值写入 `run.json.mooncake_transfer_timeout_seconds`；
-- `SGLANG_MOONCAKE_MAX_TRANSFER_BATCH_INDICES=1024`：将过大的 all-layer
+- `SGLANG_MOONCAKE_MAX_TRANSFER_BATCH_INDICES=128`：将过大的 all-layer
   同步 PD transfer 按 KV page index 有序分批，避免单次调用耗尽 Mooncake
-  瞬态资源；实际值写入 `run.json.mooncake_max_transfer_batch_indices`；
+  瞬态资源；128 对应当前 64-token page 下最多 8192 tokens/批，实际值写入
+  `run.json.mooncake_max_transfer_batch_indices`；
 - 默认 `STORAGE_SETTLE_SECONDS=1`，避免 Store 尚未可见就发下一轮；
 - Decode 在 rollout 中持续把 KV 发布到 Mooncake Store，下一轮从 L3 加载；
-- JCT：`trajectory_jct` / turn_wall **不含** flush/settle；batch `wall_seconds`
+- JCT：`trajectory_jct` / turn_wall **不含** release/settle；batch `wall_seconds`
   含真实墙钟。
 
-论文 §4.1 明确 Decode 在 H2D 后释放 CPU buffer，跨轮依赖存储而非本地 DRAM
-cache。旧“不 flush、吃 L1/L2 顺风车”的路径（Job `65694`）与论文不符，仅作
-对照。更早的 Populate/Measured + 长 storage wait（`65032`）是诊断手段，也不是
-当前正式口径。
+论文 §4.1 明确 staging buffer 用后释放，跨轮依赖存储而非本地 DRAM cache。
+`DUALPATH_PREFILL_RELEASE_LOCAL_CACHE=0` 的 L1/L2 保留路径仅作对照。更早的
+全局 flush、Populate/Measured + 长 storage wait 是诊断手段，不是正式口径。
 
 Mooncake 的 `PutStart/PutEnd` 完整对象发布替代旧 SGLang file backend 的
 `.bin` 并发覆盖，因此不再使用 Decode scratch 目录规避 `Short read`。每个

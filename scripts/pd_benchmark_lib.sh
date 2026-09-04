@@ -14,7 +14,7 @@ dualpath_export_common_env() {
   # Mooncake defaults synchronous transfers to 30s. Long-context concurrent
   # PD batches can exceed that and permanently invalidate the RDMA session.
   export MC_TRANSFER_TIMEOUT=${MC_TRANSFER_TIMEOUT:-120}
-  export SGLANG_MOONCAKE_MAX_TRANSFER_BATCH_INDICES=${SGLANG_MOONCAKE_MAX_TRANSFER_BATCH_INDICES:-1024}
+  export SGLANG_MOONCAKE_MAX_TRANSFER_BATCH_INDICES=${SGLANG_MOONCAKE_MAX_TRANSFER_BATCH_INDICES:-128}
   export MOONCAKE_MASTER_PORT=${MOONCAKE_MASTER_PORT:-50051}
   export MOONCAKE_METADATA_PORT=${MOONCAKE_METADATA_PORT:-8080}
   export MOONCAKE_MASTER="$PREFILL_HOST:$MOONCAKE_MASTER_PORT"
@@ -27,15 +27,18 @@ dualpath_export_common_env() {
   export MOONCAKE_DFS_ALIGNMENT=${MOONCAKE_DFS_ALIGNMENT:-4096}
   export MOONCAKE_DFS_SINGLE_TENANT=true
   export MOONCAKE_ENABLE_DFS=1
-  # Paper DualPath: staging/GPU buffers are released after each request; the next
-  # request must reload from L3. SGLang approximates this by Prefill /flush_cache
-  # (L1/L2 only) while keeping Mooncake Store. Default ON for formal runs.
-  export FLUSH_LOCAL_CACHE_BETWEEN_TURNS=${FLUSH_LOCAL_CACHE_BETWEEN_TURNS:-1}
+  # Release unlocked Prefill L1/L2 pages after the per-request PD ACK. This
+  # preserves active shared prefixes without a stop-the-world /flush_cache.
+  export DUALPATH_PREFILL_RELEASE_LOCAL_CACHE=${DUALPATH_PREFILL_RELEASE_LOCAL_CACHE:-1}
+  export PREFILL_HICACHE_WRITE_POLICY=${PREFILL_HICACHE_WRITE_POLICY:-write_through_selective}
+  # Retained only as a historical/control switch; disabled for formal runs.
+  export FLUSH_LOCAL_CACHE_BETWEEN_TURNS=${FLUSH_LOCAL_CACHE_BETWEEN_TURNS:-0}
   export STORAGE_SETTLE_SECONDS=${STORAGE_SETTLE_SECONDS:-1}
   export COLLECT_L3_STORAGE_SNAPSHOT=${COLLECT_L3_STORAGE_SNAPSHOT:-1}
   export MODEL_DIR LOG_DIR CACHE_DIR IB_DEVICE PREFILL_PORT DECODE_PORT
   export BOOTSTRAP_PORT ROUTER_PORT SERVER_TIMEOUT
   export MC_TRANSFER_TIMEOUT SGLANG_MOONCAKE_MAX_TRANSFER_BATCH_INDICES
+  export DUALPATH_PREFILL_RELEASE_LOCAL_CACHE PREFILL_HICACHE_WRITE_POLICY
   export FLUSH_LOCAL_CACHE_BETWEEN_TURNS STORAGE_SETTLE_SECONDS
   export COLLECT_L3_STORAGE_SNAPSHOT
 }
@@ -103,7 +106,9 @@ dualpath_write_run_json() {
     "$DISABLE_OVERLAP_SCHEDULE" "$PAPER_EXPAND_AGENTS" \
     "$PAPER_SYNTHETIC_APPEND_TOKENS" "$flush_flag" "$settle" \
     "$snapshot_flag" "$MC_TRANSFER_TIMEOUT" \
-    "$SGLANG_MOONCAKE_MAX_TRANSFER_BATCH_INDICES" <<'PY'
+    "$SGLANG_MOONCAKE_MAX_TRANSFER_BATCH_INDICES" \
+    "$DUALPATH_PREFILL_RELEASE_LOCAL_CACHE" \
+    "$PREFILL_HICACHE_WRITE_POLICY" <<'PY'
 from pathlib import Path
 import json
 import sys
@@ -132,6 +137,8 @@ Path(sys.argv[1]).write_text(json.dumps({
     "collect_l3_storage_snapshot": bool(int(sys.argv[17])),
     "mooncake_transfer_timeout_seconds": int(sys.argv[18]),
     "mooncake_max_transfer_batch_indices": int(sys.argv[19]),
+    "prefill_release_local_cache_after_pd_ack": bool(int(sys.argv[20])),
+    "prefill_hicache_write_policy": sys.argv[21],
     "l3_storage_snapshot_kind": "recursive apparent bytes and st_blocks allocated bytes",
     "kv_buffer_semantics": (
         "DualPath paper: staging/GPU buffers released after each request; "
@@ -216,11 +223,11 @@ dualpath_run_replay() {
     else
       flush_args+=(--flush-cache-url "http://$PREFILL_HOST:$PREFILL_PORT/flush_cache")
     fi
-    flush_args+=(--storage-settle-seconds "${STORAGE_SETTLE_SECONDS:-1}")
   elif [[ "${FLUSH_LOCAL_CACHE_BETWEEN_TURNS:-1}" != 0 ]]; then
     echo "FLUSH_LOCAL_CACHE_BETWEEN_TURNS must be 0 or 1" >&2
     return 2
   fi
+  flush_args+=(--storage-settle-seconds "${STORAGE_SETTLE_SECONDS:-1}")
   if [[ "${COLLECT_L3_STORAGE_SNAPSHOT:-1}" == 1 ]]; then
     : "${MOONCAKE_DFS_ROOT_DIR:?MOONCAKE_DFS_ROOT_DIR is required for L3 snapshots}"
     storage_args+=(--storage-dir "$MOONCAKE_DFS_ROOT_DIR")

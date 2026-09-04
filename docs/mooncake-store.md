@@ -53,9 +53,11 @@ root 和新 master，避免跨 run 污染。
 `scripts/pd_1p1d_benchmark.sbatch` / `pd_1p2d_benchmark.sbatch` /
 `pd_2p2d_benchmark.sbatch`：
 
-- 单次 rollout 内 Decode 持续 Put，下一 turn 在 **flush L1/L2 之后** 从 Store Get；
+- 单次 rollout 内 Decode 持续 Put；Prefill 在每次 PD ACK 后逐请求释放未锁定的
+  L1/L2 page，下一 turn 从 Store Get；
 - 不预 Populate、不重启进入 measured；
-- 默认 `FLUSH_LOCAL_CACHE_BETWEEN_TURNS=1`（论文 buffer 释放近似）；
+- 默认 `DUALPATH_PREFILL_RELEASE_LOCAL_CACHE=1` 且
+  `FLUSH_LOCAL_CACHE_BETWEEN_TURNS=0`；
 - 默认 `STORAGE_SETTLE_SECONDS=1`（Store 可见性，非旧长静默）；
 - 每个 run 从独立空 Store/DFS namespace 开始；
 - run 结束后删除本 Job 的 DFS shard 与 client-init 目录。

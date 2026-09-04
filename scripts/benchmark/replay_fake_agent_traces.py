@@ -406,6 +406,10 @@ def replay_trajectory(
                 settle_seconds,
                 cache_sync_wait_seconds,
             ) = coordinator.finish_request(turn_index + 1 < len(turns))
+        elif turn_index + 1 < len(turns) and config.storage_settle_seconds > 0:
+            settle_started = time.perf_counter()
+            time.sleep(config.storage_settle_seconds)
+            settle_seconds = time.perf_counter() - settle_started
         turn_wall_seconds = turn_ended - turn_started
         client_runtime_seconds = max(0.0, turn_wall_seconds - latency)
         round_results[-1].update(
@@ -681,9 +685,7 @@ def main() -> None:
         token_id_max=args.token_id_max,
         max_context_tokens=args.max_context_tokens,
         flush_cache_urls=flush_urls,
-        storage_settle_seconds=(
-            args.storage_settle_seconds if args.flush_local_cache_between_turns else 0.0
-        ),
+        storage_settle_seconds=args.storage_settle_seconds,
         flush_coordinator=(
             FlushCoordinator(
                 flush_urls,

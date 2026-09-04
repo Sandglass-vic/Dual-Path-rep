@@ -28,9 +28,10 @@
   （Job `65548`），对象完整发布且未发生 short read。
 - Qwen2.5-32B 1P1D HiCache + Mooncake DFS 已完成 4-turn 动态 smoke
   （Job `65557`），3/4 turns 自然命中且 DFS 实际产生数据。
-- 正式 replay 对齐论文 buffer 语义：逐轮 Prefill `/flush_cache`，跨 turn 走
-  Mooncake Store；短暂 settle 仅用于可见性。
-- Job `65694`（未 flush）仅作对照，L3 coverage=0，不得当作正式结果。
+- 正式 replay 对齐论文 buffer 语义：Prefill 在每个 PD ACK 后释放未锁定的
+  L1/L2 page，跨 turn 走 Mooncake Store；短暂 settle 仅用于可见性，不调用
+  全局 `/flush_cache`。
+- 禁用逐请求 release 的 L1/L2 保留路径仅作对照，不得当作正式结果。
 - Job `65566` 的 32K × 32/64/128-agent 正式矩阵在首轮失败：Decode-1 节点
   `dgx-gaia-53` 高负载下失联；另有历史故障节点 `dgx-gaia-30`、`dgx-gaia-46`。
   正式作业统一排除 `dgx-gaia-18,dgx-gaia-30,dgx-gaia-46,dgx-gaia-53`。详见
@@ -41,8 +42,10 @@
 
 ## 关键约束
 
-- 当前复现：SGLang 保留 L1/L2 **池**，正式路径用逐轮 flush 禁止跨 turn 本地命中。
-- 独立正确性仍可通过服务重启排除 L1/L2；正式性能路径默认 flush + L3 reload。
+- 当前复现：SGLang 保留 L1/L2 **池**，正式路径在 PD ACK 后逐请求解锁并驱逐
+  未锁定 page，禁止跨 turn 本地命中。
+- 独立正确性仍可通过服务重启排除 L1/L2；正式性能路径默认 per-request
+  release + L3 reload。
 - 多节点作业提交前核对 [已知故障节点](platform.md#已知故障节点临时排除)。
 - 每个测试使用 Job 专属 KV 目录，验收和统计完成后自动删除，日志与结构化结果保留。
 - 多轮 replay 必须把真实模型输出加入下一轮完整 context，不能将 trajectory 展开成无关请求。

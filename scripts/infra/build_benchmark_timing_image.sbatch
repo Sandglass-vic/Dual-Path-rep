@@ -73,6 +73,8 @@ assert hiradix.index(
 ) < hiradix.index("operation = self.cache_controller.prefetch(")
 assert "DUALPATH_REQ_TIMING" in schedule_batch
 assert '"DUALPATH_TTFT_P_TRANSFER_V2 rid=%s ' in prefill
+assert "DUALPATH_PREFILL_CACHE_RELEASE" in prefill
+assert "DUALPATH_PREFILL_RELEASE_LOCAL_CACHE" in prefill
 assert "dualpath_transfer_page_count" in prefill
 assert "page_aligned_tokens=%d" in prefill
 assert "DUALPATH_TTFT_D_RECEIVE" in decode
