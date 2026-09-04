@@ -1,15 +1,5 @@
 #!/usr/bin/env python3
-"""Collect JCT, full-chain TTFT, trajectory metrics, and agent-compare plots.
-
-Writes summarized charts/CSV under the labhome repo result directory
-(REPO_RESULT_DIR / --repo-result-dir), which is distinct from the Lustre
-runtime RESULT_DIR used for raw rounds/logs.
-
-Full-chain TTFT is retained only as all-request aggregates under
-fullchain/agents-*/ (fullchain_rounds.jsonl + fullchain_summary.json) and
-the cross-agent chart ttft_fullchain_by_agents.svg. Per-trajectory
-fullchain slices are not produced.
-"""
+"""Collect one task into dataset/agents/rep result directories."""
 
 from __future__ import annotations
 
@@ -28,7 +18,7 @@ def run(cmd: list[str]) -> None:
 
 def completed_runs(result_dir: Path) -> list[Path]:
     runs = []
-    for summary in sorted(result_dir.glob("*k/agents-*/rep-*/summary.json")):
+    for summary in sorted(result_dir.glob("*/agents-*/rep-*/summary.json")):
         run_dir = summary.parent
         if (run_dir / "rounds.jsonl").exists() and (run_dir / "run.json").exists():
             runs.append(run_dir)
@@ -48,7 +38,14 @@ def pick_trajectory_id(trajectories_path: Path) -> str:
     ]
     if not trajectories:
         raise RuntimeError(f"No trajectories in {trajectories_path}")
-    best = max(trajectories, key=lambda item: int(item["turns_completed"]))
+    best = max(
+        trajectories,
+        key=lambda item: (
+            float(item["elapsed_seconds"]),
+            int(item["turns_completed"]),
+            str(item["trajectory_id"]),
+        ),
+    )
     return str(best["trajectory_id"])
 
 
@@ -111,59 +108,57 @@ def main() -> None:
         ]
     )
 
-    fullchain_root = args.repo_result_dir / "fullchain"
     runs = completed_runs(args.result_dir)
     if not runs:
         raise SystemExit(f"No completed runs under {args.result_dir}")
 
     for run_dir in runs:
         metadata = json.loads((run_dir / "run.json").read_text())
+        dataset = str(
+            metadata.get("dataset", f"{int(metadata['max_len_k'])}K")
+        )
         agents = int(metadata["agents"])
         run_id = run_id_from_dir(run_dir)
         run_out = (
             args.repo_result_dir
+            / dataset
             / f"agents-{agents}"
             / f"rep-{metadata['repetition']}"
         )
-        run_out.mkdir(parents=True, exist_ok=True)
-        fc_dir = fullchain_root / f"agents-{agents}"
-        # Prefer rep-1; only regenerate if fullchain for this #Agents is missing.
-        if int(metadata.get("repetition", 1)) == 1 or not (
-            fc_dir / "fullchain_rounds.jsonl"
-        ).exists():
-            fc_dir.mkdir(parents=True, exist_ok=True)
-            run(
-                [
-                    sys.executable,
-                    str(scripts / "summarize_ttft_fullchain.py"),
-                    "--rounds",
-                    str(run_dir / "rounds.jsonl"),
-                    "--log-dir",
-                    str(args.log_dir),
-                    "--log-glob",
-                    f"*{run_id}*",
-                    "--output-dir",
-                    str(fc_dir),
-                ]
-            )
+        data_dir = run_out / "data"
+        csv_dir = run_out / "csv"
+        longest_dir = run_out / "longest-trajectory"
+        all_dir = run_out / "all-trajectories"
+        for directory in (data_dir, csv_dir, longest_dir, all_dir):
+            directory.mkdir(parents=True, exist_ok=True)
 
-        # Representative trajectory plots only (not a fullchain slice).
+        for name in ("run.json", "summary.json", "rounds.jsonl", "trajectories.jsonl"):
+            shutil.copy2(run_dir / name, data_dir / name)
+
+        fullchain_dir = data_dir / "fullchain"
+        fullchain_dir.mkdir(parents=True, exist_ok=True)
+        run(
+            [
+                sys.executable,
+                str(scripts / "summarize_ttft_fullchain.py"),
+                "--rounds",
+                str(run_dir / "rounds.jsonl"),
+                "--log-dir",
+                str(args.log_dir),
+                "--log-glob",
+                f"*{run_id}*",
+                "--output-dir",
+                str(fullchain_dir),
+            ]
+        )
+
         trajectory_id = pick_trajectory_id(run_dir / "trajectories.jsonl")
-        filtered_dir = run_out / "trajectory-source"
-        rounds_one, traj_one = filter_rounds(
+        rounds_one, _ = filter_rounds(
             run_dir / "rounds.jsonl",
             run_dir / "trajectories.jsonl",
             trajectory_id,
-            filtered_dir,
+            data_dir / "longest-trajectory",
         )
-        # Drop any leftover single-trajectory fullchain slices from older collects.
-        leftover_fc = filtered_dir / "fullchain_rounds.jsonl"
-        if leftover_fc.exists():
-            leftover_fc.unlink()
-        leftover_svg = run_out / "trajectory_ttft_breakdown.svg"
-        if leftover_svg.exists():
-            leftover_svg.unlink()
-
         run(
             [
                 sys.executable,
@@ -175,7 +170,11 @@ def main() -> None:
                 "--log-glob",
                 f"*{run_id}*",
                 "--output-dir",
-                str(run_out / "trajectory-metrics"),
+                str(longest_dir),
+                "--csv-output",
+                str(csv_dir / "longest-trajectory.csv"),
+                "--summary-output",
+                str(data_dir / "longest-trajectory-summary.json"),
             ]
         )
         run(
@@ -184,35 +183,50 @@ def main() -> None:
                 str(plot_dir / "plot_trajectory_latency.py"),
                 "--rounds",
                 str(rounds_one),
-                "--trajectories",
-                str(traj_one),
                 "--output-dir",
-                str(run_out / "trajectory-latency"),
+                str(longest_dir),
+            ]
+        )
+        run(
+            [
+                sys.executable,
+                str(plot_dir / "plot_run_summary.py"),
+                "--run-dir",
+                str(run_dir),
+                "--fullchain-rounds",
+                str(fullchain_dir / "fullchain_rounds.jsonl"),
+                "--output-dir",
+                str(all_dir),
+                "--csv-output",
+                str(csv_dir / "all-trajectories.csv"),
+                "--json-output",
+                str(data_dir / "all-trajectories-summary.json"),
             ]
         )
 
     run(
         [
             sys.executable,
-            str(plot_dir / "plot_agent_compare.py"),
+            str(plot_dir / "plot_task_jct.py"),
             "--result-dir",
             str(args.result_dir),
             "--output-dir",
             str(args.repo_result_dir),
-            "--fullchain-root",
-            str(fullchain_root),
         ]
     )
 
-    for name in (
-        "aggregate.csv",
-        "runs.csv",
-        "validation.json",
-        "merged_rounds.jsonl",
-    ):
+    task_data = args.repo_result_dir / "data"
+    task_csv = args.repo_result_dir / "csv"
+    task_data.mkdir(exist_ok=True)
+    task_csv.mkdir(exist_ok=True)
+    for name in ("aggregate.csv", "runs.csv"):
         source = summary_dir / name
         if source.exists():
-            shutil.copy2(source, args.repo_result_dir / name)
+            shutil.copy2(source, task_csv / name)
+    for name in ("validation.json", "merged_rounds.jsonl"):
+        source = summary_dir / name
+        if source.exists():
+            shutil.copy2(source, task_data / name)
 
     print(
         "COLLECT_BENCHMARK_METRICS_COMPLETE "

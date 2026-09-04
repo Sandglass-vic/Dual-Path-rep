@@ -24,14 +24,15 @@
 
 ```text
 # Lustre runtime results：原始 rounds / trajectories / run.json（RESULT_DIR）
-/mnt/lustre/users/sezhou/dual-path/results/latency-benchmark/<JOBID>/
-/mnt/lustre/users/sezhou/dual-path/logs/latency-benchmark/<JOBID>/
+/mnt/lustre/users/sezhou/dual-path/results/latency-benchmark/<TASK>/
+/mnt/lustre/users/sezhou/dual-path/logs/latency-benchmark/<TASK>/
 
-# Labhome 仓库侧产物：汇总 CSV、SVG、full-chain（REPO_RESULT_DIR）
-/labhome/sezhou/dual-path/results/latency-benchmark/<JOBID>/
+# Labhome 仓库侧产物：整理后的 data/csv/SVG（REPO_RESULT_DIR）
+/labhome/sezhou/dual-path/results/latency-benchmark/<TASK>/
 ```
 
-当前修正版单 agent 验证产物：`results/latency-benchmark/66097/`。
+task 下按 `<DATASET>/agents-<N>/rep-<R>/` 分组；例如
+`figure7-main/32K/agents-200/rep-1/`。
 
 ## 2. 端到端客户端指标
 
@@ -42,11 +43,11 @@
 
 | 名称 | 含义 | 不是 |
 |---|---|---|
-| **trajectory_jct** | 单条 trajectory 的完成时间：`elapsed_seconds` = Σ `turn_wall_seconds`。图/字段统一用此名（`trajectory_jct.svg`、箱线面板 `trajectory_jct across agents`、`trajectory_jct_max_by_agents.svg`） | 不是 batch JCT 的「求和」；batch 用 **max** |
+| **trajectory_jct** | 单条 trajectory 的完成时间：`elapsed_seconds` = Σ `turn_wall_seconds`。`all-trajectories/latency.svg` 的 JCT 面板展示全 agent 分布 | 不是 batch JCT 的「求和」；batch 用 **max** |
 | **Per-agent mean TTFT** | **两步**：① 每个 agent 内对多 turn 的 `ttft_seconds` 先平均 → ② 再在 agent 之间画箱线/取分布 | 不是先把所有 turn 混在一起再平均；也不是只画代表轨迹 |
 | **Per-agent mean TPOT** | 与 TTFT 相同的两步聚合 | 同上 |
-| **trajectory-\*** 目录/图 | `collect` 选出的 **一条代表轨迹**（`turns_completed` 最大），再画 latency/metrics | **不是**多 agent 平均 |
-| **fullchain_rounds.jsonl** | **全量** per-request：每行一个 `(trajectory_id, turn_id)` | 不是单轨迹切片；配置级均值只在 `fullchain_summary.json` / 堆叠图 |
+| **longest-trajectory/** | `collect` 选出的 **JCT 最长 trajectory** 的逐 turn latency/KV/L3/P→D 图 | **不是**多 agent 平均；不再重复输出单轨迹 JCT 图 |
+| **fullchain_rounds.jsonl** | 当前 run 的**全量** per-request：每行一个 `(trajectory_id, turn_id)` | 不是 longest trajectory 切片；均值 breakdown 在 `all-trajectories/ttft-breakdown.svg` |
 
 ### JCT
 
@@ -59,14 +60,13 @@
 - **trajectory_jct**（正式命名，勿再称 jct_breakdown）：
   `trajectories.jsonl: elapsed_seconds`，等于该 trajectory 所有
   `turn_wall_seconds` 之和。
-  - 单代表轨迹图：`trajectory-latency/trajectory_jct.svg`（per-turn wall 堆叠）。
-  - 跨 agent 箱线：`agent_latency_boxplots.svg` 中
-    `trajectory_jct across agents`，JSON 字段 `trajectory_jct_seconds`；
+  - 最长轨迹的逐 turn 图：`longest-trajectory/turn.svg`；它已经展示每轮 wall
+    time，因此不再重复输出单轨迹 JCT 图。
+  - 跨 agent 箱线：`all-trajectories/latency.svg` 中的 JCT 面板；
     每个点是一个 agent 的 `elapsed_seconds`，**不做** turn 内再平均。
-  - **max 耗时图**：`trajectory_jct_max_by_agents.svg`——每个 `#Agents` 一根柱，
-    高度为该并发下 **所有 agent 的 trajectory_jct 最大值**（batch critical
-    path）；蓝点为同 run 的 `summary.json: wall_seconds`（应接近该最大值）。
-    这不是各 agent JCT 之和。
+  - task 根目录 `JCT.svg`：每个 `(dataset, #Agents, rep)` 先取所有 agent 的
+    trajectory JCT 最大值，再对同一 `(dataset, #Agents)` 的 repetitions 取最大；
+    不再生成单独的 `trajectory_jct_max_by_agents.svg`。
 
 单轮闭合为：
 
@@ -120,8 +120,7 @@ SGLang 固定 `stream_interval=1`。如果单个 SSE payload 同时新增多个 
 
 ### Per-agent mean TTFT / TPOT（箱线图）
 
-`agent_latency_boxplots.svg` 中的 **Per-agent mean TTFT**（实现：
-`scripts/plot/plot_agent_compare.py` → `load_agent_series`）：
+`all-trajectories/latency.svg` 中的 **Per-agent mean TTFT**：
 
 1. 按 `trajectory_id`（= 一个 agent）分组，收集该 agent 所有 turn 的
    `ttft_seconds`；
@@ -136,17 +135,17 @@ SGLang 固定 `stream_interval=1`。如果单个 SSE payload 同时新增多个 
 
 ### 代表轨迹（trajectory-* 图）
 
-`trajectory-source/`、`trajectory-latency/`、`trajectory-metrics/` **不是**
-多 agent 平均，也不是全量 agent 的汇总图，而是
-`collect_benchmark_metrics.py` 选出的 **一条代表轨迹**：
+`longest-trajectory/` **不是**多 agent 平均，而是
+`collect_benchmark_metrics.py` 选出的 **一条最长轨迹**：
 
 1. 读该 run 的 `trajectories.jsonl`；
-2. 取 `turns_completed` 最大的 `trajectory_id`（若并列则 `max` 的稳定选取）；
-3. 过滤该 id 的 rounds / trajectory 行，写入 `trajectory-source/`，再调用
+2. 取 `elapsed_seconds`（trajectory JCT）最大的 `trajectory_id`，再以
+   `turns_completed` 和 id 稳定打破并列；
+3. 过滤该 id 的 rounds / trajectory 行，写入 `data/longest-trajectory/`，再调用
    `plot_trajectory_latency.py` / `plot_trajectory_metrics.py`。
 
-正式路径**不再**为该代表轨迹另存一份 fullchain 切片；full-chain 只保留
-全量 `fullchain/agents-<N>/`（见 §6）。
+正式路径**不**为最长轨迹生成 fullchain 切片；full-chain 保留当前 run 的全量
+request 明细（见 §6）。
 
 ## 3. Cache hit 与 KV 数据量
 
@@ -239,8 +238,9 @@ coverage 严格为零。启用 L3 时不设置 coverage 下限。
 ### TP=8 L3 聚合
 
 同一 request 必须取得一个 Prefill engine 的 8 个 TP rank timing。请求的
-`read_seconds` 取八个 rank 中最大 duration，`l3_slowest_tp_rank` 记录瓶颈
-rank；不能只用 rank 0 计算加载带宽。
+`read_seconds` 使用 `max(read_end) - min(read_start)`，覆盖八个 rank 的联合
+读取窗口；`l3_slowest_tp_rank` 另记录 duration 最大的瓶颈 rank。不能只用
+rank 0 或单纯 `max(rank duration)` 计算节点聚合加载带宽。
 
 ### P→D timing 与有效带宽
 
@@ -260,14 +260,16 @@ Job `66097` 的 26 个 request 覆盖率 100%，中位数为 9.483 GB/s。
 
 ```text
 prefill_l3_effective_bandwidth_gbps
-  = l3_logical_tokens × 262144 / max(tp_rank_read_seconds) / 1e9
+  = l3_logical_tokens × 262144
+    / (max(tp_rank_read_end) - min(tp_rank_read_start)) / 1e9
 ```
 
 这里分子是一个 Prefill engine 的 TP=8 合计逻辑 payload，分母是该 request
-八个 rank 中最慢的读取时间，所以结果是**单 Prefill engine 的 TP 聚合有效
+八个 rank 的联合读取窗口，所以结果是**单 Prefill engine 的 TP 聚合有效
 带宽**，不是每 rank 平均，也不是跨 engine 平均。Job `66097` 有 L3 read 的 6
-个 requests 中位数为 43.837 GB/s（折算到单 rank 约为聚合值的 1/8，仅用于
-理解口径）。带宽统一使用十进制 GB/s；KV 容量使用二进制 GiB。
+个 requests 的旧图使用 `max(rank duration)`，需按新联合窗口重新 collect 后
+再引用；该逻辑有效带宽也不能直接解释为 Lustre NIC wire bandwidth。带宽统一
+使用十进制 GB/s；KV 容量使用二进制 GiB。
 
 ## 6. TTFT breakdown
 
@@ -307,16 +309,18 @@ abs(accounting_error_seconds) <= 1e-6
 
 #### 产物粒度（重要）
 
-- `fullchain/agents-<N>/fullchain_rounds.jsonl`：**全量 per-request** 明细。
+- `<DATASET>/agents-<N>/rep-<R>/data/fullchain/fullchain_rounds.jsonl`：
+  当前 run 的**全量 per-request** 明细。
   每一行对应一次 `(trajectory_id, turn_id)` / request，含各互斥桶秒数与
   `ttft_seconds`；不是配置级均值。
-- `fullchain/agents-<N>/fullchain_summary.json`：在上述明细上的**聚合统计**
+- 同目录 `fullchain_summary.json`：在上述明细上的**聚合统计**
   （mean 等）。
-- `ttft_fullchain_by_agents.svg`：按 `#Agents` 堆叠的互斥桶均值对比图。
+- `all-trajectories/ttft-breakdown.svg`：当前 run 全部 requests 的互斥桶均值
+  堆叠图。
 
 #### 与论文 Figure 10/12 的对照（勿混）
 
-| | 本仓库 `ttft_fullchain_by_agents.svg` | 论文 Fig.10 / Fig.12(left) |
+| | 本仓库 `all-trajectories/ttft-breakdown.svg` | 论文 Fig.10 / Fig.12(left) |
 |---|---|---|
 | 场景 | **离线** barrier 同步 batch（当前矩阵） | **在线** Poisson 到达 |
 | 横轴 | `#Agents`（并发 agent 数） | **APS**（agents/s 到达率） |
@@ -333,10 +337,8 @@ abs(accounting_error_seconds) <= 1e-6
 turn 特写；本仓库 breakdown 图是 **离线全量 request 均值 × #Agents**，横轴也
 不是 APS。当前 `benchmark.md` 明确尚未做 APS sweep。
 
-正式路径**不**再输出单轨迹 fullchain 切片
-（例如 `trajectory-source/fullchain_rounds.jsonl`、
-`trajectory_ttft_breakdown.svg`）。`collect_benchmark_metrics.py` 默认对每个
-`#Agents` 的 rep-1 生成全量 fullchain。
+正式路径不输出单轨迹 fullchain 切片。`collect_benchmark_metrics.py` 对每个
+dataset/agents/rep 分别生成该 run 的全量 fullchain。
 
 ## 7. 当前自动采集流水线
 
@@ -349,6 +351,30 @@ scripts/pd_2p2d_benchmark.sbatch
 ```
 
 Job 结束时统一调用 `collect_benchmark_metrics.py`。
+
+三个入口统一接受 `TASK_NAME`、`DATASETS`、`AGENT_COUNTS`、`REPETITIONS` /
+`REP_LIST`。新运行的目录固定为：
+
+```text
+<TASK>/<DATASET>/agents-<N>/rep-<R>/
+  data/                  # run/summary/rounds/trajectories/fullchain JSON(L)
+  csv/                   # longest trajectory 与 all trajectories 表格
+  longest-trajectory/    # 最长 JCT agent 的逐 turn 图
+  all-trajectories/      # 全 agent latency box plot 与平均 TTFT breakdown
+```
+
+`longest-trajectory/` 的文件名保持简短：
+
+- latency：`turn.svg`、`ttft.svg`、`ttst.svg`、`tpot.svg`；JCT 与 turn 图信息
+  重复，不单独画；
+- KV/cache：`kv-new.svg`、`kv-total.svg`、`cache-hit.svg`；
+- 每个 Prefill engine：
+  `l3-read-data-engine-<ID>.svg`、`l3-read-time-engine-<ID>.svg`；
+- bandwidth：`l3-bandwidth.svg`、`pd-bandwidth.svg`。
+
+`all-trajectories/latency.svg` 同时展示每个 agent 的 trajectory JCT、agent 内
+多 turn mean TTFT、mean TPOT 三组箱线统计，并明确标注 min/max；
+`ttft-breakdown.svg` 对该 run 全部 requests 的 full-chain 互斥桶取均值。
 
 客户端：
 
@@ -376,20 +402,22 @@ Job 级汇总与作图（脚本布局：`scripts/plot/` 作图，`scripts/infra/
 ```text
 collect_benchmark_metrics.py
   -> summarize_latency_benchmark.py
-       -> merged_rounds.jsonl / runs.csv / aggregate.csv / validation.json
+       -> <TASK>/data/{merged_rounds.jsonl,validation.json}
+       -> <TASK>/csv/{runs.csv,aggregate.csv}
   -> summarize_ttft_fullchain.py
-       -> fullchain/agents-<N>/fullchain_rounds.jsonl   # 全量 per-request
-       -> fullchain/agents-<N>/fullchain_summary.json   # 聚合
+       -> <run>/data/fullchain/fullchain_rounds.jsonl   # 当前 run 全量 request
+       -> <run>/data/fullchain/fullchain_summary.json
   -> scripts/plot/plot_trajectory_metrics.py
   -> scripts/plot/plot_trajectory_latency.py
-       # 仅用代表轨迹的 filtered rounds（trajectory-source/），不作 fullchain 切片
-       # 产出含 trajectory_jct.svg（单轨迹 per-turn wall 堆叠 = trajectory_jct）
-  -> scripts/plot/plot_agent_compare.py
-       -> agent_latency_boxplots.svg
-            # 含 trajectory_jct / per-agent mean TTFT / per-agent mean TPOT
-       -> trajectory_jct_max_by_agents.svg
-            # 各 #Agents 下 max(trajectory_jct)；≈ batch wall_seconds
-       -> ttft_fullchain_by_agents.svg   # 读全量 fullchain_rounds 再按 #Agents 聚合画图
+       -> <run>/longest-trajectory/{turn,ttft,ttst,tpot}.svg
+       -> <run>/longest-trajectory/{kv-new,kv-total,cache-hit}.svg
+       -> <run>/longest-trajectory/l3-read-{data,time}-engine-<ID>.svg
+       -> <run>/longest-trajectory/{l3-bandwidth,pd-bandwidth}.svg
+  -> scripts/plot/plot_run_summary.py
+       -> <run>/all-trajectories/latency.svg
+       -> <run>/all-trajectories/ttft-breakdown.svg
+  -> scripts/plot/plot_task_jct.py
+       -> <TASK>/JCT.svg / JCT.json
 ```
 
 `scripts/plot/plot_ttft_fullchain.py` 仍可用于手工对任意

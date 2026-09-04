@@ -108,12 +108,27 @@ breakdown、字段和有效性阈值统一见 [指标规范](metrics.md)。本�
   `pd_2p2d_benchmark.sbatch`
 - `scripts/collect_benchmark_metrics.py`
 - `scripts/summarize_latency_benchmark.py` / `summarize_ttft_fullchain.py`
-- `scripts/plot/`（`plot_agent_compare.py` 等）
+- `scripts/plot/`（longest/all-trajectories 与 task 级 JCT 作图）
+
+三个正式 sbatch 都接受任意长度的 dataset、agent 和 repetition 配置。标准
+dataset 可写 `32`/`32K`；自定义文件写
+`32K=/absolute/path/to/file.jsonl`。`REPETITIONS=N` 表示运行 `1..N`，
+`REP_LIST="1 3 5"` 可显式选择 repetition ID：
+
+```bash
+TASK_NAME=figure7-main \
+DATASETS="32K 64K 128K" \
+AGENT_COUNTS="200 400 800" \
+REP_LIST="1 2 3" \
+sbatch scripts/pd_1p2d_benchmark.sbatch
+```
+
+旧 `MAX_LENGTHS` 仍作为 `DATASETS` 未设置时的兼容入口。
 
 历史 Job `65032` 为旧 file-backend / 隔离口径矩阵，不得与正式 Mooncake
 动态 rollout 混报。指标与产物口径见 [指标规范](metrics.md)；仓库侧图表在
-`results/latency-benchmark/<JOBID>/`（`REPO_RESULT_DIR`，勿与 Lustre
-`RESULT_DIR` 混淆）。
+`results/latency-benchmark/<TASK_NAME>/<DATASET>/agents-<N>/rep-<R>/`
+（`REPO_RESULT_DIR`，勿与 Lustre `RESULT_DIR` 混淆）。
 
 数据路径、实际 chunk 传输边界和 `ABLATION_PROFILE` 一键配置见
 [当前数据流与消融开关](dataflow-and-ablation.md)。

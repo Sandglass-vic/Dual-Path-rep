@@ -15,7 +15,7 @@
 11. [Benchmark 规范](benchmark.md)：论文式动态 rollout 和实验矩阵。
 12. [指标规范](metrics.md)：唯一 metric 来源——**trajectory_jct**、
     per-agent mean TTFT/TPOT（agent 内先平均）、代表轨迹 vs 全量 fullchain、
-    产物布局。
+    task/dataset/agents/rep 产物布局。
 13. [当前数据流与消融开关](dataflow-and-ablation.md)：L3、P→D、chunk 传输边界和一键 profile。
 14. [四轮延迟结果](latency-results.md)：历史 Job `65032`（诊断口径）。
 15. [TTFT 全链路历史测例](ttft-fullchain.md)：历史 Job `65144` 数值。
@@ -47,4 +47,5 @@ scripts/
   replay_*.py / generate_*.py / pd_{prefill,decode}*.sh
 ```
 
-仓库侧产物：`results/latency-benchmark/<JOBID>/`（gitignore；示例 `65593`）。
+仓库侧产物：`results/latency-benchmark/<TASK_NAME>/<DATASET>/agents-<N>/rep-<R>/`
+（gitignore）。

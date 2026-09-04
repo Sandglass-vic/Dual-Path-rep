@@ -26,6 +26,7 @@ P_TRANSFER = re.compile(
 L3_READ = re.compile(
     r"DUALPATH_L3_TIMING rid=(?P<rid>\S+) "
     r"prefill_engine=(?P<engine>\S+) tp_rank=(?P<rank>\d+) .*?"
+    r"read_start=(?P<start>[0-9.]+) read_end=(?P<end>[0-9.]+) "
     r"read_s=(?P<seconds>[0-9.]+) tokens=(?P<tokens>\d+)"
 )
 
@@ -35,13 +36,13 @@ def parse_logs(
     log_glob: str = "prefill*.log",
 ) -> tuple[
     dict[str, tuple[float, int, int, int, int]],
-    dict[str, dict[str, dict[int, tuple[float, int]]]],
+    dict[str, dict[str, dict[int, tuple[float, float, float, int]]]],
 ]:
     transfer_values: dict[
         str, list[tuple[float, int, int, int, int]]
     ] = defaultdict(list)
     read_values: dict[
-        str, dict[str, dict[int, list[tuple[float, int]]]]
+        str, dict[str, dict[int, list[tuple[float, float, float, int]]]]
     ] = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
     for path in log_dir.glob(log_glob):
         if "prefill" not in path.name:
@@ -65,6 +66,8 @@ def parse_logs(
                     int(read_match.group("rank"))
                 ].append(
                     (
+                        float(read_match.group("start")),
+                        float(read_match.group("end")),
                         float(read_match.group("seconds")),
                         int(read_match.group("tokens")),
                     )
@@ -85,7 +88,9 @@ def parse_logs(
             engine: {
                 rank: (
                     statistics.median(item[0] for item in items),
-                    round(statistics.median(item[1] for item in items)),
+                    statistics.median(item[1] for item in items),
+                    statistics.median(item[2] for item in items),
+                    round(statistics.median(item[3] for item in items)),
                 )
                 for rank, items in ranks.items()
             }
@@ -144,19 +149,23 @@ def build_rows(
         prefill_engine = next(iter(request_engines), "")
         rank_timings = request_engines.get(prefill_engine, {})
         if rank_timings:
-            slowest_rank, (l3_seconds, _) = max(
-                rank_timings.items(), key=lambda item: item[1][0]
+            slowest_rank, (_, _, slowest_seconds, _) = max(
+                rank_timings.items(), key=lambda item: item[1][2]
             )
-            l3_tokens = min(item[1] for item in rank_timings.values())
+            l3_start = min(item[0] for item in rank_timings.values())
+            l3_end = max(item[1] for item in rank_timings.values())
+            l3_seconds = l3_end - l3_start
+            l3_tokens = min(item[3] for item in rank_timings.values())
             rank_row: dict[str, float | int | str] = {
                 "trajectory_id": item["trajectory_id"],
                 "turn_id": int(item["turn_id"]),
                 "request_id": rid,
                 "prefill_engine_id": prefill_engine,
+                "l3_read_gib": l3_tokens * KV_BYTES_PER_TOKEN / GIB,
             }
-            for rank, (seconds, _) in sorted(rank_timings.items()):
+            for rank, (_, _, seconds, _) in sorted(rank_timings.items()):
                 rank_row[f"tp_rank_{rank}_read_seconds"] = seconds
-            rank_row["max_tp_rank_read_seconds"] = l3_seconds
+            rank_row["tp_union_read_seconds"] = l3_seconds
             engine_rank_rows[prefill_engine].append(rank_row)
         else:
             slowest_rank, l3_seconds, l3_tokens = -1, 0.0, 0
@@ -181,7 +190,7 @@ def build_rows(
                 "l3_rank_read_seconds_json": json.dumps(
                     {
                         str(rank): seconds
-                        for rank, (seconds, _) in sorted(rank_timings.items())
+                    for rank, (_, _, seconds, _) in sorted(rank_timings.items())
                     },
                     separators=(",", ":"),
                 ),
@@ -332,6 +341,8 @@ def main() -> None:
     parser.add_argument("--log-dir", type=Path)
     parser.add_argument("--log-glob", default="prefill*.log")
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--csv-output", type=Path)
+    parser.add_argument("--summary-output", type=Path)
     args = parser.parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     if args.metrics_csv:
@@ -357,7 +368,8 @@ def main() -> None:
         raise RuntimeError(
             f"P-to-D timing coverage is only {transfer_coverage:.1%}"
         )
-    csv_path = args.output_dir / "trajectory_metrics.csv"
+    csv_path = args.csv_output or args.output_dir / "metrics.csv"
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
     with csv_path.open("w", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
         writer.writeheader()
@@ -371,7 +383,7 @@ def main() -> None:
         ),
         "Hit rate",
         "KV-cache Hit Rate by Turn",
-        args.output_dir / "trajectory_cache_hit_rate.svg",
+        args.output_dir / "cache-hit.svg",
         y_limit=1.0,
     )
     plot(
@@ -379,7 +391,7 @@ def main() -> None:
         (("new_logical_kv_gib", "New logical KV", "#16a34a"),),
         "GiB",
         "New KV Data by Turn",
-        args.output_dir / "trajectory_new_kv.svg",
+        args.output_dir / "kv-new.svg",
     )
     total_kv_series = [
         ("total_logical_kv_gib", "Total logical context KV", "#0f766e")
@@ -402,7 +414,7 @@ def main() -> None:
         tuple(total_kv_series),
         "GiB",
         "Total KV Data by Turn",
-        args.output_dir / "trajectory_total_kv.svg",
+        args.output_dir / "kv-total.svg",
     )
     plot(
         rows,
@@ -415,7 +427,7 @@ def main() -> None:
         ),
         "GB/s",
         "Prefill-to-Decode KV Completion-window Bandwidth by Turn",
-        args.output_dir / "trajectory_pd_bandwidth.svg",
+        args.output_dir / "pd-bandwidth.svg",
     )
     plot(
         rows,
@@ -428,7 +440,7 @@ def main() -> None:
         ),
         "GB/s",
         "Prefill L3 KV Load Bandwidth by Turn",
-        args.output_dir / "trajectory_l3_bandwidth.svg",
+        args.output_dir / "l3-bandwidth.svg",
     )
     rank_colors = (
         "#2563eb",
@@ -473,8 +485,8 @@ def main() -> None:
             for rank in rank_ids
         ) + (
             (
-                "max_tp_rank_read_seconds",
-                "Max rank (bandwidth denominator)",
+                "tp_union_read_seconds",
+                "TP union window (bandwidth denominator)",
                 "#111827",
             ),
         )
@@ -485,7 +497,14 @@ def main() -> None:
             "Seconds",
             f"Prefill Engine {engine}: L3 Read Time by TP Rank",
             args.output_dir
-            / f"prefill_engine_{safe_engine}_l3_rank_times.svg",
+            / f"l3-read-time-engine-{safe_engine}.svg",
+        )
+        plot(
+            rank_rows,
+            (("l3_read_gib", "Logical KV read", "#0f766e"),),
+            "GiB",
+            f"Prefill Engine {engine}: L3 Read Data by Turn",
+            args.output_dir / f"l3-read-data-engine-{safe_engine}.svg",
         )
     positive_l3 = [
         float(row["prefill_l3_effective_bandwidth_gbps"])
@@ -527,8 +546,8 @@ def main() -> None:
         "prefill_engine_l3_timing": {
             engine: {
                 "requests": len(rank_rows),
-                "median_max_tp_rank_read_seconds": statistics.median(
-                    float(row["max_tp_rank_read_seconds"])
+                "median_tp_union_read_seconds": statistics.median(
+                    float(row["tp_union_read_seconds"])
                     for row in rank_rows
                 ),
                 "per_rank_median_read_seconds": {
@@ -542,9 +561,9 @@ def main() -> None:
             for engine, rank_rows in sorted(engine_rank_rows.items())
         },
     }
-    (args.output_dir / "trajectory_metrics_summary.json").write_text(
-        json.dumps(summary, indent=2) + "\n"
-    )
+    summary_path = args.summary_output or args.output_dir / "metrics-summary.json"
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+    summary_path.write_text(json.dumps(summary, indent=2) + "\n")
     print(f"Wrote {len(rows)} turns to {args.output_dir}")
 
 

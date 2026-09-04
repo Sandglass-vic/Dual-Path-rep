@@ -35,6 +35,7 @@ breakdown](metrics.md#full-chain-additive-breakdown)。
 仓库侧 Job `65144` 图表目录已清理；上表数值仍有效。当前正式 full-chain
 为**全量 per-request** 明细（`fullchain_rounds.jsonl` 每行一个
 `trajectory_id`+`turn_id`）加 `fullchain_summary.json` 聚合，以及
-`ttft_fullchain_by_agents.svg`；不再保留单轨迹 fullchain 切片。定义见
+每个 run 的 `all-trajectories/ttft-breakdown.svg`；不再保留单轨迹
+fullchain 切片。定义见
 [指标规范 §6](metrics.md#6-ttft-breakdown)。Lustre 原始日志仍保留，不复制到
 仓库 `results/`。

@@ -36,10 +36,10 @@ def patch_hiradix(path: Path) -> None:
         "            req_id, host_indices, new_input_tokens, last_hash, prefix_keys\n"
         "        )\n"
         "        self.ongoing_prefetch[req_id] = (\n",
+        "        self.dualpath_prefetch_start[req_id] = time.perf_counter()\n"
         "        operation = self.cache_controller.prefetch(\n"
         "            req_id, host_indices, new_input_tokens, last_hash, prefix_keys\n"
         "        )\n"
-        "        self.dualpath_prefetch_start[req_id] = time.perf_counter()\n"
         "        self.ongoing_prefetch[req_id] = (\n",
         "record L3 prefetch start",
     )

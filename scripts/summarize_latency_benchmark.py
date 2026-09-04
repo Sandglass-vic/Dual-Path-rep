@@ -70,6 +70,12 @@ def parse_timing_logs(
                 l3_values[rid][engine][rank]["read"].append(
                     float(match.group("read"))
                 )
+                l3_values[rid][engine][rank]["start"].append(
+                    float(match.group("start"))
+                )
+                l3_values[rid][engine][rank]["end"].append(
+                    float(match.group("end"))
+                )
                 l3_values[rid][engine][rank]["tokens"].append(
                     float(match.group("tokens"))
                 )
@@ -119,7 +125,8 @@ def parse_timing_logs(
             reduced.items(), key=lambda item: item[1]["read"]
         )
         l3[rid] = {
-            "read": slowest["read"],
+            "read": max(item["end"] for item in reduced.values())
+            - min(item["start"] for item in reduced.values()),
             "tokens": min(item["tokens"] for item in reduced.values()),
             "engine": engine,
             "slowest_rank": slowest_rank,
@@ -137,7 +144,7 @@ def parse_timing_logs(
 
 def load_runs(result_dir: Path) -> list[dict[str, Any]]:
     runs = []
-    for run_path in sorted(result_dir.glob("*k/agents-*/rep-*/run.json")):
+    for run_path in sorted(result_dir.glob("*/agents-*/rep-*/run.json")):
         run_dir = run_path.parent
         metadata = json.loads(run_path.read_text())
         summary_path = run_dir / "summary.json"

@@ -27,9 +27,31 @@
 └── test/dataset/                  fake trajectory 数据集
 ```
 
-**同名不同义**：labhome 的 `results/` 存 collect 产出的 CSV/SVG/fullchain；
+**同名不同义**：labhome 的 `results/` 存 collect 产出的 CSV/SVG/JSON；
 Lustre 的 `results/` 存 replay 原始 `rounds.jsonl` 等。二者通过
 `REPO_RESULT_DIR` 与 `RESULT_DIR` 区分。旧名 `artifacts/` 已弃用。
+
+每个 Slurm 作业是一个 task，默认名为
+`<SLURM_JOB_NAME>-<SLURM_JOB_ID>`，也可用 `TASK_NAME` 指定。Lustre 原始结果和
+labhome 整理结果使用相同层级：
+
+```text
+<task>/
+├── JCT.svg / JCT.json                    # labhome task 级对比
+├── data/ / csv/                          # task 级聚合
+├── 32K/
+│   └── agents-200/
+│       ├── rep-1/
+│       │   ├── data/                     # JSON/JSONL 原始及明细
+│       │   ├── csv/                      # 处理后的表格
+│       │   ├── longest-trajectory/       # 最长 agent 的逐 turn 图
+│       │   └── all-trajectories/         # 全 agent 分布与 TTFT breakdown
+│       └── rep-2/
+└── 64K/...
+```
+
+Lustre 侧 `<task>/<dataset>/agents-<N>/rep-<R>/` 保存 replay 原始文件；服务日志
+仍在同 task 的 `LOG_DIR`，不会复制到 labhome。
 
 所有代码和小型配置必须放在 `/labhome/sezhou/dual-path` 的子目录并由 Git 管理，确保登录节点随时可读。镜像、模型权重、SWE-bench checkout/sandbox、KV-cache、大型 trace 和原始结果放在 Lustre，不提交 Git。登录节点不能依赖 `/mnt/lustre` 或 `/labhome/sezhou/lustre` 可见；访问和生成运行数据时必须进入计算节点。
 

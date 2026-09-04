@@ -18,10 +18,15 @@ CODE_HOME=${CODE_HOME:-/labhome/sezhou/dual-path}
 RUNTIME_HOME=${RUNTIME_HOME:-/mnt/lustre/users/sezhou/dual-path}
 IMAGE=${IMAGE:-$RUNTIME_HOME/images/sglang:26.01-py3-mooncake0.3.13.post1-timing-v2.sqsh}
 MODEL_DIR=${MODEL_DIR:-$RUNTIME_HOME/models/Qwen2.5-32B}
-LOG_DIR=${LOG_DIR:-$RUNTIME_HOME/logs/latency-benchmark/$SLURM_JOB_ID}
-RESULT_DIR=${RESULT_DIR:-$RUNTIME_HOME/results/latency-benchmark/$SLURM_JOB_ID}
-CACHE_DIR=${CACHE_DIR:-$RUNTIME_HOME/kv-cache/latency-benchmark/$SLURM_JOB_ID}
-REPO_RESULT_DIR=${REPO_RESULT_DIR:-$CODE_HOME/results/latency-benchmark/$SLURM_JOB_ID}
+TASK_NAME=${TASK_NAME:-${SLURM_JOB_NAME}-${SLURM_JOB_ID}}
+if [[ "$TASK_NAME" == */* || -z "$TASK_NAME" ]]; then
+  echo "TASK_NAME must be a non-empty directory name without /" >&2
+  exit 2
+fi
+LOG_DIR=${LOG_DIR:-$RUNTIME_HOME/logs/latency-benchmark/$TASK_NAME}
+RESULT_DIR=${RESULT_DIR:-$RUNTIME_HOME/results/latency-benchmark/$TASK_NAME}
+CACHE_DIR=${CACHE_DIR:-$RUNTIME_HOME/kv-cache/latency-benchmark/$TASK_NAME}
+REPO_RESULT_DIR=${REPO_RESULT_DIR:-$CODE_HOME/results/latency-benchmark/$TASK_NAME}
 IB_DEVICE=${IB_DEVICE:-mlx5_0}
 PREFILL_PORT=${PREFILL_PORT:-30000}
 DECODE_PORT=${DECODE_PORT:-30000}
@@ -29,9 +34,11 @@ BOOTSTRAP_PORT=${BOOTSTRAP_PORT:-8998}
 ROUTER_PORT=${ROUTER_PORT:-8000}
 SERVER_TIMEOUT=${SERVER_TIMEOUT:-1200}
 REPETITIONS=${REPETITIONS:-3}
+REP_LIST=${REP_LIST:-}
 MAX_TURNS=${MAX_TURNS:-0}
 TRAJECTORY_OFFSET=${TRAJECTORY_OFFSET:-0}
-MAX_LENGTHS=${MAX_LENGTHS:-"32"}
+# DATASETS entries: N/NK uses the standard fake dataset; NK=/path selects a file.
+DATASETS=${DATASETS:-${MAX_LENGTHS:-"32"}}
 AGENT_COUNTS=${AGENT_COUNTS:-"32 64 128"}
 ABLATION_PROFILE=${ABLATION_PROFILE:-full}
 PAPER_EXPAND_AGENTS=${PAPER_EXPAND_AGENTS:-1}
@@ -116,20 +123,27 @@ remove_run_cache() {
   echo "Removed completed run KV cache: $run_cache_dir"
 }
 
-for max_len in $MAX_LENGTHS; do
-  dataset="$RUNTIME_HOME/test/dataset/dualpath_fake_${max_len}k.jsonl"
-  for repetition in $(seq 1 "$REPETITIONS"); do
+mapfile -t repetition_ids < <(dualpath_repetition_ids)
+if (( ${#repetition_ids[@]} == 0 )); then
+  echo "No repetition IDs configured" >&2
+  exit 2
+fi
+for dataset_spec in $DATASETS; do
+  dualpath_resolve_dataset "$dataset_spec"
+  dataset_slug=${DATASET_LABEL,,}
+  for repetition in "${repetition_ids[@]}"; do
     for agents in $AGENT_COUNTS; do
-      run_dir="$RESULT_DIR/${max_len}k/agents-${agents}/rep-${repetition}"
-      run_id="${max_len}k-a${agents}-r${repetition}"
+      run_dir="$RESULT_DIR/$DATASET_LABEL/agents-${agents}/rep-${repetition}"
+      run_id="${dataset_slug}-a${agents}-r${repetition}"
       run_cache_dir="$CACHE_DIR/$run_id"
       mkdir -p "$run_dir"
       launch_cluster "$run_id" "$run_cache_dir"
       dualpath_write_run_json \
-        "$run_dir/run.json" "$ARCHITECTURE" "$max_len" "$agents" "$repetition"
+        "$run_dir/run.json" "$ARCHITECTURE" "$DATASET_MAX_LEN" \
+        "$agents" "$repetition" "$DATASET_LABEL"
       dualpath_run_replay \
-        "$dataset" "$agents" "$run_dir" \
-        "bench-${ARCHITECTURE,,}-${max_len}k-a${agents}-r${repetition}-"
+        "$DATASET_PATH" "$agents" "$run_dir" \
+        "bench-${ARCHITECTURE,,}-${dataset_slug}-a${agents}-r${repetition}-"
       dualpath_stop_steps
       remove_run_cache "$run_cache_dir"
     done

@@ -82,6 +82,7 @@ dualpath_write_run_json() {
   local max_len=$3
   local agents=$4
   local repetition=$5
+  local dataset=${6:-${max_len}K}
   local flush_flag=0
   local snapshot_flag=0
   local settle="${STORAGE_SETTLE_SECONDS:-0}"
@@ -91,7 +92,7 @@ dualpath_write_run_json() {
   if [[ "${COLLECT_L3_STORAGE_SNAPSHOT:-1}" == 1 ]]; then
     snapshot_flag=1
   fi
-  python - "$path" "$architecture" "$max_len" "$agents" "$repetition" \
+  python - "$path" "$architecture" "$max_len" "$agents" "$repetition" "$dataset" \
     "$MAX_TURNS" "$ABLATION_PROFILE" "$MEASURED_PREFILL_L3" \
     "$MEASURED_DECODE_OFFLOAD" "$CHUNKED_PREFILL_SIZE" \
     "$DISABLE_OVERLAP_SCHEDULE" "$PAPER_EXPAND_AGENTS" \
@@ -106,22 +107,23 @@ Path(sys.argv[1]).write_text(json.dumps({
     "max_len_k": int(sys.argv[3]),
     "agents": int(sys.argv[4]),
     "repetition": int(sys.argv[5]),
-    "turns": int(sys.argv[6]),
-    "ablation_profile": sys.argv[7],
-    "prefill_l3": bool(int(sys.argv[8])),
-    "decode_offload": bool(int(sys.argv[9])),
-    "chunked_prefill_size": int(sys.argv[10]),
-    "disable_overlap_schedule": bool(int(sys.argv[11])),
-    "paper_expand_agents": bool(int(sys.argv[12])),
-    "paper_synthetic_append_tokens": int(sys.argv[13]),
+    "dataset": sys.argv[6],
+    "turns": int(sys.argv[7]),
+    "ablation_profile": sys.argv[8],
+    "prefill_l3": bool(int(sys.argv[9])),
+    "decode_offload": bool(int(sys.argv[10])),
+    "chunked_prefill_size": int(sys.argv[11]),
+    "disable_overlap_schedule": bool(int(sys.argv[12])),
+    "paper_expand_agents": bool(int(sys.argv[13])),
+    "paper_synthetic_append_tokens": int(sys.argv[14]),
     "cache_policy": "paper-aligned-l3-reload",
     "cache_initial_state": "empty",
     "storage_backend": "mooncake-dfs-posix-lustre",
     "artificial_inter_turn_delay": False,
-    "per_turn_cache_flush": bool(int(sys.argv[14])),
-    "storage_settle_seconds": float(sys.argv[15]),
-    "storage_quiescence_wait": bool(float(sys.argv[15]) > 0),
-    "collect_l3_storage_snapshot": bool(int(sys.argv[16])),
+    "per_turn_cache_flush": bool(int(sys.argv[15])),
+    "storage_settle_seconds": float(sys.argv[16]),
+    "storage_quiescence_wait": bool(float(sys.argv[16]) > 0),
+    "collect_l3_storage_snapshot": bool(int(sys.argv[17])),
     "l3_storage_snapshot_kind": "recursive apparent bytes and st_blocks allocated bytes",
     "kv_buffer_semantics": (
         "DualPath paper: staging/GPU buffers released after each request; "
@@ -130,6 +132,48 @@ Path(sys.argv[1]).write_text(json.dumps({
     ),
 }, indent=2) + "\n")
 PY
+}
+
+dualpath_resolve_dataset() {
+  local spec=$1
+  local value
+  if [[ "$spec" == *=* ]]; then
+    DATASET_LABEL=${spec%%=*}
+    DATASET_PATH=${spec#*=}
+  else
+    value=${spec%[Kk]}
+    if [[ ! "$value" =~ ^[0-9]+$ ]]; then
+      echo "Dataset '$spec' must be N, NK, or LABEL=/path/file.jsonl" >&2
+      return 2
+    fi
+    DATASET_LABEL="${value}K"
+    DATASET_PATH="$RUNTIME_HOME/test/dataset/dualpath_fake_${value}k.jsonl"
+  fi
+  value=${DATASET_LABEL%[Kk]}
+  if [[ ! "$value" =~ ^[0-9]+$ ]]; then
+    echo "Dataset label '$DATASET_LABEL' must use the form NK" >&2
+    return 2
+  fi
+  DATASET_MAX_LEN=$value
+  DATASET_LABEL="${value}K"
+  if [[ ! -f "$DATASET_PATH" ]]; then
+    echo "Dataset file does not exist: $DATASET_PATH" >&2
+    return 2
+  fi
+  export DATASET_LABEL DATASET_PATH DATASET_MAX_LEN
+}
+
+dualpath_repetition_ids() {
+  if [[ -n ${REP_LIST:-} ]]; then
+    printf '%s\n' ${REP_LIST//,/ }
+  elif [[ "$REPETITIONS" == *" "* || "$REPETITIONS" == *","* ]]; then
+    printf '%s\n' ${REPETITIONS//,/ }
+  elif [[ "$REPETITIONS" =~ ^[0-9]+$ ]] && (( REPETITIONS > 0 )); then
+    seq 1 "$REPETITIONS"
+  else
+    echo "REPETITIONS must be a positive count or REP_LIST must list IDs" >&2
+    return 2
+  fi
 }
 
 dualpath_run_replay() {

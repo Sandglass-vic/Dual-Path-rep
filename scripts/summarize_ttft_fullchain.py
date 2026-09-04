@@ -138,8 +138,16 @@ def collect_logs(
         (engine, rank), slowest = max(
             reduced.items(), key=lambda item: item[1]["duration"]
         )
+        engines = {key[0] for key in reduced}
+        if len(engines) != 1:
+            raise RuntimeError(f"{rid} has L3 timing from engines {sorted(engines)}")
+        union_start = min(item["start"] for item in reduced.values())
+        union_end = max(item["end"] for item in reduced.values())
         l3[rid] = {
             **slowest,
+            "start": union_start,
+            "end": union_end,
+            "duration": union_end - union_start,
             "engine": engine,
             "rank": float(rank),
             "rank_count": float(len(reduced)),
