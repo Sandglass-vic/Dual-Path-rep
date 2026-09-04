@@ -83,6 +83,12 @@ turn_wall_seconds
 `turn_wall_seconds` 闭合式；旧的“永远记 0 后删除字段”做法已废止——现字段在
 flush 开启时为实测值，关闭时为 0。
 
+并发 agent 不能在其他请求仍活跃时直接调用 SGLang 的全局 `/flush_cache`
+（服务会返回 HTTP 400）。replay 使用 request-wave coordinator：任一 agent
+请求 flush 后阻止新请求进入，等待当前活跃请求排空，仅执行一次全局 flush 和
+settle，再释放下一波请求。`cache_sync_wait_seconds` 记录该同步等待，同样不计入
+`turn_wall_seconds` / trajectory JCT。
+
 ### Request latency
 
 `latency_seconds` 是 client 发出 `/generate` 请求到完整 streaming response

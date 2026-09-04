@@ -72,6 +72,8 @@ Repetitions：3
 - 不预先 populate，不重启进入 measured 阶段；
 - **每轮结束后 Prefill `/flush_cache`**，释放本地 L1/L2（近似论文 staging/GPU
   buffer 用完即放）；**不**清 Mooncake Store；
+- 多 agent 时先阻止下一波请求进入并排空当前活跃请求，再只执行一次全局
+  `/flush_cache`；避免并发请求期间 flush 返回 HTTP 400；
 - 默认 `STORAGE_SETTLE_SECONDS=1`，避免 Store 尚未可见就发下一轮；
 - Decode 在 rollout 中持续把 KV 发布到 Mooncake Store，下一轮从 L3 加载；
 - JCT：`trajectory_jct` / turn_wall **不含** flush/settle；batch `wall_seconds`

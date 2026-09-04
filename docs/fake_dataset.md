@@ -116,6 +116,11 @@ seed 为每轮构造普通词表范围内的伪随机 token IDs，通过 SGLang 
 发送 `input_ids`，强制精确生成目标长度，并把响应中的真实 `output_ids` 拼入
 下一轮 context。不同 trajectory 可并发执行，同一 trajectory 内严格串行。
 
+开启逐轮 Prefill flush 且 agents>1 时，client 会在任一线程请求 flush 后关闭
+下一轮入口，等待当前服务请求排空，只执行一次全局 flush/settle，再释放等待
+线程。同步耗时写入 `cache_sync_wait_seconds`，不属于模型请求 latency 或
+trajectory JCT。
+
 ### 论文的 500→4096 agents 扩增方法
 
 论文 Figure 7 的离线 agent batch size 为 `512/1024/2048/4096`，但每个 MaxLen

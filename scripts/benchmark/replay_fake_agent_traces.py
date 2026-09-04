@@ -18,6 +18,69 @@ from pathlib import Path
 from typing import Any
 
 
+class FlushCoordinator:
+    """Drain active requests, flush once, then release the next request wave."""
+
+    def __init__(
+        self, urls: tuple[str, ...], timeout: float, settle_seconds: float
+    ) -> None:
+        self.urls = urls
+        self.timeout = timeout
+        self.settle_seconds = settle_seconds
+        self.condition = threading.Condition()
+        self.active_requests = 0
+        self.flush_pending = False
+        self.flushing = False
+        self.generation = 0
+
+    def begin_request(self) -> None:
+        with self.condition:
+            self.condition.wait_for(lambda: not self.flush_pending)
+            self.active_requests += 1
+
+    def finish_request(
+        self, needs_flush: bool
+    ) -> tuple[float, float, float]:
+        sync_started = time.perf_counter()
+        with self.condition:
+            self.active_requests -= 1
+            if self.active_requests < 0:
+                raise RuntimeError("FlushCoordinator active request underflow")
+            generation = self.generation
+            if needs_flush:
+                self.flush_pending = True
+            self.condition.notify_all()
+            if not needs_flush:
+                return 0.0, 0.0, time.perf_counter() - sync_started
+            self.condition.wait_for(
+                lambda: self.generation != generation
+                or (self.active_requests == 0 and not self.flushing)
+            )
+            if self.generation != generation:
+                return 0.0, 0.0, time.perf_counter() - sync_started
+            self.flushing = True
+
+        flush_seconds = 0.0
+        settle_seconds = 0.0
+        try:
+            flush_seconds = flush_local_caches(self.urls, self.timeout)
+            if self.settle_seconds > 0:
+                settle_started = time.perf_counter()
+                time.sleep(self.settle_seconds)
+                settle_seconds = time.perf_counter() - settle_started
+        finally:
+            with self.condition:
+                self.generation += 1
+                self.flushing = False
+                self.flush_pending = False
+                self.condition.notify_all()
+        return (
+            flush_seconds,
+            settle_seconds,
+            time.perf_counter() - sync_started,
+        )
+
+
 @dataclass(frozen=True)
 class ReplayConfig:
     endpoint: str
@@ -31,7 +94,7 @@ class ReplayConfig:
     max_context_tokens: int | None
     flush_cache_urls: tuple[str, ...]
     storage_settle_seconds: float
-    flush_lock: threading.Lock | None
+    flush_coordinator: FlushCoordinator | None
     storage_dirs: tuple[Path, ...]
 
 
@@ -186,9 +249,21 @@ def flush_local_caches(urls: tuple[str, ...], timeout: float) -> float:
         return 0.0
     started = time.perf_counter()
     for url in urls:
-        request = urllib.request.Request(url, method="POST", data=b"")
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            response.read()
+        deadline = time.monotonic() + timeout
+        while True:
+            request = urllib.request.Request(url, method="POST", data=b"")
+            try:
+                with urllib.request.urlopen(request, timeout=timeout) as response:
+                    response.read()
+                break
+            except urllib.error.HTTPError as error:
+                detail = error.read().decode(errors="replace")
+                if error.code == 400 and time.monotonic() < deadline:
+                    time.sleep(0.1)
+                    continue
+                raise RuntimeError(
+                    f"Flush cache HTTP {error.code}: {detail}"
+                ) from error
     return time.perf_counter() - started
 
 
@@ -258,21 +333,29 @@ def replay_trajectory(
         request_id = (
             f"{config.request_id_prefix}{trajectory_id}-turn-{turn_id}"
         )
-        (
-            response,
-            latency,
-            stream_metrics,
-            effective_request_id,
-            stream_retry_count,
-        ) = post_generate(
-            config, prompt_ids, generate_tokens, request_id
-        )
-        output_ids = extract_output_ids(response)
-        if len(output_ids) != generate_tokens:
-            raise RuntimeError(
-                f"{trajectory_id} turn {turn_id} generated {len(output_ids)} "
-                f"tokens; expected {generate_tokens}"
+        coordinator = config.flush_coordinator
+        if coordinator is not None:
+            coordinator.begin_request()
+        try:
+            (
+                response,
+                latency,
+                stream_metrics,
+                effective_request_id,
+                stream_retry_count,
+            ) = post_generate(
+                config, prompt_ids, generate_tokens, request_id
             )
+            output_ids = extract_output_ids(response)
+            if len(output_ids) != generate_tokens:
+                raise RuntimeError(
+                    f"{trajectory_id} turn {turn_id} generated "
+                    f"{len(output_ids)} tokens; expected {generate_tokens}"
+                )
+        except BaseException:
+            if coordinator is not None:
+                coordinator.finish_request(False)
+            raise
 
         meta = response.get("meta_info", {})
         round_results.append(
@@ -294,6 +377,15 @@ def replay_trajectory(
         )
         context_ids = prompt_ids + output_ids
         turn_ended = time.perf_counter()
+        flush_seconds = 0.0
+        settle_seconds = 0.0
+        cache_sync_wait_seconds = 0.0
+        if coordinator is not None:
+            (
+                flush_seconds,
+                settle_seconds,
+                cache_sync_wait_seconds,
+            ) = coordinator.finish_request(turn_index + 1 < len(turns))
         turn_wall_seconds = turn_ended - turn_started
         client_runtime_seconds = max(0.0, turn_wall_seconds - latency)
         round_results[-1].update(
@@ -306,31 +398,10 @@ def replay_trajectory(
             }
         )
 
-        # Paper DualPath: release staging/GPU after the request. On SGLang we
-        # approximate by flushing Prefill L1/L2 while keeping Mooncake Store.
-        # Flush/settle are recorded separately and are NOT part of turn_wall.
-        if config.flush_cache_urls and turn_index + 1 < len(turns):
-            flush_seconds = 0.0
-            settle_seconds = 0.0
-            lock = config.flush_lock
-            if lock is not None:
-                lock.acquire()
-            try:
-                flush_seconds = flush_local_caches(
-                    config.flush_cache_urls, config.timeout
-                )
-                if config.storage_settle_seconds > 0:
-                    settle_started = time.perf_counter()
-                    time.sleep(config.storage_settle_seconds)
-                    settle_seconds = time.perf_counter() - settle_started
-            finally:
-                if lock is not None:
-                    lock.release()
-            round_results[-1]["cache_flush_seconds"] = flush_seconds
-            round_results[-1]["storage_settle_seconds"] = settle_seconds
-        else:
-            round_results[-1]["cache_flush_seconds"] = 0.0
-            round_results[-1]["storage_settle_seconds"] = 0.0
+        # Flush/settle/synchronization are deliberately outside turn_wall.
+        round_results[-1]["cache_flush_seconds"] = flush_seconds
+        round_results[-1]["storage_settle_seconds"] = settle_seconds
+        round_results[-1]["cache_sync_wait_seconds"] = cache_sync_wait_seconds
         if config.storage_dirs:
             # The last turn has no following-request flush branch, but still
             # needs a short visibility delay before the final filesystem
@@ -366,6 +437,10 @@ def replay_trajectory(
         ),
         "storage_settle_seconds": sum(
             float(item.get("storage_settle_seconds", 0.0)) for item in round_results
+        ),
+        "cache_sync_wait_seconds": sum(
+            float(item.get("cache_sync_wait_seconds", 0.0))
+            for item in round_results
         ),
         "jct_accounting_error_seconds": sum(
             float(item["turn_accounting_error_seconds"]) for item in round_results
@@ -589,7 +664,15 @@ def main() -> None:
         storage_settle_seconds=(
             args.storage_settle_seconds if args.flush_local_cache_between_turns else 0.0
         ),
-        flush_lock=threading.Lock() if flush_urls else None,
+        flush_coordinator=(
+            FlushCoordinator(
+                flush_urls,
+                args.timeout,
+                args.storage_settle_seconds,
+            )
+            if flush_urls
+            else None
+        ),
         storage_dirs=tuple(args.storage_dir),
     )
     start_event = threading.Event()
@@ -680,6 +763,9 @@ def main() -> None:
     )
     summary["storage_settle_seconds_total"] = sum(
         float(item.get("storage_settle_seconds", 0.0)) for item in all_rounds
+    )
+    summary["cache_sync_wait_seconds_total"] = sum(
+        float(item.get("cache_sync_wait_seconds", 0.0)) for item in all_rounds
     )
     summary["storage_snapshot_seconds_total"] = sum(
         float(item.get("storage_snapshot_seconds", 0.0)) for item in all_rounds
