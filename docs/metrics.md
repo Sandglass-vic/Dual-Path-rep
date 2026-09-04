@@ -89,6 +89,10 @@ radix lock；随后驱逐只处理 `lock_ref=0` 的叶节点，因此不会释�
 使用的共享 prefix。Prefill 使用 `write_through_selective`，Decode 继续负责把
 完整上下文发布到 L3。
 
+自动验收要求 `prefill_cache_release_coverage >= 0.95`，且
+`prefill_evictable_after_release_max == 0`；对应字段写入 task
+`data/validation.json` 和聚合 CSV。
+
 长上下文并发 PD 传输显式设置 `MC_TRANSFER_TIMEOUT=120` 秒，并使用
 `SGLANG_MOONCAKE_MAX_TRANSFER_BATCH_INDICES=128` 将过大的 all-layer 同步
 transfer 按 KV page index 有序分批；两项均写入 `run.json`。Mooncake 默认超时

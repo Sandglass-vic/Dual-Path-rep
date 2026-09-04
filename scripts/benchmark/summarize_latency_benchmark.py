@@ -30,6 +30,10 @@ P_TRANSFER_PATTERN = re.compile(
     r"(?: page_aligned_tokens=(?P<page_tokens>\d+) "
     r"page_count=(?P<page_count>\d+) page_size=(?P<page_size>\d+))?"
 )
+PREFILL_RELEASE_PATTERN = re.compile(
+    r"DUALPATH_PREFILL_CACHE_RELEASE rid=(?P<rid>\S+) "
+    r"evictable_before=(?P<before>\d+) evictable_after=(?P<after>\d+)"
+)
 KV_BYTES_PER_TOKEN = 64 * 8 * 128 * 2 * 2
 
 
@@ -43,6 +47,7 @@ def parse_timing_logs(
     dict[str, dict[str, float]],
     dict[str, dict[str, float]],
     dict[str, dict[str, float]],
+    dict[str, dict[str, float]],
 ]:
     request_values: dict[str, dict[str, list[float]]] = defaultdict(
         lambda: defaultdict(list)
@@ -53,6 +58,9 @@ def parse_timing_logs(
         lambda: defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
     )
     transfer_values: dict[str, dict[str, list[float]]] = defaultdict(
+        lambda: defaultdict(list)
+    )
+    release_values: dict[str, dict[str, list[float]]] = defaultdict(
         lambda: defaultdict(list)
     )
     for path in log_dir.glob("prefill*.log"):
@@ -97,6 +105,15 @@ def parse_timing_logs(
                 transfer_values[rid]["page_size"].append(
                     float(match.group("page_size") or 0)
                 )
+            match = PREFILL_RELEASE_PATTERN.search(line)
+            if match:
+                rid = match.group("rid")
+                release_values[rid]["before"].append(
+                    float(match.group("before"))
+                )
+                release_values[rid]["after"].append(
+                    float(match.group("after"))
+                )
 
     requests = {
         rid: {name: statistics.median(values) for name, values in fields.items()}
@@ -139,7 +156,14 @@ def parse_timing_logs(
         }
         for rid, fields in transfer_values.items()
     }
-    return requests, l3, transfers
+    releases = {
+        rid: {
+            name: statistics.median(values)
+            for name, values in fields.items()
+        }
+        for rid, fields in release_values.items()
+    }
+    return requests, l3, transfers, releases
 
 
 def load_runs(result_dir: Path) -> list[dict[str, Any]]:
@@ -210,7 +234,9 @@ def main() -> None:
     args = parser.parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    request_timing, l3_timing, pd_timing = parse_timing_logs(args.log_dir)
+    request_timing, l3_timing, pd_timing, release_timing = parse_timing_logs(
+        args.log_dir
+    )
     runs = load_runs(args.result_dir)
     merged_rounds = []
     run_rows = []
@@ -223,6 +249,7 @@ def main() -> None:
             request = request_timing.get(rid, {})
             l3 = l3_timing.get(rid, {})
             pd = pd_timing.get(rid, {})
+            release = release_timing.get(rid, {})
             pd_payload_tokens = int(
                 pd.get("page_tokens", 0) or pd.get("tokens", 0)
             )
@@ -273,6 +300,13 @@ def main() -> None:
                         else 0.0
                     ),
                     "has_pd_timing": bool(pd),
+                    "has_prefill_cache_release": bool(release),
+                    "prefill_evictable_before_release": int(
+                        release.get("before", 0)
+                    ),
+                    "prefill_evictable_after_release": int(
+                        release.get("after", 0)
+                    ),
                 }
             )
 
@@ -320,6 +354,20 @@ def main() -> None:
                      and item["agents"] == metadata["agents"]
                      and item["repetition"] == metadata["repetition"]]
                 ),
+                "prefill_cache_release_coverage": mean(
+                    [1.0 if item["has_prefill_cache_release"] else 0.0
+                     for item in merged_rounds
+                     if item["max_len_k"] == metadata["max_len_k"]
+                     and item["agents"] == metadata["agents"]
+                     and item["repetition"] == metadata["repetition"]]
+                ),
+                "prefill_evictable_after_release_max": max(
+                    int(item["prefill_evictable_after_release"])
+                    for item in merged_rounds
+                    if item["max_len_k"] == metadata["max_len_k"]
+                    and item["agents"] == metadata["agents"]
+                    and item["repetition"] == metadata["repetition"]
+                ),
                 "pd_transfer_mean_seconds": mean(values("pd_transfer_seconds")),
                 "pd_effective_bandwidth_mean_gbps": mean(
                     values("pd_effective_bandwidth_gbps")
@@ -364,6 +412,14 @@ def main() -> None:
     expects_l3_timing = any(
         bool(run["metadata"].get("prefill_l3", True)) for run in runs
     )
+    expects_prefill_release = any(
+        bool(
+            run["metadata"].get(
+                "prefill_release_local_cache_after_pd_ack", False
+            )
+        )
+        for run in runs
+    )
     validation = {
         "runs": len(run_rows),
         "rounds": len(merged_rounds),
@@ -376,6 +432,15 @@ def main() -> None:
         ),
         "pd_timing_coverage": mean(
             [1.0 if item["has_pd_timing"] else 0.0 for item in merged_rounds]
+        ),
+        "expects_prefill_cache_release": expects_prefill_release,
+        "prefill_cache_release_coverage": mean(
+            [1.0 if item["has_prefill_cache_release"] else 0.0
+             for item in merged_rounds]
+        ),
+        "prefill_evictable_after_release_max": max(
+            int(item["prefill_evictable_after_release"])
+            for item in merged_rounds
         ),
         "batched_token_chunks": sum(
             int(item.get("batched_token_chunks", 0)) for item in merged_rounds
@@ -396,6 +461,16 @@ def main() -> None:
         raise RuntimeError(f"Unexpected L3 timing for no-L3 profile: {validation}")
     if validation["pd_timing_coverage"] < 0.95:
         raise RuntimeError(f"Low P-to-D timing coverage: {validation}")
+    if (
+        expects_prefill_release
+        and validation["prefill_cache_release_coverage"] < 0.95
+    ):
+        raise RuntimeError(f"Low Prefill cache release coverage: {validation}")
+    if (
+        expects_prefill_release
+        and validation["prefill_evictable_after_release_max"] != 0
+    ):
+        raise RuntimeError(f"Incomplete Prefill cache eviction: {validation}")
     if validation["batched_token_chunks"]:
         raise RuntimeError(f"Streaming chunks contained multiple tokens: {validation}")
     print(json.dumps(validation, indent=2))
