@@ -66,7 +66,8 @@ task 下按 `<DATASET>/agents-<N>/rep-<R>/` 分组；例如
     每个点是一个 agent 的 `elapsed_seconds`，**不做** turn 内再平均。
   - task 根目录 `JCT.svg`：每个 `(dataset, #Agents, rep)` 先取所有 agent 的
     trajectory JCT 最大值，再对同一 `(dataset, #Agents)` 的 repetitions 取最大；
-    不再生成单独的 `trajectory_jct_max_by_agents.svg`。
+    每个 dataset 一个面板、横轴为 agents、柱高为上述最坏 JCT；不再生成单独的
+    `trajectory_jct_max_by_agents.svg`。
 
 单轮闭合为：
 
@@ -370,6 +371,8 @@ Job 结束时统一调用 `collect_benchmark_metrics.py`。
 - KV/cache：`kv-new.svg`、`kv-total.svg`、`cache-hit.svg`；
 - 每个 Prefill engine：
   `l3-read-data-engine-<ID>.svg`、`l3-read-time-engine-<ID>.svg`；
+  1P* 只有 engine 0；2P2D 的 engine 0/1 共享 Mooncake DFS namespace，但一个
+  request 只由 Router 选中的 Prefill engine 发起 L3 read，因此按 engine 分图；
 - bandwidth：`l3-bandwidth.svg`、`pd-bandwidth.svg`。
 
 `all-trajectories/latency.svg` 同时展示每个 agent 的 trajectory JCT、agent 内

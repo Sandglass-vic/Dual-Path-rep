@@ -6,11 +6,9 @@ from __future__ import annotations
 import argparse
 import html
 import json
+import math
 from collections import defaultdict
 from pathlib import Path
-
-
-COLORS = ("#2563eb", "#f97316", "#16a34a", "#9333ea", "#0891b2", "#db2777")
 
 
 def text(
@@ -56,79 +54,70 @@ def discover(result_dir: Path) -> dict[str, dict[int, dict[str, object]]]:
 
 
 def write_svg(data: dict[str, dict[int, dict[str, object]]], output: Path) -> None:
-    width, height = 1120, 560
-    left, right, top, bottom = 90.0, 850.0, 75.0, 470.0
-    agent_counts = sorted(
-        {agents for datasets in data.values() for agents in datasets}
-    )
-    y_max = (
-        max(
-            float(point["max_jct_seconds"])
-            for datasets in data.values()
-            for point in datasets.values()
-        )
-        * 1.15
-        or 1.0
-    )
-
-    def x_pos(agents: int) -> float:
-        index = agent_counts.index(agents)
-        return left + (index + 0.5) / len(agent_counts) * (right - left)
-
-    def y_pos(value: float) -> float:
-        return bottom - value / y_max * (bottom - top)
-
+    datasets = sorted(data.items())
+    columns = min(3, len(datasets))
+    rows = math.ceil(len(datasets) / columns)
+    panel_width, panel_height = 390, 330
+    width = 55 + columns * panel_width
+    height = 80 + rows * panel_height
     elements = [
         f'<rect width="{width}" height="{height}" fill="white"/>',
-        text(width / 2, 28, "Worst-case trajectory JCT by dataset and agents", 16),
+        text(width / 2, 26, "Worst-case trajectory JCT", 16),
         text(
             width / 2,
-            50,
-            "Each point is max(agent JCT) within a rep, then max across repetitions",
+            47,
+            "For each dataset × agents: max agent JCT, then max across repetitions",
             11,
         ),
     ]
-    for tick in range(6):
-        value = y_max * tick / 5
-        y = y_pos(value)
-        elements.append(
-            f'<line x1="{left}" y1="{y:.1f}" x2="{right}" y2="{y:.1f}" '
-            'stroke="#e5e7eb"/>'
-        )
-        elements.append(text(left - 8, y + 4, f"{value:.1f}", 10, "end"))
-    for agents in agent_counts:
-        elements.append(text(x_pos(agents), bottom + 24, str(agents), 11))
-    for index, (dataset, points) in enumerate(sorted(data.items())):
-        color = COLORS[index % len(COLORS)]
+    for index, (dataset, points) in enumerate(datasets):
+        row, column = divmod(index, columns)
+        panel_x = 55 + column * panel_width
+        panel_y = 65 + row * panel_height
+        left, right = panel_x + 50, panel_x + panel_width - 18
+        top, bottom = panel_y + 35, panel_y + panel_height - 55
         ordered = sorted(points.items())
-        polyline = " ".join(
-            f"{x_pos(agents):.1f},{y_pos(float(point['max_jct_seconds'])):.1f}"
-            for agents, point in ordered
+        y_max = (
+            max(float(point["max_jct_seconds"]) for _, point in ordered) * 1.18
+            or 1.0
         )
+
+        def y_pos(value: float) -> float:
+            return bottom - value / y_max * (bottom - top)
+
         elements.append(
-            f'<polyline points="{polyline}" fill="none" stroke="{color}" '
-            'stroke-width="2.5"/>'
+            text((left + right) / 2, panel_y + 18, f"Dataset = {dataset}", 14)
         )
-        for agents, point in ordered:
-            x = x_pos(agents)
-            y = y_pos(float(point["max_jct_seconds"]))
-            elements.append(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="5" fill="{color}"/>')
-        legend_y = 105 + index * 34
+        for tick in range(5):
+            value = y_max * tick / 4
+            y = y_pos(value)
+            elements.append(
+                f'<line x1="{left}" y1="{y:.1f}" x2="{right}" y2="{y:.1f}" '
+                'stroke="#e5e7eb"/>'
+            )
+            elements.append(text(left - 7, y + 4, f"{value:.0f}", 9, "end"))
+        spacing = (right - left) / len(ordered)
+        bar_width = min(62.0, spacing * 0.58)
+        for bar_index, (agents, point) in enumerate(ordered):
+            value = float(point["max_jct_seconds"])
+            x = left + spacing * (bar_index + 0.5)
+            y = y_pos(value)
+            elements.append(
+                f'<rect x="{x - bar_width / 2:.1f}" y="{y:.1f}" '
+                f'width="{bar_width:.1f}" height="{bottom - y:.1f}" '
+                'fill="#f6c77c" stroke="#b7791f"/>'
+            )
+            elements.append(text(x, y - 7, f"{value:.1f}", 9))
+            elements.append(text(x, bottom + 18, str(agents), 10))
+        elements.append(text((left + right) / 2, bottom + 39, "#Agents", 11))
+        axis_x = panel_x + 13
+        axis_y = (top + bottom) / 2
         elements.append(
-            f'<line x1="900" y1="{legend_y}" x2="925" y2="{legend_y}" '
-            f'stroke="{color}" stroke-width="3"/>'
+            f'<text x="{axis_x:.1f}" y="{axis_y:.1f}" '
+            'font-family="sans-serif" font-size="11" text-anchor="middle" '
+            f'transform="rotate(-90 {axis_x:.1f} {axis_y:.1f})">'
+            "Max JCT (s)</text>"
         )
-        elements.append(text(935, legend_y + 4, dataset, 11, "start"))
-    elements.extend(
-        [
-            text((left + right) / 2, 525, "#Agents", 12),
-            (
-                '<text x="24" y="275" font-family="sans-serif" font-size="12" '
-                'text-anchor="middle" transform="rotate(-90 24 275)">'
-                "Max JCT (seconds)</text>"
-            ),
-        ]
-    )
     output.write_text(
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" '
         f'height="{height}" viewBox="0 0 {width} {height}">\n'
