@@ -213,6 +213,26 @@ nvidia-smi topo -m
 - 是否允许用户读取端口计数器；
 - IB VL/QoS 配置是否需要管理员操作。
 
+### Lustre 单节点 Direct I/O 实测
+
+2026-09-05 在 `dgx-gaia-14` 使用
+`scripts/smoke/lustre_io_bandwidth.sbatch` 测试。每轮总数据量 128 GiB，
+4 MiB block、`O_DIRECT`，并同步采集 HCA 端口计数器；临时文件在结束时删除。
+
+- 8 jobs / 8 stripes：写 10.94 GiB/s，读 10.77 GiB/s；
+- 16 jobs / 16 stripes：写 18.24 GiB/s，读 19.35 GiB/s；
+- 32 jobs / 32 stripes：写 22.93 GiB/s，读 30.49 GiB/s；
+- 64 jobs / 32 stripes：写 **23.31 GiB/s**，读 **32.37 GiB/s**。
+
+单条 200 Gb/s 链路的十进制理论峰值是 25 GB/s，即 23.28 GiB/s。因此写入
+已经达到单 rail 线速（计时边界存在约 1% 误差），但不是双 rail 的理论峰值。
+64-job 写入流量约 98.4% 经过 `mlx5_7`；读取约 70.3% 经过 `mlx5_1`、29.7%
+经过 `mlx5_7`，说明 Lustre/LNet 的读取路径已启用两个 storage rail，但当前
+负载分配不均。读取 32.37 GiB/s 是双 200 Gb/s 理论值 46.57 GiB/s 的约 69.5%。
+
+此前 `ip route get 192.1.3.230` 只描述到一个 server IP 的普通 IP 路由，不能
+代表 Lustre 全部 LNet 数据路径；HCA 计数器是本次流量归属判断依据。
+
 ## 4. Lustre
 
 Lustre 仅在计算节点可见，登录节点上 `/mnt/lustre` 不存在。
