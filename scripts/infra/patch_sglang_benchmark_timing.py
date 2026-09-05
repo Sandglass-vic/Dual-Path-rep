@@ -23,6 +23,54 @@ def patch_hiradix(path: Path) -> None:
 
     source = replace_once(
         source,
+        "    def check_hicache_events(self):\n"
+        "        self.writing_check()\n"
+        "        self.loading_check()\n"
+        "        if self.enable_storage:\n"
+        "            self.drain_storage_control_queues()\n"
+        "        if self.enable_storage_metrics:\n"
+        "            self.storage_metrics_collector.log_storage_metrics(\n"
+        "                self.cache_controller.storage_backend.get_stats()\n"
+        "            )\n",
+        "    def check_hicache_events(self):\n"
+        "        self.writing_check()\n"
+        "        self.loading_check()\n"
+        "        if self.enable_storage:\n"
+        "            self.drain_storage_control_queues()\n"
+        "        if self.enable_storage_metrics:\n"
+        "            self.storage_metrics_collector.log_storage_metrics(\n"
+        "                self.cache_controller.storage_backend.get_stats()\n"
+        "            )\n"
+        "        if __import__(\"os\").environ.get(\n"
+        "            \"DUALPATH_HICACHE_EVICT_UNLOCKED\", \"0\"\n"
+        "        ) == \"1\":\n"
+        "            evictable_before = self.evictable_size()\n"
+        "            if evictable_before > 0:\n"
+        "                self.evict(evictable_before)\n"
+        "                logger.info(\n"
+        "                    \"DUALPATH_PREFILL_DEFERRED_CACHE_RELEASE \"\n"
+        "                    \"evictable_before=%d evictable_after=%d\",\n"
+        "                    evictable_before,\n"
+        "                    self.evictable_size(),\n"
+        "                )\n"
+        "            self.evict_host(1 << 60)\n",
+        "evict unlocked Prefill cache after HiCache progress",
+    )
+    source = replace_once(
+        source,
+        "    def _inc_hit_count(self, node: TreeNode, chunked=False):\n"
+        "        # skip the hit count update for chunked requests\n",
+        "    def _inc_hit_count(self, node: TreeNode, chunked=False):\n"
+        "        # Prefill is an L3 reader only; Decode publishes the full context.\n"
+        "        if __import__(\"os\").environ.get(\n"
+        "            \"DUALPATH_HICACHE_READ_ONLY\", \"0\"\n"
+        "        ) == \"1\":\n"
+        "            return\n"
+        "        # skip the hit count update for chunked requests\n",
+        "disable Prefill local write-through backup",
+    )
+    source = replace_once(
+        source,
         "        self.ongoing_prefetch = {}\n"
         "        self.ongoing_backup = {}\n",
         "        self.ongoing_prefetch = {}\n"
@@ -252,6 +300,22 @@ def patch_prefill_transfer(path: Path) -> None:
         "                if __import__(\"os\").environ.get(\n"
         "                    \"DUALPATH_PREFILL_RELEASE_LOCAL_CACHE\", \"0\"\n"
         "                ) == \"1\":\n"
+        "                    backup_deadline = time.monotonic() + float(\n"
+        "                        __import__(\"os\").environ.get(\n"
+        "                            \"DUALPATH_PREFILL_BACKUP_TIMEOUT\", \"120\"\n"
+        "                        )\n"
+        "                    )\n"
+        "                    while (\n"
+        "                        getattr(self.tree_cache, \"ongoing_write_through\", {})\n"
+        "                        or getattr(self.tree_cache, \"ongoing_backup\", {})\n"
+        "                    ):\n"
+        "                        self.tree_cache.check_hicache_events()\n"
+        "                        if time.monotonic() >= backup_deadline:\n"
+        "                            raise RuntimeError(\n"
+        "                                \"Timed out waiting for Prefill L3 backup \"\n"
+        "                                f\"before local release: {req.rid}\"\n"
+        "                            )\n"
+        "                        time.sleep(0.001)\n"
         "                    evictable_before = self.tree_cache.evictable_size()\n"
         "                    self.tree_cache.evict(evictable_before)\n"
         "                    if hasattr(self.tree_cache, \"evict_host\"):\n"

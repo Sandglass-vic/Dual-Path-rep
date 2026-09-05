@@ -73,9 +73,14 @@ Repetitions：3
 - Prefill 在每个 request 的 PD transfer ACK 后调用 SGLang 原生
   `release_kv_cache()` 解锁 radix 路径，再驱逐全部 `lock_ref=0` 的 L1/L2
   page；活跃请求共享的 prefix 保持受保护；
-- Prefill 使用 `write_through_selective`，避免重复承担 Decode 的完整 L3
-  offload；Decode 继续使用 `write_through` 发布完整上下文；
+- Prefill 保留 `write_through_selective` 以发布 page-aligned prompt；PD ACK
+  解锁后等待异步 backup 完成，再驱逐本地 L1/L2；Decode offload 发布 prompt
+  之后的增量 KV；等待上限由 `DUALPATH_PREFILL_BACKUP_TIMEOUT=120` 控制；
 - 正式路径不调用全局 `/flush_cache`，因此不阻塞或同步并发 agents；
+- DGX H100 的 8 个 TP rank 分别绑定
+  `mlx5_0,3,4,5,6,9,10,11`，不再让全部 rank 共享 `mlx5_0`；完整 JSON
+  映射记录在 `run.json.pd_ib_device_mapping`，启动时要求八个 HCA 均为
+  `ACTIVE`；
 - `MC_TRANSFER_TIMEOUT=120`（Mooncake 默认 30 秒）：长上下文高并发 PD 同步
   batch 若超过默认阈值，Mooncake 会将 RDMA session 永久标记为 failed；
   实际值写入 `run.json.mooncake_transfer_timeout_seconds`；

@@ -74,8 +74,8 @@ GPU：NVIDIA H100 80GB HBM3
 
 ```text
 /mnt/lustre/users/sezhou/dual-path/images/sglang:26.01-py3-mooncake0.3.13.post1-timing-v2.sqsh
-最终构建 Job：66315，COMPLETED，ExitCode=0:0
-SHA-256：06574d825d4b68e1663c1ba1cc31915e31001b9672be6311a9dd41d0869c52f2
+最终构建 Job：66579，COMPLETED，ExitCode=0:0
+SHA-256：3cad9bcca9d58df81ff976ae1dbc2cba381cba2638f44744bdf891dcf56ad914
 ```
 
 镜像目录只保留上述最终派生版和最初基础版；Mooncake `0.3.9`、旧 timing 与

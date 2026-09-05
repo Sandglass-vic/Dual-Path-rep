@@ -37,20 +37,35 @@ SGLang HiCache **无法**关闭 L2 pool（`--hicache-size 0` 仍按 ratio 分配
 
 1. SGLang 原生在 Prefill PD `KVPoll.Success` 后执行
    `release_kv_cache(req, tree_cache)`，解除当前 request 的 radix lock；
-2. 补丁随后驱逐所有 `lock_ref=0` 的 L1/L2 page；其他活跃 request 共享的
+2. Prefill 保留异步 write-through backup，把 page-aligned prompt 发布到 L3；
+3. 若 backup lock 尚未释放，PD ACK 清理阶段推进并等待 Prefill backup 发布
+   到 L3，随后驱逐所有 `lock_ref=0` 的 L1/L2 page；其他活跃 request 共享的
    prefix 仍受引用计数保护；
-3. **不**清 Mooncake Store；Decode 继续负责完整上下文 offload；
-4. `STORAGE_SETTLE_SECONDS`（默认 1s）只等待 Decode→Store 对下一 turn 可见，
+4. **不**清 Mooncake Store；Decode 继续负责完整上下文 offload；
+5. `STORAGE_SETTLE_SECONDS`（默认 1s）只等待 Decode→Store 对下一 turn 可见，
    不计入 `turn_wall_seconds` / `trajectory_jct`。
 
 环境变量（`pd_benchmark_lib.sh` 默认）：
 
 ```bash
 DUALPATH_PREFILL_RELEASE_LOCAL_CACHE=1
+PREFILL_HICACHE_READ_ONLY=0
+PREFILL_HICACHE_EVICT_UNLOCKED=0
 PREFILL_HICACHE_WRITE_POLICY=write_through_selective
+DUALPATH_PREFILL_BACKUP_TIMEOUT=120
 FLUSH_LOCAL_CACHE_BETWEEN_TURNS=0
 STORAGE_SETTLE_SECONDS=1
 ```
+
+`PREFILL_HICACHE_READ_ONLY=1` 仅保留为诊断开关。Job `66572` 证明它虽能真正
+清空 Prefill L1/L2，却会破坏 SGLang 0.5.7 的持久化分工：Decode offload 只写
+增量 KV，并假定 page-aligned prompt 已由 Prefill 发布，因此正式路径必须保持
+该开关为 `0`。
+
+最终正确性 Job `66581`（1P1D、32K、1 agent、4 turns、8 HCA）完成：
+request/PD/release coverage 均为 100%，release 前最多 6976 tokens、release
+后为 0；turn 2–4 的 `cached_tokens` 与 `l3_read_tokens` 分别严格相等为
+1856、3840、5696，证明跨 turn 命中全部来自 L3，而非残留 Prefill L1/L2。
 
 Job `65694` 未 flush，prefix hit 来自 L1/L2，`l3_timing_coverage=0`，**不得**
 当作论文 L3 路径结果。

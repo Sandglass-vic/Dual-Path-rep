@@ -86,12 +86,18 @@ turn_wall_seconds
 `DUALPATH_PREFILL_CACHE_RELEASE` 在每个成功 PD ACK 后记录释放前后的 device
 evictable tokens。SGLang 已先通过 `release_kv_cache()` 解除当前 request 的
 radix lock；随后驱逐只处理 `lock_ref=0` 的叶节点，因此不会释放并发请求仍在
-使用的共享 prefix。Prefill 使用 `write_through_selective`，Decode 继续负责把
-完整上下文发布到 L3。
+使用的共享 prefix。若 Prefill write-through backup 尚持有节点，PD ACK 清理
+阶段先推进并等待该 backup 发布到 L3，再驱逐 L1/L2。Prefill 发布 page-aligned
+prompt，Decode 只发布增量 KV；等待是为了下一 turn 的 L3 完整性，不是为了
+当前 Decode 请求。
 
 自动验收要求 `prefill_cache_release_coverage >= 0.95`，且
+`prefill_evictable_before_release_max > 0`、
 `prefill_evictable_after_release_max == 0`；对应字段写入 task
-`data/validation.json` 和聚合 CSV。
+`data/validation.json` 和聚合 CSV。启用 Prefill L3 与 Decode offload 的多轮
+run 还要求观测到跨 turn L3 timing，防止“本地释放成功但 L3 未发布”的假阳性。
+Job `66581` 中 turn 2–4 的 `cached_tokens == l3_read_tokens`
+（1856/3840/5696），是当前机制的通过样例。
 
 长上下文并发 PD 传输显式设置 `MC_TRANSFER_TIMEOUT=120` 秒，并使用
 `SGLANG_MOONCAKE_MAX_TRANSFER_BATCH_INDICES=128` 将过大的 all-layer 同步
@@ -276,6 +282,9 @@ tokens，也不是多个 Decode engine 的平均）；分母是 Prefill sender �
 IB wire bandwidth；曲线逐 request/turn 作图，summary 报其中位数。Job
 `65144/65502` 的旧镜像从最后一个 chunk 才开始计时，数值不可与新结果直接比较。
 Job `66097` 的 26 个 request 覆盖率 100%，中位数为 9.483 GB/s。
+
+正式 DGX H100 配置将 TP rank 0–7 一一绑定到八条 400 Gb/s compute-fabric
+HCA；该值仍是应用层逻辑有效带宽，不能用 `8 × 400 Gb/s` 直接替代实测。
 
 ### Prefill L3 有效加载带宽
 

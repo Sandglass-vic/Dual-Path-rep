@@ -182,9 +182,27 @@ dev ibp41s0f0
 src 192.1.0.12
 ```
 
-因此当前节点的 Lustre 流量经过 `ibp41s0f0 / mlx5_1`，链路速率为 200 Gb/s。该结果支持“存储网络与 8 张 GPU 的 400G compute fabric 分离”的判断，但仍应在每个作业节点复核，不能假设所有节点映射永久相同。
+该命令只说明到特定 server IP 的普通 IP 路由，不能代表 Lustre 的全部 LNet
+数据路径。后续 HCA counter 实测确认 Lustre 会使用 `mlx5_1` 和 `mlx5_7`
+两条 200 Gb/s storage rail，详见下方 Direct I/O 测试。
 
-对 SGLang PD transfer，候选 compute-fabric device 可先从 `mlx5_0` 开始验证，**不要使用 `mlx5_1`**，以免把 PD KV 流量放到 Lustre 存储链路。最终应根据 GPU/NIC PCIe affinity 选择每卡配对设备，而不是仅凭编号。
+DGX H100 官方 GPU/compute-fabric HCA 拓扑为一一对应。正式 SGLang/Mooncake
+PD 和 HiCache client 均使用逐 TP rank JSON 映射：
+
+```text
+GPU0 mlx5_0   GPU1 mlx5_3   GPU2 mlx5_4   GPU3 mlx5_5
+GPU4 mlx5_6   GPU5 mlx5_9   GPU6 mlx5_10  GPU7 mlx5_11
+```
+
+对应 `--disaggregation-ib-device`：
+
+```json
+{"0":"mlx5_0","1":"mlx5_3","2":"mlx5_4","3":"mlx5_5","4":"mlx5_6","5":"mlx5_9","6":"mlx5_10","7":"mlx5_11"}
+```
+
+SGLang 0.5.7 会按当前 `gpu_id` 选择映射值；Mooncake Store 也会按
+`storage_config.tp_rank` 选择 `device_name`。不要把 `mlx5_1/7` 加入 PD 映射，
+它们属于 Lustre storage fabric。
 
 复核命令：
 
@@ -207,8 +225,6 @@ nvidia-smi topo -m
 
 待确认：
 
-- 各 H100 与 `mlx5_0,3,4,5,6,9,10,11` 的一一 PCIe/NVLink affinity；
-- SGLang/Mooncake 使用单 device 还是 device list 性能更好；
 - compute fabric 与 storage fabric 是否具有不同 IB partition/P_Key；
 - 是否允许用户读取端口计数器；
 - IB VL/QoS 配置是否需要管理员操作。

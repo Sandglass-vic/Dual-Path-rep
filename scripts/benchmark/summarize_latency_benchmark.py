@@ -368,6 +368,13 @@ def main() -> None:
                     and item["agents"] == metadata["agents"]
                     and item["repetition"] == metadata["repetition"]
                 ),
+                "prefill_evictable_before_release_max": max(
+                    int(item["prefill_evictable_before_release"])
+                    for item in merged_rounds
+                    if item["max_len_k"] == metadata["max_len_k"]
+                    and item["agents"] == metadata["agents"]
+                    and item["repetition"] == metadata["repetition"]
+                ),
                 "pd_transfer_mean_seconds": mean(values("pd_transfer_seconds")),
                 "pd_effective_bandwidth_mean_gbps": mean(
                     values("pd_effective_bandwidth_gbps")
@@ -420,10 +427,17 @@ def main() -> None:
         )
         for run in runs
     )
+    expects_l3_reuse = any(
+        bool(run["metadata"].get("prefill_l3", True))
+        and bool(run["metadata"].get("decode_offload", True))
+        and len(run["rounds"]) > 1
+        for run in runs
+    )
     validation = {
         "runs": len(run_rows),
         "rounds": len(merged_rounds),
         "expects_l3_timing": expects_l3_timing,
+        "expects_l3_reuse": expects_l3_reuse,
         "request_timing_coverage": mean(
             [1.0 if item["has_request_timing"] else 0.0 for item in merged_rounds]
         ),
@@ -440,6 +454,10 @@ def main() -> None:
         ),
         "prefill_evictable_after_release_max": max(
             int(item["prefill_evictable_after_release"])
+            for item in merged_rounds
+        ),
+        "prefill_evictable_before_release_max": max(
+            int(item["prefill_evictable_before_release"])
             for item in merged_rounds
         ),
         "batched_token_chunks": sum(
@@ -471,6 +489,13 @@ def main() -> None:
         and validation["prefill_evictable_after_release_max"] != 0
     ):
         raise RuntimeError(f"Incomplete Prefill cache eviction: {validation}")
+    if (
+        expects_prefill_release
+        and validation["prefill_evictable_before_release_max"] == 0
+    ):
+        raise RuntimeError(f"Prefill cache release evicted no pages: {validation}")
+    if expects_l3_reuse and validation["l3_timing_coverage"] == 0:
+        raise RuntimeError(f"Expected cross-turn L3 reuse was not observed: {validation}")
     if validation["batched_token_chunks"]:
         raise RuntimeError(f"Streaming chunks contained multiple tokens: {validation}")
     print(json.dumps(validation, indent=2))

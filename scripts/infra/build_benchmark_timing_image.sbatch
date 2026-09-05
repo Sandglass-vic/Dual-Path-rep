@@ -68,6 +68,9 @@ assert "DUALPATH_MOONCAKE_DFS_BACKPORT" in mooncake_backend
 assert "config.dfs_replica_num = self.dfs_replica_num" in mooncake_backend
 assert "DUALPATH_L3_TIMING" in hiradix
 assert "prefill_engine=%s" in hiradix
+assert "DUALPATH_HICACHE_READ_ONLY" in hiradix
+assert "DUALPATH_HICACHE_EVICT_UNLOCKED" in hiradix
+assert "DUALPATH_PREFILL_DEFERRED_CACHE_RELEASE" in hiradix
 assert hiradix.index(
     "self.dualpath_prefetch_start[req_id] = time.perf_counter()"
 ) < hiradix.index("operation = self.cache_controller.prefetch(")
@@ -75,6 +78,7 @@ assert "DUALPATH_REQ_TIMING" in schedule_batch
 assert '"DUALPATH_TTFT_P_TRANSFER_V2 rid=%s ' in prefill
 assert "DUALPATH_PREFILL_CACHE_RELEASE" in prefill
 assert "DUALPATH_PREFILL_RELEASE_LOCAL_CACHE" in prefill
+assert "DUALPATH_PREFILL_BACKUP_TIMEOUT" in prefill
 assert "dualpath_transfer_page_count" in prefill
 assert "page_aligned_tokens=%d" in prefill
 assert "DUALPATH_TTFT_D_RECEIVE" in decode

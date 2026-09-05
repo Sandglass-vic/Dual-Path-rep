@@ -30,6 +30,9 @@ dualpath_export_common_env() {
   # Release unlocked Prefill L1/L2 pages after the per-request PD ACK. This
   # preserves active shared prefixes without a stop-the-world /flush_cache.
   export DUALPATH_PREFILL_RELEASE_LOCAL_CACHE=${DUALPATH_PREFILL_RELEASE_LOCAL_CACHE:-1}
+  export PREFILL_HICACHE_READ_ONLY=${PREFILL_HICACHE_READ_ONLY:-0}
+  export PREFILL_HICACHE_EVICT_UNLOCKED=${PREFILL_HICACHE_EVICT_UNLOCKED:-0}
+  export DUALPATH_PREFILL_BACKUP_TIMEOUT=${DUALPATH_PREFILL_BACKUP_TIMEOUT:-120}
   export PREFILL_HICACHE_WRITE_POLICY=${PREFILL_HICACHE_WRITE_POLICY:-write_through_selective}
   # Retained only as a historical/control switch; disabled for formal runs.
   export FLUSH_LOCAL_CACHE_BETWEEN_TURNS=${FLUSH_LOCAL_CACHE_BETWEEN_TURNS:-0}
@@ -38,9 +41,13 @@ dualpath_export_common_env() {
   export MODEL_DIR LOG_DIR CACHE_DIR IB_DEVICE PREFILL_PORT DECODE_PORT
   export BOOTSTRAP_PORT ROUTER_PORT SERVER_TIMEOUT
   export MC_TRANSFER_TIMEOUT SGLANG_MOONCAKE_MAX_TRANSFER_BATCH_INDICES
-  export DUALPATH_PREFILL_RELEASE_LOCAL_CACHE PREFILL_HICACHE_WRITE_POLICY
+  export DUALPATH_PREFILL_RELEASE_LOCAL_CACHE PREFILL_HICACHE_READ_ONLY
+  export PREFILL_HICACHE_EVICT_UNLOCKED
+  export DUALPATH_PREFILL_BACKUP_TIMEOUT
+  export PREFILL_HICACHE_WRITE_POLICY
   export FLUSH_LOCAL_CACHE_BETWEEN_TURNS STORAGE_SETTLE_SECONDS
   export COLLECT_L3_STORAGE_SNAPSHOT
+  export MOONCAKE_DEVICE
 }
 
 dualpath_wait_for_url() {
@@ -108,10 +115,17 @@ dualpath_write_run_json() {
     "$snapshot_flag" "$MC_TRANSFER_TIMEOUT" \
     "$SGLANG_MOONCAKE_MAX_TRANSFER_BATCH_INDICES" \
     "$DUALPATH_PREFILL_RELEASE_LOCAL_CACHE" \
-    "$PREFILL_HICACHE_WRITE_POLICY" <<'PY'
+    "$PREFILL_HICACHE_WRITE_POLICY" "$IB_DEVICE" \
+    "$PREFILL_HICACHE_READ_ONLY" "$PREFILL_HICACHE_EVICT_UNLOCKED" \
+    "$DUALPATH_PREFILL_BACKUP_TIMEOUT" <<'PY'
 from pathlib import Path
 import json
 import sys
+
+try:
+    pd_ib_device_mapping = json.loads(sys.argv[22])
+except json.JSONDecodeError:
+    pd_ib_device_mapping = sys.argv[22]
 
 Path(sys.argv[1]).write_text(json.dumps({
     "architecture": sys.argv[2],
@@ -139,11 +153,16 @@ Path(sys.argv[1]).write_text(json.dumps({
     "mooncake_max_transfer_batch_indices": int(sys.argv[19]),
     "prefill_release_local_cache_after_pd_ack": bool(int(sys.argv[20])),
     "prefill_hicache_write_policy": sys.argv[21],
+    "pd_ib_device_mapping": pd_ib_device_mapping,
+    "prefill_hicache_read_only": bool(int(sys.argv[23])),
+    "prefill_hicache_evict_unlocked": bool(int(sys.argv[24])),
+    "prefill_backup_timeout_seconds": float(sys.argv[25]),
     "l3_storage_snapshot_kind": "recursive apparent bytes and st_blocks allocated bytes",
     "kv_buffer_semantics": (
         "DualPath paper: staging/GPU buffers released after each request; "
-        "cross-turn reuse via L3 only. SGLang approx: Prefill /flush_cache "
-        "drops L1/L2 radix; Mooncake Store retained."
+        "cross-turn reuse via L3 only. SGLang approximation: after successful "
+        "PD ACK, release the request lock and evict unlocked Prefill L1/L2 "
+        "radix pages; Mooncake Store is retained."
     ),
 }, indent=2) + "\n")
 PY

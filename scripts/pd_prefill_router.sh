@@ -5,6 +5,12 @@ set -euo pipefail
 : "${LOG_DIR:?LOG_DIR is required}"
 : "${PREFILL_HOST:?PREFILL_HOST is required}"
 
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=scripts/pd_network_config.sh
+source "$SCRIPT_DIR/pd_network_config.sh"
+export DUALPATH_HICACHE_READ_ONLY=${PREFILL_HICACHE_READ_ONLY:-0}
+export DUALPATH_HICACHE_EVICT_UNLOCKED=${PREFILL_HICACHE_EVICT_UNLOCKED:-0}
+
 if [[ -z ${PREFILL_HOSTS:-} ]]; then
   PREFILL_HOSTS=$PREFILL_HOST
 fi
@@ -24,7 +30,6 @@ if [[ ${#decode_hosts[@]} -eq 0 ]]; then
   exit 1
 fi
 
-IB_DEVICE=${IB_DEVICE:-mlx5_0}
 PREFILL_PORT=${PREFILL_PORT:-30000}
 DECODE_PORT=${DECODE_PORT:-30000}
 BOOTSTRAP_PORT=${BOOTSTRAP_PORT:-8998}
@@ -36,6 +41,9 @@ PD_TRANSFER_BACKEND=${PD_TRANSFER_BACKEND:-mooncake}
 HICACHE_STORAGE_BACKEND=${HICACHE_STORAGE_BACKEND:-file}
 CHUNKED_PREFILL_SIZE=${CHUNKED_PREFILL_SIZE:-}
 DISABLE_OVERLAP_SCHEDULE=${DISABLE_OVERLAP_SCHEDULE:-0}
+if [[ "$PD_TRANSFER_BACKEND" == mooncake || "$HICACHE_STORAGE_BACKEND" == mooncake ]]; then
+  dualpath_validate_ib_devices
+fi
 if [[ -n ${PREFILL_ID:-} ]]; then
   PREFILL_LOG="$LOG_DIR/prefill-$PREFILL_ID.log"
 else

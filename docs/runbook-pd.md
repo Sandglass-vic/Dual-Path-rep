@@ -354,8 +354,9 @@ Router: 与 Prefill 同节点，绑定少量 CPU
 建议绑定：
 
 - SGLang 模型进程使用整节点 GPU；
-- Lustre 走 `mlx5_1`（由系统路由决定）；
-- PD transfer 显式选择 compute-fabric device，初测可用 `mlx5_0`；
+- Lustre 使用 `mlx5_1/7` storage rails，实际选择由 LNet 决定；
+- 正式 PD transfer 按 GPU/TP rank 一一使用
+  `mlx5_0,3,4,5,6,9,10,11` 八条 compute-fabric HCA；
 - Router 不占 GPU；
 - 指标采集进程限制 CPU，避免影响 SGLang。
 

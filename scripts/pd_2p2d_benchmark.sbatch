@@ -17,6 +17,8 @@ set -euo pipefail
 CODE_HOME=${CODE_HOME:-/labhome/sezhou/dual-path}
 RUNTIME_HOME=${RUNTIME_HOME:-/mnt/lustre/users/sezhou/dual-path}
 IMAGE=${IMAGE:-$RUNTIME_HOME/images/sglang:26.01-py3-mooncake0.3.13.post1-timing-v2.sqsh}
+# shellcheck source=scripts/pd_network_config.sh
+source "$CODE_HOME/scripts/pd_network_config.sh"
 MODEL_DIR=${MODEL_DIR:-$RUNTIME_HOME/models/Qwen2.5-32B}
 TASK_NAME=${TASK_NAME:-${SLURM_JOB_NAME}-${SLURM_JOB_ID}}
 if [[ "$TASK_NAME" == */* || -z "$TASK_NAME" ]]; then
@@ -27,7 +29,6 @@ LOG_DIR=${LOG_DIR:-$RUNTIME_HOME/logs/latency-benchmark/$TASK_NAME}
 RESULT_DIR=${RESULT_DIR:-$RUNTIME_HOME/results/latency-benchmark/$TASK_NAME}
 CACHE_DIR=${CACHE_DIR:-$RUNTIME_HOME/kv-cache/latency-benchmark/$TASK_NAME}
 REPO_RESULT_DIR=${REPO_RESULT_DIR:-$CODE_HOME/results/latency-benchmark/$TASK_NAME}
-IB_DEVICE=${IB_DEVICE:-mlx5_0}
 PREFILL_PORT=${PREFILL_PORT:-30000}
 DECODE_PORT=${DECODE_PORT:-30000}
 BOOTSTRAP_PORT=${BOOTSTRAP_PORT:-8998}

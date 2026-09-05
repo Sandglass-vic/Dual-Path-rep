@@ -5,13 +5,21 @@ set -euo pipefail
 : "${LOG_DIR:?LOG_DIR is required}"
 : "${DECODE_HOST:?DECODE_HOST is required}"
 
-IB_DEVICE=${IB_DEVICE:-mlx5_0}
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=scripts/pd_network_config.sh
+source "$SCRIPT_DIR/pd_network_config.sh"
+unset DUALPATH_HICACHE_READ_ONLY
+unset DUALPATH_HICACHE_EVICT_UNLOCKED
+
 DECODE_PORT=${DECODE_PORT:-30000}
 MEM_FRACTION_STATIC=${MEM_FRACTION_STATIC:-0.75}
 CONTEXT_LENGTH=${CONTEXT_LENGTH:-4096}
 PD_TRANSFER_BACKEND=${PD_TRANSFER_BACKEND:-mooncake}
 HICACHE_STORAGE_BACKEND=${HICACHE_STORAGE_BACKEND:-file}
 DECODE_OFFLOAD_KVCACHE=${DECODE_OFFLOAD_KVCACHE:-${ENABLE_HICACHE_L3:-0}}
+if [[ "$PD_TRANSFER_BACKEND" == mooncake || "$HICACHE_STORAGE_BACKEND" == mooncake ]]; then
+  dualpath_validate_ib_devices
+fi
 if [[ -n ${DECODE_ID:-} ]]; then
   DECODE_LOG="$LOG_DIR/decode-$DECODE_ID.log"
 else
