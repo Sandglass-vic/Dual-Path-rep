@@ -66,7 +66,8 @@ L3 已发布前缀长度不变，而完整 prompt 持续增长，所以命中率
    - 计算：`l3_read_tokens × 256 KiB / l3_read_seconds`。
    - Job 65502 的历史曲线使用 tp_rank=0 的 wall duration。
    - 新 timing patch 记录每个 Prefill Engine 的全部八个 TP rank；新聚合器使用
-     `max(rank read duration)` 作为带宽分母，并输出
+     TP 完成共识 `all_reduce` 之前采集的 `max(rank local read duration)` 作为
+     带宽分母，并输出
      `prefill_engine_<id>_l3_rank_times.svg`。分子仍表示 TP8 合计逻辑 KV payload。
 
 所有曲线横坐标均为 `turn_id`。逐点原始值在

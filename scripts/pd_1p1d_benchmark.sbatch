@@ -9,7 +9,7 @@
 #SBATCH --exclusive
 #SBATCH --time=06:00:00
 # Known platform-faulty nodes; keep in sync with docs/platform.md.
-#SBATCH --exclude=dgx-gaia-12,dgx-gaia-18,dgx-gaia-30,dgx-gaia-46,dgx-gaia-53
+#SBATCH --exclude=dgx-gaia-12,dgx-gaia-18,dgx-gaia-30,dgx-gaia-35,dgx-gaia-38,dgx-gaia-46,dgx-gaia-53
 #SBATCH --output=/mnt/lustre/users/sezhou/dual-path/logs/slurm-1p1d-benchmark-%j.out
 
 set -euo pipefail

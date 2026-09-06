@@ -258,6 +258,7 @@ dualpath_run_replay() {
     --dataset "$dataset" \
     --base-url "http://$PREFILL_HOST:$ROUTER_PORT" \
     --output-dir "$output_dir" \
+    --server-selection-timeout "${SERVER_SELECTION_TIMEOUT:-120}" \
     --trajectory-offset "$TRAJECTORY_OFFSET" \
     --num-trajectories "$agents" \
     --max-workers "$agents" \

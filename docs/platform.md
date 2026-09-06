@@ -74,11 +74,13 @@ scontrol show hostnames "$SLURM_JOB_NODELIST"
 | `dgx-gaia-53` | `65566` | 32-agent 完整 rollout 中 Decode 突然停写日志；Router `HostUnreachable` / `No route to host`；Prefill `KVTransferError` 与 bootstrap 300 s 超时 |
 | `dgx-gaia-18` | `65658` | 1P2D 1-agent 启动时 Decode-1 上 Mooncake Store `warmup()` `put` 断言失败；日志含 `Failed to get segment descriptor for segment dgx-gaia-16:...`；Prefill/Decode-0 已健康但 Decode-1 未就绪 |
 | `dgx-gaia-12` | `66412` | Mooncake warmup 前 `mlx5_0` 连续报告 RDMA port error/inactive，随后 `AddressNotRegistered`，Store `put` 断言失败，Prefill 无法启动 |
+| `dgx-gaia-35` | `66744` | 1P2D 64K replay 到第 55 turn 时 Decode-0 RDMA port error，随后节点变为 `drained (Kill task failed)` |
+| `dgx-gaia-38` | `66737` | 1P2D 32K replay 期间 Prefill 节点异常，两个 Decode 的 Mooncake 会话同时失败；随后 `sinfo` 标记为 `drained (Kill task failed)` |
 
 统一排除列表：
 
 ```text
-dgx-gaia-12,dgx-gaia-18,dgx-gaia-30,dgx-gaia-46,dgx-gaia-53
+dgx-gaia-12,dgx-gaia-18,dgx-gaia-30,dgx-gaia-35,dgx-gaia-38,dgx-gaia-46,dgx-gaia-53
 ```
 
 正式 benchmark 脚本（`pd_1p1d_benchmark.sbatch` /
@@ -86,7 +88,7 @@ dgx-gaia-12,dgx-gaia-18,dgx-gaia-30,dgx-gaia-46,dgx-gaia-53
 `#SBATCH --exclude=...`。临时覆盖提交时也应显式带上同一列表，例如：
 
 ```bash
-sbatch --exclude=dgx-gaia-12,dgx-gaia-18,dgx-gaia-30,dgx-gaia-46,dgx-gaia-53 --time=08:00:00 \
+sbatch --exclude=dgx-gaia-12,dgx-gaia-18,dgx-gaia-30,dgx-gaia-35,dgx-gaia-38,dgx-gaia-46,dgx-gaia-53 --time=08:00:00 \
   scripts/pd_1p2d_benchmark.sbatch
 ```
 
@@ -103,6 +105,26 @@ CUDA OOM/segfault/traceback）；客户端仅 2/32 trajectory 完成，其余为
 Job `65658` 细节：节点 `dgx-gaia-[16-18]`，Decode-1=`dgx-gaia-18` 在 Mooncake
 Store warmup 阶段失败（`AssertionError` on `store.put`），约 4.5 分钟后
 FAILED；未进入 replay，无正式 metrics。随后将 `dgx-gaia-18` 并入排除列表重提。
+
+### 2026-09-06 GAIA 节点状态快照
+
+`sinfo -N -p GAIA` 显示当前可调度（`idle`）节点为：
+
+```text
+dgx-gaia-10,29,30,31,41,44,45,46,51,52,53,54,57,58,60,62,63
+```
+
+当前不可调度节点按 Slurm 原因分组如下：
+
+- `Kill task failed`：`09,14,17-27,34-36,38,47,48`
+- NIC/IB 健康检查失败：`15,16,33,39,40,42,56,59`
+- PCIe/NVMe 链路检查失败：`12,32,55`
+- GPU GRES 数量不符：`28,50`
+- 其他平台检查或维护：`11,13,37,43,49,61`
+
+这些 `drained` / `inval` 节点由 Slurm 自动拒绝分配，不全部写入项目静态
+exclude；静态列表只保留本项目已实际触发故障、即使恢复调度后仍需管理员确认的
+节点。提交前应重新运行 `sinfo`，不能把本快照视为永久状态。
 
 ## 2. 计算节点硬件
 

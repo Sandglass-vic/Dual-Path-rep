@@ -154,7 +154,8 @@ def build_rows(
             )
             l3_start = min(item[0] for item in rank_timings.values())
             l3_end = max(item[1] for item in rank_timings.values())
-            l3_seconds = l3_end - l3_start
+            l3_union_seconds = l3_end - l3_start
+            l3_seconds = slowest_seconds
             l3_tokens = min(item[3] for item in rank_timings.values())
             rank_row: dict[str, float | int | str] = {
                 "trajectory_id": item["trajectory_id"],
@@ -165,7 +166,8 @@ def build_rows(
             }
             for rank, (_, _, seconds, _) in sorted(rank_timings.items()):
                 rank_row[f"tp_rank_{rank}_read_seconds"] = seconds
-            rank_row["tp_union_read_seconds"] = l3_seconds
+            rank_row["tp_slowest_read_seconds"] = slowest_seconds
+            rank_row["tp_union_read_seconds"] = l3_union_seconds
             engine_rank_rows[prefill_engine].append(rank_row)
         else:
             slowest_rank, l3_seconds, l3_tokens = -1, 0.0, 0

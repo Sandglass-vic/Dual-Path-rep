@@ -75,6 +75,7 @@ def patch_hiradix(path: Path) -> None:
         "        self.ongoing_backup = {}\n",
         "        self.ongoing_prefetch = {}\n"
         "        self.dualpath_prefetch_start = {}\n"
+        "        self.dualpath_prefetch_local_end = {}\n"
         "        self.ongoing_backup = {}\n",
         "initialize benchmark timing state",
     )
@@ -93,11 +94,30 @@ def patch_hiradix(path: Path) -> None:
     )
     source = replace_once(
         source,
+        "        if self.prefetch_stop_policy == \"wait_complete\":\n"
+        "            can_terminate = completed\n",
+        "        if completed and operation.request_id not in (\n"
+        "            self.dualpath_prefetch_local_end\n"
+        "        ):\n"
+        "            # Capture this rank's storage IO completion before the TP\n"
+        "            # completion-consensus all_reduce below.\n"
+        "            self.dualpath_prefetch_local_end[operation.request_id] = (\n"
+        "                time.perf_counter()\n"
+        "            )\n"
+        "\n"
+        "        if self.prefetch_stop_policy == \"wait_complete\":\n"
+        "            can_terminate = completed\n",
+        "record rank-local L3 completion before TP consensus",
+    )
+    source = replace_once(
+        source,
         "        logger.debug(f\"Prefetch {req_id} completed with {completed_tokens} tokens\")\n",
         "        logger.debug(f\"Prefetch {req_id} completed with {completed_tokens} tokens\")\n"
         "        dualpath_start = self.dualpath_prefetch_start.pop(req_id, None)\n"
         "        if dualpath_start is not None:\n"
-        "            dualpath_end = time.perf_counter()\n"
+        "            dualpath_end = self.dualpath_prefetch_local_end.pop(\n"
+        "                req_id, time.perf_counter()\n"
+        "            )\n"
         "            logger.info(\n"
         "                \"DUALPATH_L3_TIMING rid=%s prefill_engine=%s \"\n"
         "                \"tp_rank=%d read_start=%.9f \"\n"
@@ -118,6 +138,7 @@ def patch_hiradix(path: Path) -> None:
         "            info = self.ongoing_prefetch.pop(req_id, None)\n",
         "            req_id = cc.prefetch_revoke_queue.get()\n"
         "            self.dualpath_prefetch_start.pop(req_id, None)\n"
+        "            self.dualpath_prefetch_local_end.pop(req_id, None)\n"
         "            info = self.ongoing_prefetch.pop(req_id, None)\n",
         "discard revoked prefetch timing",
     )

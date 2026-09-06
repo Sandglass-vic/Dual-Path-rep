@@ -104,8 +104,8 @@ def draw_box_panel(
     scale: float,
 ) -> dict[str, float | int]:
     scaled = [value * scale for value in values]
-    summary = stats(scaled)
-    y_max = float(summary["max"]) * 1.18 or 1.0
+    display_summary = stats(scaled)
+    y_max = float(display_summary["max"]) * 1.18 or 1.0
 
     def y_pos(value: float) -> float:
         return bottom - value / y_max * (bottom - top)
@@ -121,12 +121,12 @@ def draw_box_panel(
         elements.append(text(left - 8, y + 4, f"{value:.1f}", 10, "end"))
     x = (left + right) / 2
     box_width = min(90.0, (right - left) * 0.32)
-    y_min = y_pos(float(summary["min"]))
-    y_q1 = y_pos(float(summary["q1"]))
-    y_med = y_pos(float(summary["median"]))
-    y_q3 = y_pos(float(summary["q3"]))
-    y_max_v = y_pos(float(summary["max"]))
-    y_mean = y_pos(float(summary["mean"]))
+    y_min = y_pos(float(display_summary["min"]))
+    y_q1 = y_pos(float(display_summary["q1"]))
+    y_med = y_pos(float(display_summary["median"]))
+    y_q3 = y_pos(float(display_summary["q3"]))
+    y_max_v = y_pos(float(display_summary["max"]))
+    y_mean = y_pos(float(display_summary["mean"]))
     elements.extend(
         [
             f'<line x1="{x:.1f}" y1="{y_max_v:.1f}" x2="{x:.1f}" '
@@ -142,9 +142,9 @@ def draw_box_panel(
             f'x2="{x + box_width / 2:.1f}" y2="{y_med:.1f}" '
             'stroke="#9a3412" stroke-width="2"/>',
             f'<circle cx="{x:.1f}" cy="{y_mean:.1f}" r="4" fill="#1d4ed8"/>',
-            text(x + box_width / 2 + 12, y_max_v + 4, f"max {summary['max']:.1f}", 10, "start"),
-            text(x + box_width / 2 + 12, y_min + 4, f"min {summary['min']:.1f}", 10, "start"),
-            text(x, bottom + 24, f"n={summary['count']}", 10),
+            text(x + box_width / 2 + 12, y_max_v + 4, f"max {display_summary['max']:.1f}", 10, "start"),
+            text(x + box_width / 2 + 12, y_min + 4, f"min {display_summary['min']:.1f}", 10, "start"),
+            text(x, bottom + 24, f"n={display_summary['count']}", 10),
         ]
     )
     elements.append(
@@ -153,7 +153,7 @@ def draw_box_panel(
         f'transform="rotate(-90 {left - 45:.1f} {(top + bottom) / 2:.1f})">'
         f"{html.escape(ylabel)}</text>"
     )
-    return summary
+    return stats(values)
 
 
 def write_latency(

@@ -198,12 +198,11 @@ def load_runs(result_dir: Path) -> list[dict[str, Any]]:
                 f"Run {run_dir} has {len(rounds)} rounds, expected {expected_rounds}"
             )
         if any(
-            int(item["batched_token_chunks"]) != 0
-            or int(item["streamed_token_count"])
+            int(item["streamed_token_count"])
             != int(item["actual_generate_tokens"])
             for item in rounds
         ):
-            raise RuntimeError(f"Run {run_dir} has invalid streaming token chunks")
+            raise RuntimeError(f"Run {run_dir} has mismatched streaming token counts")
         runs.append(
             {
                 "directory": run_dir,
@@ -496,8 +495,6 @@ def main() -> None:
         raise RuntimeError(f"Prefill cache release evicted no pages: {validation}")
     if expects_l3_reuse and validation["l3_timing_coverage"] == 0:
         raise RuntimeError(f"Expected cross-turn L3 reuse was not observed: {validation}")
-    if validation["batched_token_chunks"]:
-        raise RuntimeError(f"Streaming chunks contained multiple tokens: {validation}")
     print(json.dumps(validation, indent=2))
 
 

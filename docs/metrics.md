@@ -132,9 +132,12 @@ payload 的时间。
 - `tpot_seconds`：该请求第一个 token 之后所有 ITL 的算术均值。
 - 只有一个 output token 时 TPOT 为 `null`。
 
-SGLang 固定 `stream_interval=1`。如果单个 SSE payload 同时新增多个 token，
-`batched_token_chunks > 0`，该 run 无法提供真实逐 token 到达时间，汇总器会
-判为无效。
+SGLang 固定 `stream_interval=1`，但 HTTP/SSE 仍可能把多个 token 合并到一个
+payload。此时这些 token 共享同一个 client 到达时间，并通过
+`batched_token_chunks > 0` 明确标记。只要 `streamed_token_count` 与实际生成
+token 数一致，run 仍然有效：TTFT、TTST 和端到端 TPOT 可用；逐 token ITL 的
+时间分辨率受 SSE 合并影响，会包含零值，不应用于分析 server 内部逐步 decode
+间隔。只有 streaming token 总数不一致时，汇总器才判定 run 无效。
 
 ### 聚合统计
 
@@ -231,6 +234,8 @@ request-scoped 日志，以 request ID 与客户端 `rounds.jsonl` 关联。
 - `DUALPATH_L3_TIMING`
   - 来源：Prefill HiRadix/HiCache storage prefetch。
   - 字段：Prefill engine、TP rank、read start/end/duration、tokens。
+  - `read_end` 在该 rank 首次观察到本地 storage IO 完成时、TP 完成共识
+    `all_reduce` 之前记录，因此每个 rank 的 duration 不包含等待慢 rank 的时间。
   - 用途：L3 read latency、L3 timing coverage、有效加载带宽。
 - `DUALPATH_TTFT_P_TRANSFER_V2`（解析器兼容旧
   `DUALPATH_TTFT_P_TRANSFER`）
@@ -265,9 +270,10 @@ coverage 严格为零。启用 L3 时不设置 coverage 下限。
 ### TP=8 L3 聚合
 
 同一 request 必须取得一个 Prefill engine 的 8 个 TP rank timing。请求的
-`read_seconds` 使用 `max(read_end) - min(read_start)`，覆盖八个 rank 的联合
-读取窗口；`l3_slowest_tp_rank` 另记录 duration 最大的瓶颈 rank。不能只用
-rank 0 或单纯 `max(rank duration)` 计算节点聚合加载带宽。
+`read_seconds` 使用 `max(rank read duration)`，即最慢 rank 的本地 L3 IO
+耗时；`l3_slowest_tp_rank` 记录该瓶颈 rank。另保留
+`tp_union_read_seconds = max(read_end) - min(read_start)` 作为 rank 启动偏斜
+诊断，但它不作为有效带宽分母。不能只使用 rank 0。
 
 ### P→D timing 与有效带宽
 
@@ -295,11 +301,10 @@ prefill_l3_effective_bandwidth_gbps
 ```
 
 这里分子是一个 Prefill engine 的 TP=8 合计逻辑 payload，分母是该 request
-八个 rank 的联合读取窗口，所以结果是**单 Prefill engine 的 TP 聚合有效
-带宽**，不是每 rank 平均，也不是跨 engine 平均。Job `66097` 有 L3 read 的 6
-个 requests 的旧图使用 `max(rank duration)`，需按新联合窗口重新 collect 后
-再引用；该逻辑有效带宽也不能直接解释为 Lustre NIC wire bandwidth。带宽统一
-使用十进制 GB/s；KV 容量使用二进制 GiB。
+最慢 rank 的本地 L3 IO duration，所以结果是**单 Prefill engine 的 TP 聚合
+有效带宽**，不是每 rank 平均，也不是跨 engine 平均。该逻辑有效带宽不能直接
+解释为 Lustre NIC wire bandwidth。带宽统一使用十进制 GB/s；KV 容量使用
+二进制 GiB。
 
 ## 6. TTFT breakdown
 
