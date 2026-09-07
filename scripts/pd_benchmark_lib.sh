@@ -40,9 +40,6 @@ dualpath_export_common_env() {
   export STORAGE_SETTLE_SECONDS=${STORAGE_SETTLE_SECONDS:-0}
   export DUALPATH_DECODE_L3_SYNC_RANKS=${DUALPATH_DECODE_L3_SYNC_RANKS:-8}
   export DUALPATH_DECODE_L3_SYNC_TIMEOUT=${DUALPATH_DECODE_L3_SYNC_TIMEOUT:-600}
-  # Recursive Lustre usage scans are diagnostic-only. Running one after every
-  # turn dominates long-context benchmark wall time under concurrent agents.
-  export COLLECT_L3_STORAGE_SNAPSHOT=${COLLECT_L3_STORAGE_SNAPSHOT:-0}
   export MODEL_DIR LOG_DIR CACHE_DIR IB_DEVICE PREFILL_PORT DECODE_PORT
   export BOOTSTRAP_PORT ROUTER_PORT SERVER_TIMEOUT
   export MC_TRANSFER_TIMEOUT SGLANG_MOONCAKE_MAX_TRANSFER_BATCH_INDICES
@@ -54,7 +51,6 @@ dualpath_export_common_env() {
   export DUALPATH_DECODE_PD_HOST_STAGING_GB DECODE_HICACHE_RATIO
   export FLUSH_LOCAL_CACHE_BETWEEN_TURNS STORAGE_SETTLE_SECONDS
   export DUALPATH_DECODE_L3_SYNC_RANKS DUALPATH_DECODE_L3_SYNC_TIMEOUT
-  export COLLECT_L3_STORAGE_SNAPSHOT
   export MOONCAKE_DEVICE
 }
 
@@ -142,20 +138,16 @@ dualpath_write_run_json() {
   local repetition=$5
   local dataset=${6:-${max_len}K}
   local flush_flag=0
-  local snapshot_flag=0
   local settle="${STORAGE_SETTLE_SECONDS:-0}"
   if [[ "${FLUSH_LOCAL_CACHE_BETWEEN_TURNS:-1}" == 1 ]]; then
     flush_flag=1
-  fi
-  if [[ "${COLLECT_L3_STORAGE_SNAPSHOT:-0}" == 1 ]]; then
-    snapshot_flag=1
   fi
   python - "$path" "$architecture" "$max_len" "$agents" "$repetition" "$dataset" \
     "$MAX_TURNS" "$ABLATION_PROFILE" "$MEASURED_PREFILL_L3" \
     "$MEASURED_DECODE_OFFLOAD" "$CHUNKED_PREFILL_SIZE" \
     "$DISABLE_OVERLAP_SCHEDULE" "$PAPER_EXPAND_AGENTS" \
     "$PAPER_SYNTHETIC_APPEND_TOKENS" "$flush_flag" "$settle" \
-    "$snapshot_flag" "$MC_TRANSFER_TIMEOUT" \
+    "$MC_TRANSFER_TIMEOUT" \
     "$SGLANG_MOONCAKE_MAX_TRANSFER_BATCH_INDICES" \
     "$DUALPATH_PREFILL_RELEASE_LOCAL_CACHE" \
     "$PREFILL_HICACHE_WRITE_POLICY" "$IB_DEVICE" \
@@ -170,9 +162,9 @@ import os
 import sys
 
 try:
-    pd_ib_device_mapping = json.loads(sys.argv[22])
+    pd_ib_device_mapping = json.loads(sys.argv[21])
 except json.JSONDecodeError:
-    pd_ib_device_mapping = sys.argv[22]
+    pd_ib_device_mapping = sys.argv[21]
 
 Path(sys.argv[1]).write_text(json.dumps({
     "architecture": sys.argv[2],
@@ -195,19 +187,18 @@ Path(sys.argv[1]).write_text(json.dumps({
     "per_turn_cache_flush": bool(int(sys.argv[15])),
     "storage_settle_seconds": float(sys.argv[16]),
     "storage_quiescence_wait": bool(float(sys.argv[16]) > 0),
-    "collect_l3_storage_snapshot": bool(int(sys.argv[17])),
-    "mooncake_transfer_timeout_seconds": int(sys.argv[18]),
-    "mooncake_max_transfer_batch_indices": int(sys.argv[19]),
-    "prefill_release_local_cache_after_pd_ack": bool(int(sys.argv[20])),
-    "prefill_hicache_write_policy": sys.argv[21],
+    "mooncake_transfer_timeout_seconds": int(sys.argv[17]),
+    "mooncake_max_transfer_batch_indices": int(sys.argv[18]),
+    "prefill_release_local_cache_after_pd_ack": bool(int(sys.argv[19])),
+    "prefill_hicache_write_policy": sys.argv[20],
     "pd_ib_device_mapping": pd_ib_device_mapping,
-    "prefill_hicache_read_only": bool(int(sys.argv[23])),
-    "prefill_hicache_evict_unlocked": bool(int(sys.argv[24])),
-    "prefill_backup_timeout_seconds": float(sys.argv[25]),
-    "decode_pd_host_staging": bool(int(sys.argv[26])),
+    "prefill_hicache_read_only": bool(int(sys.argv[22])),
+    "prefill_hicache_evict_unlocked": bool(int(sys.argv[23])),
+    "prefill_backup_timeout_seconds": float(sys.argv[24]),
+    "decode_pd_host_staging": bool(int(sys.argv[25])),
     "decode_pd_host_staging_pool": "dedicated_pinned_host_pool",
-    "decode_pd_host_staging_gb_per_rank": float(sys.argv[27]),
-    "decode_hicache_ratio": float(sys.argv[28]),
+    "decode_pd_host_staging_gb_per_rank": float(sys.argv[26]),
+    "decode_hicache_ratio": float(sys.argv[27]),
     "decode_l3_completion_sync": bool(
         os.environ.get("DUALPATH_DECODE_L3_SYNC_DIR")
     ),
@@ -216,11 +207,6 @@ Path(sys.argv[1]).write_text(json.dumps({
     ),
     "decode_l3_completion_sync_timeout_seconds": float(
         os.environ.get("DUALPATH_DECODE_L3_SYNC_TIMEOUT", "600")
-    ),
-    "l3_storage_snapshot_kind": (
-        "recursive apparent bytes and st_blocks allocated bytes"
-        if bool(int(sys.argv[17]))
-        else "disabled"
     ),
     "kv_buffer_semantics": (
         "DualPath paper: staging/GPU buffers released after each request; "
@@ -285,7 +271,6 @@ dualpath_run_replay() {
   local paper_args=()
   local turn_args=()
   local flush_args=()
-  local storage_args=()
   local sync_args=()
   local host
   if (( MAX_TURNS > 0 )); then
@@ -322,13 +307,6 @@ dualpath_run_replay() {
       --decode-l3-sync-timeout "${DUALPATH_DECODE_L3_SYNC_TIMEOUT:-600}"
     )
   fi
-  if [[ "${COLLECT_L3_STORAGE_SNAPSHOT:-0}" == 1 ]]; then
-    : "${L3_STORAGE_DIR:?L3_STORAGE_DIR is required for L3 snapshots}"
-    storage_args+=(--storage-dir "$L3_STORAGE_DIR")
-  elif [[ "${COLLECT_L3_STORAGE_SNAPSHOT:-0}" != 0 ]]; then
-    echo "COLLECT_L3_STORAGE_SNAPSHOT must be 0 or 1" >&2
-    return 2
-  fi
   python scripts/benchmark/replay_fake_agent_traces.py \
     --dataset "$dataset" \
     --base-url "http://$PREFILL_HOST:$ROUTER_PORT" \
@@ -343,6 +321,5 @@ dualpath_run_replay() {
     "${paper_args[@]}" \
     "${flush_args[@]}" \
     "${sync_args[@]}" \
-    "${storage_args[@]}" \
     --stream
 }

@@ -96,7 +96,6 @@ class ReplayConfig:
     flush_cache_urls: tuple[str, ...]
     storage_settle_seconds: float
     flush_coordinator: FlushCoordinator | None
-    storage_dirs: tuple[Path, ...]
     l3_sync_dir: Path | None
     l3_sync_ranks: int
     l3_sync_timeout: float
@@ -311,35 +310,6 @@ def flush_local_caches(urls: tuple[str, ...], timeout: float) -> float:
     return time.perf_counter() - started
 
 
-def snapshot_storage(paths: tuple[Path, ...]) -> dict[str, int | float]:
-    """Return a recursive Lustre snapshot without following symlinks.
-
-    Mooncake DFS shard files may be sparse/preallocated.  Apparent bytes are
-    useful for describing the namespace, while allocated bytes (st_blocks)
-    represent filesystem blocks currently charged to the files.
-    """
-    started = time.perf_counter()
-    apparent_bytes = 0
-    allocated_bytes = 0
-    file_count = 0
-    for root in paths:
-        if not root.exists():
-            continue
-        for path in root.rglob("*"):
-            if not path.is_file() or path.is_symlink():
-                continue
-            stat = path.stat()
-            apparent_bytes += stat.st_size
-            allocated_bytes += stat.st_blocks * 512
-            file_count += 1
-    return {
-        "l3_apparent_bytes_after_turn": apparent_bytes,
-        "l3_allocated_bytes_after_turn": allocated_bytes,
-        "l3_file_count_after_turn": file_count,
-        "storage_snapshot_seconds": time.perf_counter() - started,
-    }
-
-
 def replay_trajectory(
     trajectory: dict[str, Any],
     config: ReplayConfig,
@@ -459,20 +429,6 @@ def replay_trajectory(
         round_results[-1]["storage_settle_seconds"] = settle_seconds
         round_results[-1]["cache_sync_wait_seconds"] = cache_sync_wait_seconds
         round_results[-1]["decode_l3_sync_wait_seconds"] = l3_sync_wait_seconds
-        if config.storage_dirs:
-            # The last turn has no following-request flush branch, but still
-            # needs a short visibility delay before the final filesystem
-            # snapshot observes asynchronous Decode -> Store writes.
-            if (
-                turn_index + 1 == len(turns)
-                and config.storage_settle_seconds > 0
-            ):
-                settle_started = time.perf_counter()
-                time.sleep(config.storage_settle_seconds)
-                round_results[-1]["storage_settle_seconds"] = (
-                    time.perf_counter() - settle_started
-                )
-            round_results[-1].update(snapshot_storage(config.storage_dirs))
 
     elapsed_seconds = sum(
         float(item["turn_wall_seconds"]) for item in round_results
@@ -653,16 +609,6 @@ def main() -> None:
         help="Optional legacy sleep after a turn; exact Decode L3 sync is preferred.",
     )
     parser.add_argument(
-        "--storage-dir",
-        type=Path,
-        action="append",
-        default=[],
-        help=(
-            "L3 file-backend directory to snapshot after each turn. Repeatable; "
-            "records apparent and allocated bytes separately."
-        ),
-    )
-    parser.add_argument(
         "--decode-l3-sync-dir",
         type=Path,
         help=(
@@ -742,7 +688,6 @@ def main() -> None:
             if flush_urls
             else None
         ),
-        storage_dirs=tuple(args.storage_dir),
         l3_sync_dir=args.decode_l3_sync_dir,
         l3_sync_ranks=args.decode_l3_sync_ranks,
         l3_sync_timeout=args.decode_l3_sync_timeout,
@@ -846,10 +791,6 @@ def main() -> None:
     summary["decode_l3_sync_dir"] = (
         str(config.l3_sync_dir) if config.l3_sync_dir is not None else None
     )
-    summary["storage_snapshot_seconds_total"] = sum(
-        float(item.get("storage_snapshot_seconds", 0.0)) for item in all_rounds
-    )
-    summary["storage_snapshot_dirs"] = [str(path) for path in config.storage_dirs]
     (args.output_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     print(json.dumps(summary, indent=2))
     if errors:

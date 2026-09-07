@@ -214,18 +214,17 @@ request 明细（见 §6）。
 - turn 后逻辑 KV：`(prompt_tokens + generated_tokens) × 262144`。
 - 容量图使用 GiB，即除以 `1024³`。
 
-逐轮 Lustre 容量采样默认关闭。诊断时显式设置
-`COLLECT_L3_STORAGE_SNAPSHOT=1`，replay 才会在请求完成并等齐 Decode
-L3-complete markers 后递归扫描该 run 的 file-backend 目录；同步和采样均不计入
-`turn_wall_seconds` / trajectory JCT。递归扫描开销会随文件数量和并发 agent 数
-快速增长，因此正式 latency benchmark 保持默认值 `0`。
+正式 replay 不再递归扫描 Lustre file-backend 目录，也不再生成逐轮 apparent
+bytes、allocated blocks 或 file-count snapshot。该扫描会随文件数量和并发 agent
+数快速增长，并且 `st_blocks` 受文件系统分配粒度影响，不能作为请求逻辑 KV 的
+准确替代。L3 数据量和带宽只使用服务端 request-scoped read timing marker；
+Decode 持久化完成仍由 8-rank completion marker 精确同步。
 
-- `l3_apparent_snapshot_gib`：file-backend KV 文件 `st_size` 总和。
-- `l3_physical_snapshot_gib`：`st_blocks × 512` 总和，表示 Lustre 当时已分配
-  block，是当前落盘曲线使用的物理快照。completion barrier 后不应再有该
-  request 的异步 file write；文件系统分配与逻辑 KV 仍可能因 page 对齐不同。
-- 关闭采样后不生成上述两项逐轮 snapshot 指标，但不影响 L3 read timing、
-  cache hit、TTFT 和 JCT。
+Job `67478`（2026-09-07，1P2D、32K、1 agent、26 turns）验证删除后完整
+replay 成功：26/26 turns、0 errors，request/P→D timing coverage 均为 100%，
+Prefill L3 cached-token coverage 为 100%，总作业耗时 5:44；生成的 run metadata、
+rounds、CSV、summary 和图均不再包含 snapshot/allocated-block 字段。
+
 - Job `66097` 是历史 Mooncake DFS 结果，不与当前 file-backend 容量混报。
 
 ## 4. 服务端 timing marker

@@ -113,24 +113,12 @@ def build_rows(
     engine_rank_rows: dict[
         str, list[dict[str, float | int | str]]
     ] = defaultdict(list)
-    previous_storage: int | None = None
     for item in rounds:
         rid = item["request_id"]
         prompt_tokens = int(item["prompt_tokens"])
         generated_tokens = int(item["actual_generate_tokens"])
         append_tokens = int(item["append_tokens"])
         cached_tokens = int(item["cached_tokens"])
-        storage_raw = item.get(
-            "l3_allocated_bytes_after_turn",
-            item.get("storage_bytes_after_turn"),
-        )
-        storage_bytes = int(storage_raw) if storage_raw is not None else None
-        storage_apparent_raw = item.get("l3_apparent_bytes_after_turn")
-        storage_apparent_bytes = (
-            int(storage_apparent_raw)
-            if storage_apparent_raw is not None
-            else None
-        )
         (
             transfer_seconds,
             transfer_tokens,
@@ -208,22 +196,6 @@ def build_rows(
                     * KV_BYTES_PER_TOKEN
                     / GIB
                 ),
-                "l3_physical_increment_gib": max(
-                    0, storage_bytes - previous_storage
-                ) / GIB
-                if storage_bytes is not None and previous_storage is not None
-                else None,
-                "l3_physical_total_gib": (
-                    storage_bytes / GIB if storage_bytes is not None else None
-                ),
-                "l3_physical_snapshot_gib": (
-                    storage_bytes / GIB if storage_bytes is not None else None
-                ),
-                "l3_apparent_snapshot_gib": (
-                    storage_apparent_bytes / GIB
-                    if storage_apparent_bytes is not None
-                    else None
-                ),
                 "pd_transfer_tokens": transfer_tokens,
                 "pd_transfer_page_aligned_tokens": transfer_page_tokens,
                 "pd_transfer_page_count": transfer_page_count,
@@ -241,8 +213,6 @@ def build_rows(
                 ),
             }
         )
-        if storage_bytes is not None:
-            previous_storage = storage_bytes
     return rows, dict(engine_rank_rows)
 
 
@@ -350,10 +320,6 @@ def main() -> None:
     if args.metrics_csv:
         with args.metrics_csv.open(newline="") as stream:
             rows = list(csv.DictReader(stream))
-        for row in rows:
-            row.setdefault(
-                "l3_physical_snapshot_gib", row["l3_physical_total_gib"]
-            )
         engine_rank_rows: dict[
             str, list[dict[str, float | int | str]]
         ] = {}
@@ -395,25 +361,9 @@ def main() -> None:
         "New KV Data by Turn",
         args.output_dir / "kv-new.svg",
     )
-    total_kv_series = [
-        ("total_logical_kv_gib", "Total logical context KV", "#0f766e")
-    ]
-    physical_values = [
-        row.get("l3_physical_snapshot_gib")
-        for row in rows
-        if row.get("l3_physical_snapshot_gib") not in (None, "")
-    ]
-    if physical_values:
-        total_kv_series.append(
-            (
-                "l3_physical_snapshot_gib",
-                "Lustre allocated blocks (async snapshot)",
-                "#7c3aed",
-            )
-        )
     plot(
         rows,
-        tuple(total_kv_series),
+        (("total_logical_kv_gib", "Total logical context KV", "#0f766e"),),
         "GiB",
         "Total KV Data by Turn",
         args.output_dir / "kv-total.svg",
@@ -540,17 +490,6 @@ def main() -> None:
         ),
         "final_cache_hit_rate": float(rows[-1]["cache_hit_rate"]),
         "final_logical_kv_gib": float(rows[-1]["total_logical_kv_gib"]),
-        "l3_storage_snapshot_available": bool(physical_values),
-        "final_l3_physical_gib": (
-            float(rows[-1]["l3_physical_total_gib"])
-            if rows[-1].get("l3_physical_total_gib") not in (None, "")
-            else None
-        ),
-        "final_observed_l3_snapshot_gib": (
-            float(rows[-1]["l3_physical_snapshot_gib"])
-            if rows[-1].get("l3_physical_snapshot_gib") not in (None, "")
-            else None
-        ),
         "median_pd_effective_bandwidth_gbps": statistics.median(
             float(row["pd_effective_bandwidth_gbps"]) for row in rows
         ),
