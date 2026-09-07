@@ -61,7 +61,7 @@ SGLang HiCache **无法**关闭 L2 pool（`--hicache-size 0` 仍按 ratio 分配
 ```bash
 DUALPATH_PREFILL_RELEASE_LOCAL_CACHE=1
 PREFILL_HICACHE_READ_ONLY=1
-PREFILL_HICACHE_EVICT_UNLOCKED=0
+PREFILL_HICACHE_EVICT_UNLOCKED=1
 PREFILL_HICACHE_WRITE_POLICY=write_through_selective
 DUALPATH_PREFILL_BACKUP_TIMEOUT=0
 DUALPATH_DECODE_PD_HOST_STAGING=1
@@ -70,6 +70,11 @@ DECODE_HICACHE_RATIO=1.05
 FLUSH_LOCAL_CACHE_BETWEEN_TURNS=0
 STORAGE_SETTLE_SECONDS=0
 ```
+
+PD ACK 路径在释放 request radix lock 后，先调用 HiCache `loading_check()` 收割
+已经完成的 L3→Host→GPU copy event 并解除对应 node lock，再立即驱逐这些 page。
+`PREFILL_HICACHE_EVICT_UNLOCKED=1` 继续在后续 HiCache progress 中驱逐更晚解锁
+的 page，作为并发 load event 的兜底。
 
 最终正确性 Job `66987`（1P1D、32K、1 agent、2 turns、8 HCA）完成：
 request/PD/release coverage 均为 100%，release 后为 0。turn 1 Decode 从 0

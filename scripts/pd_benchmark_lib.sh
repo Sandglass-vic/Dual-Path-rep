@@ -23,7 +23,10 @@ dualpath_export_common_env() {
   # preserves active shared prefixes without a stop-the-world /flush_cache.
   export DUALPATH_PREFILL_RELEASE_LOCAL_CACHE=${DUALPATH_PREFILL_RELEASE_LOCAL_CACHE:-1}
   export PREFILL_HICACHE_READ_ONLY=${PREFILL_HICACHE_READ_ONLY:-1}
-  export PREFILL_HICACHE_EVICT_UNLOCKED=${PREFILL_HICACHE_EVICT_UNLOCKED:-0}
+  # A page can still be locked by HiCache when the PD ACK arrives. Revisit the
+  # cache after HiCache progress so pages unlocked after the immediate release
+  # do not become cross-turn L1/L2 hits.
+  export PREFILL_HICACHE_EVICT_UNLOCKED=${PREFILL_HICACHE_EVICT_UNLOCKED:-1}
   # Retained in run metadata for compatibility; Prefill performs no backup and
   # therefore never waits on this timeout.
   export DUALPATH_PREFILL_BACKUP_TIMEOUT=${DUALPATH_PREFILL_BACKUP_TIMEOUT:-0}
@@ -37,7 +40,9 @@ dualpath_export_common_env() {
   export STORAGE_SETTLE_SECONDS=${STORAGE_SETTLE_SECONDS:-0}
   export DUALPATH_DECODE_L3_SYNC_RANKS=${DUALPATH_DECODE_L3_SYNC_RANKS:-8}
   export DUALPATH_DECODE_L3_SYNC_TIMEOUT=${DUALPATH_DECODE_L3_SYNC_TIMEOUT:-600}
-  export COLLECT_L3_STORAGE_SNAPSHOT=${COLLECT_L3_STORAGE_SNAPSHOT:-1}
+  # Recursive Lustre usage scans are diagnostic-only. Running one after every
+  # turn dominates long-context benchmark wall time under concurrent agents.
+  export COLLECT_L3_STORAGE_SNAPSHOT=${COLLECT_L3_STORAGE_SNAPSHOT:-0}
   export MODEL_DIR LOG_DIR CACHE_DIR IB_DEVICE PREFILL_PORT DECODE_PORT
   export BOOTSTRAP_PORT ROUTER_PORT SERVER_TIMEOUT
   export MC_TRANSFER_TIMEOUT SGLANG_MOONCAKE_MAX_TRANSFER_BATCH_INDICES
@@ -142,7 +147,7 @@ dualpath_write_run_json() {
   if [[ "${FLUSH_LOCAL_CACHE_BETWEEN_TURNS:-1}" == 1 ]]; then
     flush_flag=1
   fi
-  if [[ "${COLLECT_L3_STORAGE_SNAPSHOT:-1}" == 1 ]]; then
+  if [[ "${COLLECT_L3_STORAGE_SNAPSHOT:-0}" == 1 ]]; then
     snapshot_flag=1
   fi
   python - "$path" "$architecture" "$max_len" "$agents" "$repetition" "$dataset" \
@@ -212,7 +217,11 @@ Path(sys.argv[1]).write_text(json.dumps({
     "decode_l3_completion_sync_timeout_seconds": float(
         os.environ.get("DUALPATH_DECODE_L3_SYNC_TIMEOUT", "600")
     ),
-    "l3_storage_snapshot_kind": "recursive apparent bytes and st_blocks allocated bytes",
+    "l3_storage_snapshot_kind": (
+        "recursive apparent bytes and st_blocks allocated bytes"
+        if bool(int(sys.argv[17]))
+        else "disabled"
+    ),
     "kv_buffer_semantics": (
         "DualPath paper: staging/GPU buffers released after each request; "
         "cross-turn reuse via L3 only. SGLang approximation: after successful "
@@ -313,10 +322,10 @@ dualpath_run_replay() {
       --decode-l3-sync-timeout "${DUALPATH_DECODE_L3_SYNC_TIMEOUT:-600}"
     )
   fi
-  if [[ "${COLLECT_L3_STORAGE_SNAPSHOT:-1}" == 1 ]]; then
+  if [[ "${COLLECT_L3_STORAGE_SNAPSHOT:-0}" == 1 ]]; then
     : "${L3_STORAGE_DIR:?L3_STORAGE_DIR is required for L3 snapshots}"
     storage_args+=(--storage-dir "$L3_STORAGE_DIR")
-  elif [[ "${COLLECT_L3_STORAGE_SNAPSHOT:-1}" != 0 ]]; then
+  elif [[ "${COLLECT_L3_STORAGE_SNAPSHOT:-0}" != 0 ]]; then
     echo "COLLECT_L3_STORAGE_SNAPSHOT must be 0 or 1" >&2
     return 2
   fi

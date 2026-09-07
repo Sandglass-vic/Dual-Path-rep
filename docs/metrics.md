@@ -91,8 +91,12 @@ radix lock；随后驱逐只处理 `lock_ref=0` 的叶节点，因此不会释�
 所以 PD ACK 后无需等待存储写入即可立即驱逐 L1/L2。Decode 根据 Prefill metadata
 中的 `cached_tokens`，只发布该 page-aligned L3 前缀之后的新 KV。
 
-自动验收要求 `prefill_cache_release_coverage >= 0.95` 且
-`prefill_evictable_after_release_max == 0`。`evictable_before` 仅作为诊断：
+自动验收要求 `prefill_cache_release_coverage >= 0.95`、
+`prefill_evictable_after_release_max == 0`，并在 deferred eviction 开启时要求
+`prefill_l3_cached_token_coverage >= 0.99`。最后一个指标是所有存在 cached prefix
+的轮次中 `min(L3 read tokens, cached tokens)` 与 `cached tokens` 的加权比值，
+用于发现 PD ACK 时仍被 HiCache 临时锁住、稍后解锁却留在 L1/L2 的 page。
+`evictable_before` 仅作为诊断：
 短请求或已由请求生命周期提前释放的 page 可以为 0。对应字段写入 task
 `data/validation.json` 和聚合 CSV。启用 Prefill L3 与 Decode offload 的多轮
 run 还要求观测到跨 turn L3 timing，防止“本地释放成功但 L3 未发布”的假阳性。
@@ -210,14 +214,18 @@ request 明细（见 §6）。
 - turn 后逻辑 KV：`(prompt_tokens + generated_tokens) × 262144`。
 - 容量图使用 GiB，即除以 `1024³`。
 
-正式 replay 在请求完成并等齐 Decode L3-complete markers 后递归采样该 run 的
-Lustre file-backend 目录；同步和采样均不计入 `turn_wall_seconds` /
-trajectory JCT。
+逐轮 Lustre 容量采样默认关闭。诊断时显式设置
+`COLLECT_L3_STORAGE_SNAPSHOT=1`，replay 才会在请求完成并等齐 Decode
+L3-complete markers 后递归扫描该 run 的 file-backend 目录；同步和采样均不计入
+`turn_wall_seconds` / trajectory JCT。递归扫描开销会随文件数量和并发 agent 数
+快速增长，因此正式 latency benchmark 保持默认值 `0`。
 
 - `l3_apparent_snapshot_gib`：file-backend KV 文件 `st_size` 总和。
 - `l3_physical_snapshot_gib`：`st_blocks × 512` 总和，表示 Lustre 当时已分配
   block，是当前落盘曲线使用的物理快照。completion barrier 后不应再有该
   request 的异步 file write；文件系统分配与逻辑 KV 仍可能因 page 对齐不同。
+- 关闭采样后不生成上述两项逐轮 snapshot 指标，但不影响 L3 read timing、
+  cache hit、TTFT 和 JCT。
 - Job `66097` 是历史 Mooncake DFS 结果，不与当前 file-backend 容量混报。
 
 ## 4. 服务端 timing marker

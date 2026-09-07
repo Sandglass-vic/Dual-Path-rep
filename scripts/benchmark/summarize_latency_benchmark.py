@@ -41,6 +41,21 @@ def mean(values: list[float]) -> float:
     return statistics.fmean(values) if values else 0.0
 
 
+def l3_cached_token_coverage(rows: list[dict[str, Any]]) -> float:
+    reusable = [item for item in rows if int(item["cached_tokens"]) > 0]
+    cached_tokens = sum(int(item["cached_tokens"]) for item in reusable)
+    if cached_tokens == 0:
+        return 1.0
+    l3_tokens = sum(
+        min(
+            int(item["cached_tokens"]),
+            int(item["l3_prefetched_tokens_logical"]),
+        )
+        for item in reusable
+    )
+    return l3_tokens / cached_tokens
+
+
 def parse_timing_logs(
     log_dir: Path,
 ) -> tuple[
@@ -379,6 +394,15 @@ def main() -> None:
                     values("pd_effective_bandwidth_gbps")
                 ),
                 "cache_hit_rate_mean": mean(values("cache_hit_rate")),
+                "prefill_l3_cached_token_coverage": l3_cached_token_coverage(
+                    [
+                        item
+                        for item in merged_rounds
+                        if item["max_len_k"] == metadata["max_len_k"]
+                        and item["agents"] == metadata["agents"]
+                        and item["repetition"] == metadata["repetition"]
+                    ]
+                ),
             }
         )
 
@@ -432,6 +456,13 @@ def main() -> None:
         and len(run["rounds"]) > 1
         for run in runs
     )
+    deferred_evict_rows = [
+        item
+        for item in merged_rounds
+        if bool(item.get("prefill_l3", True))
+        and bool(item.get("decode_offload", True))
+        and bool(item.get("prefill_hicache_evict_unlocked", False))
+    ]
     validation = {
         "runs": len(run_rows),
         "rounds": len(merged_rounds),
@@ -458,6 +489,15 @@ def main() -> None:
         "prefill_evictable_before_release_max": max(
             int(item["prefill_evictable_before_release"])
             for item in merged_rounds
+        ),
+        "prefill_l3_cached_token_coverage": l3_cached_token_coverage(
+            deferred_evict_rows
+        ),
+        "prefill_local_prefix_reuse_rounds": sum(
+            int(item["cached_tokens"]) > 0
+            and int(item["l3_prefetched_tokens_logical"])
+            < int(item["cached_tokens"])
+            for item in deferred_evict_rows
         ),
         "batched_token_chunks": sum(
             int(item.get("batched_token_chunks", 0)) for item in merged_rounds
@@ -490,6 +530,13 @@ def main() -> None:
         raise RuntimeError(f"Incomplete Prefill cache eviction: {validation}")
     if expects_l3_reuse and validation["l3_timing_coverage"] == 0:
         raise RuntimeError(f"Expected cross-turn L3 reuse was not observed: {validation}")
+    if (
+        deferred_evict_rows
+        and validation["prefill_l3_cached_token_coverage"] < 0.99
+    ):
+        raise RuntimeError(
+            f"Unexpected Prefill local-prefix reuse after deferred eviction: {validation}"
+        )
     print(json.dumps(validation, indent=2))
 
 

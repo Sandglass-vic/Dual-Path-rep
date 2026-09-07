@@ -77,8 +77,12 @@ assert "DUALPATH_REQ_TIMING" in schedule_batch
 assert '"DUALPATH_TTFT_P_TRANSFER_V2 rid=%s ' in prefill
 assert "DUALPATH_PREFILL_CACHE_RELEASE" in prefill
 assert "DUALPATH_PREFILL_RELEASE_LOCAL_CACHE" in prefill
+release_local = prefill.index("DUALPATH_PREFILL_RELEASE_LOCAL_CACHE")
+assert prefill.index("self.tree_cache.loading_check()", release_local) < (
+    prefill.index("self.tree_cache.evict(evictable_before)", release_local)
+)
 assert "ongoing_write_through" not in prefill[
-    prefill.index("DUALPATH_PREFILL_RELEASE_LOCAL_CACHE"):
+    release_local:
     prefill.index("DUALPATH_PREFILL_CACHE_RELEASE")
 ]
 assert "dualpath_transfer_page_count" in prefill
