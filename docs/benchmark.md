@@ -68,14 +68,16 @@ Repetitions：3
 
 正式入口为论文对齐的动态 rollout：
 
-- 每个配置从独立、空的 Mooncake Store namespace 开始；
+- 每个配置从独立、空的 Lustre file-backend 目录开始；
 - 不预先 populate，不重启进入 measured 阶段；
 - Prefill 在每个 request 的 PD transfer ACK 后调用 SGLang 原生
   `release_kv_cache()` 解锁 radix 路径，再驱逐全部 `lock_ref=0` 的 L1/L2
   page；活跃请求共享的 prefix 保持受保护；
-- Prefill 保留 `write_through_selective` 以发布 page-aligned prompt；PD ACK
-  解锁后等待异步 backup 完成，再驱逐本地 L1/L2；Decode offload 发布 prompt
-  之后的增量 KV；等待上限由 `DUALPATH_PREFILL_BACKUP_TIMEOUT=120` 控制；
+- Prefill 为 L3 read-only，不执行 D2H 或 Host→L3 offload；PD ACK 后不等待
+  backup，立即释放本地 L1/L2；
+- Decode 从 Prefill metadata 的 page-aligned `cached_tokens` 边界开始 offload，
+  因此持久化“Prefill 本轮新计算 KV + Decode 新生成 KV”；第一轮从 0 开始，
+  已在 L3 的前缀不重复写；
 - 正式路径不调用全局 `/flush_cache`，因此不阻塞或同步并发 agents；
 - DGX H100 的 8 个 TP rank 分别绑定
   `mlx5_0,3,4,5,6,9,10,11`，不再让全部 rank 共享 `mlx5_0`；完整 JSON
@@ -88,8 +90,17 @@ Repetitions：3
   同步 PD transfer 按 KV page index 有序分批，避免单次调用耗尽 Mooncake
   瞬态资源；128 对应当前 64-token page 下最多 8192 tokens/批，实际值写入
   `run.json.mooncake_max_transfer_batch_indices`；
-- 默认 `STORAGE_SETTLE_SECONDS=1`，避免 Store 尚未可见就发下一轮；
-- Decode 在 rollout 中持续把 KV 发布到 Mooncake Store，下一轮从 L3 加载；
+- `DUALPATH_DECODE_PD_HOST_STAGING=1`：Mooncake Transfer Engine 的 Decode
+  目标是独立的 `layer_first` pinned Host staging pool，默认每 rank 40 GB；
+  H2D 完成后归还 staging pages。Decode D2H→Lustre 使用另一套
+  `page_first_direct` HiCache Host pool，两者不复用；实际值写入
+  `run.json.decode_pd_host_staging*`；
+- `HICACHE_STORAGE_BACKEND=file`：HiCache L3 直接使用共享 Lustre 文件，
+  Mooncake 仅负责 P→D RDMA，不再使用 Mooncake Store/global segment；
+- 默认 `STORAGE_SETTLE_SECONDS=0`。Decode 每个 TP rank 在该 request 的 L3
+  backup ACK 后原子发布 completion marker；同一 trajectory 发下一 turn 前
+  必须等待上一 turn 的 8 个 rank marker，等待不计入 `turn_wall_seconds`；
+- Decode 在 rollout 中持续把新增 KV 写入 Lustre，下一轮从该目录加载；
 - JCT：`trajectory_jct` / turn_wall **不含** release/settle；batch `wall_seconds`
   含真实墙钟。
 
@@ -97,10 +108,10 @@ Repetitions：3
 `DUALPATH_PREFILL_RELEASE_LOCAL_CACHE=0` 的 L1/L2 保留路径仅作对照。更早的
 全局 flush、Populate/Measured + 长 storage wait 是诊断手段，不是正式口径。
 
-Mooncake 的 `PutStart/PutEnd` 完整对象发布替代旧 SGLang file backend 的
-`.bin` 并发覆盖，因此不再使用 Decode scratch 目录规避 `Short read`。每个
-run 使用独立 DFS root 是实验间 cold-start 隔离，不是请求 critical path
-中的等待。Job 退出后仍删除该 Job 的临时 KV 目录。
+旧 file backend 的 `.bin` 发布不是原子的，因此下一 turn 不能只依赖固定 sleep。
+逐 request、逐 TP rank completion marker 保证同一 trajectory 不会在上一轮
+Decode L3 backup 完成前读取对应文件。每个 run 使用独立 Lustre 目录做实验间
+cold-start 隔离；Job 退出后仍删除该 Job 的临时 KV 目录。
 
 Job `65032` 是历史诊断矩阵：它使用 Populate/Measured、服务重启、cache flush
 和存储静默等待，只能用于早期正确性与趋势分析，不能作为论文性能结果，也不再

@@ -18,6 +18,7 @@ COMPONENTS = (
         "#22c55e",
     ),
     ("pd_transfer_seconds", "Prefill-to-Decode KV Transfer", "#f97316"),
+    ("decode_host_to_device_seconds", "Decode Host-to-GPU Copy", "#ef4444"),
     ("decode_dispatch_seconds", "Decode Prebuilt-token Dispatch", "#8b5cf6"),
     ("sse_egress_seconds", "SSE Serialization & Egress", "#06b6d4"),
     ("router_client_runtime_seconds", "Router, Client & Runtime Gaps", "#cbd5e1"),

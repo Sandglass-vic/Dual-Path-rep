@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 import json
 import random
 import statistics
@@ -96,6 +97,29 @@ class ReplayConfig:
     storage_settle_seconds: float
     flush_coordinator: FlushCoordinator | None
     storage_dirs: tuple[Path, ...]
+    l3_sync_dir: Path | None
+    l3_sync_ranks: int
+    l3_sync_timeout: float
+
+
+def wait_for_decode_l3(
+    sync_dir: Path, request_id: str, rank_count: int, timeout: float
+) -> float:
+    """Wait until every Decode TP rank publishes this request's L3 completion."""
+    started = time.perf_counter()
+    stem = hashlib.sha256(request_id.encode()).hexdigest()
+    expected = [sync_dir / f"{stem}.rank-{rank}.done" for rank in range(rank_count)]
+    deadline = time.monotonic() + timeout
+    while True:
+        missing = [path for path in expected if not path.is_file()]
+        if not missing:
+            return time.perf_counter() - started
+        if time.monotonic() >= deadline:
+            names = ", ".join(path.name for path in missing)
+            raise TimeoutError(
+                f"Decode L3 completion timeout for {request_id}; missing {names}"
+            )
+        time.sleep(0.05)
 
 
 def synthetic_token_ids(
@@ -397,6 +421,14 @@ def replay_trajectory(
         )
         context_ids = prompt_ids + output_ids
         turn_ended = time.perf_counter()
+        l3_sync_wait_seconds = 0.0
+        if config.l3_sync_dir is not None:
+            l3_sync_wait_seconds = wait_for_decode_l3(
+                config.l3_sync_dir,
+                effective_request_id,
+                config.l3_sync_ranks,
+                config.l3_sync_timeout,
+            )
         flush_seconds = 0.0
         settle_seconds = 0.0
         cache_sync_wait_seconds = 0.0
@@ -426,6 +458,7 @@ def replay_trajectory(
         round_results[-1]["cache_flush_seconds"] = flush_seconds
         round_results[-1]["storage_settle_seconds"] = settle_seconds
         round_results[-1]["cache_sync_wait_seconds"] = cache_sync_wait_seconds
+        round_results[-1]["decode_l3_sync_wait_seconds"] = l3_sync_wait_seconds
         if config.storage_dirs:
             # The last turn has no following-request flush branch, but still
             # needs a short visibility delay before the final filesystem
@@ -604,7 +637,7 @@ def main() -> None:
         action="store_true",
         help=(
             "After each turn, POST Prefill /flush_cache to drop L1/L2 while "
-            "keeping Mooncake Store (paper DualPath buffer-release approx)."
+            "keeping the shared L3 files (historical control only)."
         ),
     )
     parser.add_argument(
@@ -617,7 +650,7 @@ def main() -> None:
         "--storage-settle-seconds",
         type=float,
         default=0.0,
-        help="Sleep after flush to let Decode→Mooncake Store publish become visible.",
+        help="Optional legacy sleep after a turn; exact Decode L3 sync is preferred.",
     )
     parser.add_argument(
         "--storage-dir",
@@ -625,10 +658,20 @@ def main() -> None:
         action="append",
         default=[],
         help=(
-            "Mooncake DFS directory to snapshot after each turn. Repeatable; "
+            "L3 file-backend directory to snapshot after each turn. Repeatable; "
             "records apparent and allocated bytes separately."
         ),
     )
+    parser.add_argument(
+        "--decode-l3-sync-dir",
+        type=Path,
+        help=(
+            "Shared directory containing per-request Decode L3 completion "
+            "markers; wait after every turn before issuing the next request."
+        ),
+    )
+    parser.add_argument("--decode-l3-sync-ranks", type=int, default=8)
+    parser.add_argument("--decode-l3-sync-timeout", type=float, default=600.0)
     args = parser.parse_args()
 
     if args.token_id_min < 0 or args.token_id_max <= args.token_id_min:
@@ -639,6 +682,10 @@ def main() -> None:
         )
     if args.storage_settle_seconds < 0:
         parser.error("--storage-settle-seconds must be >= 0")
+    if args.decode_l3_sync_ranks <= 0:
+        parser.error("--decode-l3-sync-ranks must be positive")
+    if args.decode_l3_sync_timeout <= 0:
+        parser.error("--decode-l3-sync-timeout must be positive")
     if args.paper_expand_agents:
         if args.trajectory_offset != 0:
             parser.error("--paper-expand-agents requires --trajectory-offset=0")
@@ -696,6 +743,9 @@ def main() -> None:
             else None
         ),
         storage_dirs=tuple(args.storage_dir),
+        l3_sync_dir=args.decode_l3_sync_dir,
+        l3_sync_ranks=args.decode_l3_sync_ranks,
+        l3_sync_timeout=args.decode_l3_sync_timeout,
     )
     start_event = threading.Event()
     all_rounds: list[dict[str, Any]] = []
@@ -788,6 +838,13 @@ def main() -> None:
     )
     summary["cache_sync_wait_seconds_total"] = sum(
         float(item.get("cache_sync_wait_seconds", 0.0)) for item in all_rounds
+    )
+    summary["decode_l3_sync_wait_seconds_total"] = sum(
+        float(item.get("decode_l3_sync_wait_seconds", 0.0))
+        for item in all_rounds
+    )
+    summary["decode_l3_sync_dir"] = (
+        str(config.l3_sync_dir) if config.l3_sync_dir is not None else None
     )
     summary["storage_snapshot_seconds_total"] = sum(
         float(item.get("storage_snapshot_seconds", 0.0)) for item in all_rounds

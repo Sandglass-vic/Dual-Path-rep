@@ -37,6 +37,11 @@ D_RECEIVE = re.compile(
     r"receive_end=(?P<end>[0-9.]+) "
     r"receive_wait_s=(?P<duration>[0-9.]+)"
 )
+D_HOST_STAGING = re.compile(
+    r"DUALPATH_TTFT_D_HOST_STAGING rid=(?P<rid>\S+) "
+    r"tp_rank=(?P<rank>\d+) h2d_start=(?P<start>[0-9.]+) "
+    r"h2d_end=(?P<end>[0-9.]+) h2d_s=(?P<duration>[0-9.]+)"
+)
 D_DISPATCH = re.compile(
     r"DUALPATH_TTFT_D_DISPATCH rid=(?P<rid>\S+) "
     r"dispatch_time=(?P<time>[0-9.]+) "
@@ -56,6 +61,7 @@ PREFILL_STAGES = (
     "pd_transfer_seconds",
 )
 ALL_STAGES = PREFILL_STAGES + (
+    "decode_host_to_device_seconds",
     "decode_dispatch_seconds",
     "sse_egress_seconds",
     "router_client_runtime_seconds",
@@ -86,6 +92,9 @@ def collect_logs(
     receive: dict[str, dict[str, list[float]]] = defaultdict(
         lambda: defaultdict(list)
     )
+    host_staging_ranks: dict[
+        str, dict[int, dict[str, list[float]]]
+    ] = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
     dispatch: dict[str, dict[str, list[float]]] = defaultdict(
         lambda: defaultdict(list)
     )
@@ -101,6 +110,7 @@ def collect_logs(
         elif path.name.startswith("decode-"):
             patterns = (
                 (D_RECEIVE, receive),
+                (D_HOST_STAGING, None),
                 (D_DISPATCH, dispatch),
                 (HTTP_YIELD, http),
             )
@@ -121,6 +131,11 @@ def collect_logs(
                     rank = int(groups.pop("rank"))
                     for name, value in groups.items():
                         l3_ranks[rid][(engine, rank)][name].append(float(value))
+                    break
+                if pattern is D_HOST_STAGING:
+                    rank = int(groups.pop("rank"))
+                    for name, value in groups.items():
+                        host_staging_ranks[rid][rank][name].append(float(value))
                     break
                 assert destination is not None
                 for name, value in groups.items():
@@ -152,11 +167,29 @@ def collect_logs(
             "rank": float(rank),
             "rank_count": float(len(reduced)),
         }
+    host_staging: dict[str, dict[str, float]] = {}
+    for rid, rank_values in host_staging_ranks.items():
+        reduced = {
+            rank: {
+                name: statistics.median(items)
+                for name, items in fields.items()
+            }
+            for rank, fields in rank_values.items()
+        }
+        slowest_rank, slowest = max(
+            reduced.items(), key=lambda item: item[1]["duration"]
+        )
+        host_staging[rid] = {
+            **slowest,
+            "rank": float(slowest_rank),
+            "rank_count": float(len(reduced)),
+        }
     return (
         median_fields(request),
         l3,
         median_fields(transfer),
         median_fields(receive),
+        host_staging,
         median_fields(dispatch),
         median_fields(http),
     )
@@ -226,7 +259,7 @@ def main() -> None:
 
     rounds = [json.loads(line) for line in args.rounds.read_text().splitlines()]
     logs = sorted(args.log_dir.glob(args.log_glob))
-    request, l3, transfer, receive, dispatch, http = collect_logs(logs)
+    request, l3, transfer, receive, host_staging, dispatch, http = collect_logs(logs)
     merged: list[dict[str, Any]] = []
 
     for round_item in rounds:
@@ -248,6 +281,7 @@ def main() -> None:
         stages = exclusive_prefill_stages(
             request[rid], l3.get(rid, {}), transfer[rid]
         )
+        decode_host_to_device = host_staging.get(rid, {}).get("duration", 0.0)
         decode_dispatch = max(
             0.0, dispatch[rid]["time"] - receive[rid]["end"]
         )
@@ -255,7 +289,12 @@ def main() -> None:
             value for name, value in http[rid].items() if name.startswith("yield")
         )
         sse_egress = max(0.0, http_yield_time - dispatch[rid]["time"])
-        known = sum(stages.values()) + decode_dispatch + sse_egress
+        known = (
+            sum(stages.values())
+            + decode_host_to_device
+            + decode_dispatch
+            + sse_egress
+        )
         ttft = float(round_item["ttft_seconds"])
         runtime_gap = max(0.0, ttft - known)
         overlap_excess = max(0.0, known - ttft)
@@ -269,6 +308,7 @@ def main() -> None:
             {
                 **round_item,
                 **stages,
+                "decode_host_to_device_seconds": decode_host_to_device,
                 "decode_dispatch_seconds": decode_dispatch,
                 "sse_egress_seconds": sse_egress,
                 "router_client_runtime_seconds": runtime_gap,
@@ -279,6 +319,14 @@ def main() -> None:
                 "decode_receive_wait_seconds_diagnostic": receive[rid][
                     "duration"
                 ],
+                "decode_host_to_device_slowest_tp_rank_diagnostic": (
+                    int(host_staging[rid]["rank"]) if rid in host_staging else -1
+                ),
+                "decode_host_to_device_tp_rank_count_diagnostic": (
+                    int(host_staging[rid]["rank_count"])
+                    if rid in host_staging
+                    else 0
+                ),
                 "decode_handler_to_yield_seconds_diagnostic": http[rid][
                     "duration"
                 ],
@@ -324,6 +372,7 @@ def main() -> None:
             "l3_read": sum(1 for item in merged if item["has_l3_read"]),
             "p_to_d_transfer": len(transfer),
             "decode_receive": len(receive),
+            "decode_host_staging": len(host_staging),
             "decode_dispatch": len(dispatch),
             "http_yield": len(http),
         },

@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
-# Shared helpers for formal 1P1D / 1P2D / 2P2D Mooncake Store benchmarks.
+# Shared helpers for formal 1P1D / 1P2D / 2P2D Mooncake PD benchmarks.
 # shellcheck disable=SC2034
 
 dualpath_export_common_env() {
   export ENABLE_BENCHMARK_TIMING=1
-  export HICACHE_STORAGE_BACKEND=mooncake
+  export HICACHE_STORAGE_BACKEND=file
   export MEM_FRACTION_STATIC=${MEM_FRACTION_STATIC:-0.55}
   export HICACHE_RATIO=${HICACHE_RATIO:-1.2}
+  export DECODE_HICACHE_RATIO=${DECODE_HICACHE_RATIO:-1.05}
   export CONTEXT_LENGTH=${CONTEXT_LENGTH:-65536}
   export MOONCAKE_PROTOCOL=${MOONCAKE_PROTOCOL:-rdma}
   export MOONCAKE_DEVICE=${MOONCAKE_DEVICE:-$IB_DEVICE}
-  export MOONCAKE_GLOBAL_SEGMENT_SIZE=${MOONCAKE_GLOBAL_SEGMENT_SIZE:-1536gb}
   # Mooncake defaults synchronous transfers to 30s. Long-context concurrent
   # PD batches can exceed that and permanently invalidate the RDMA session.
   export MC_TRANSFER_TIMEOUT=${MC_TRANSFER_TIMEOUT:-120}
@@ -19,24 +19,24 @@ dualpath_export_common_env() {
   export MOONCAKE_METADATA_PORT=${MOONCAKE_METADATA_PORT:-8080}
   export MOONCAKE_MASTER="$PREFILL_HOST:$MOONCAKE_MASTER_PORT"
   export MOONCAKE_TE_META_DATA_SERVER="http://$PREFILL_HOST:$MOONCAKE_METADATA_PORT/metadata"
-  export MOONCAKE_OFFLOAD_ENABLED=true
-  export MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR=distributed_storage_backend
-  export MOONCAKE_DFS_FS_ADAPTER=posix
-  export MOONCAKE_DFS_SHARD_COUNT=${MOONCAKE_DFS_SHARD_COUNT:-64}
-  export MOONCAKE_DFS_SHARD_CAPACITY=${MOONCAKE_DFS_SHARD_CAPACITY:-4294967296}
-  export MOONCAKE_DFS_ALIGNMENT=${MOONCAKE_DFS_ALIGNMENT:-4096}
-  export MOONCAKE_DFS_SINGLE_TENANT=true
-  export MOONCAKE_ENABLE_DFS=1
   # Release unlocked Prefill L1/L2 pages after the per-request PD ACK. This
   # preserves active shared prefixes without a stop-the-world /flush_cache.
   export DUALPATH_PREFILL_RELEASE_LOCAL_CACHE=${DUALPATH_PREFILL_RELEASE_LOCAL_CACHE:-1}
-  export PREFILL_HICACHE_READ_ONLY=${PREFILL_HICACHE_READ_ONLY:-0}
+  export PREFILL_HICACHE_READ_ONLY=${PREFILL_HICACHE_READ_ONLY:-1}
   export PREFILL_HICACHE_EVICT_UNLOCKED=${PREFILL_HICACHE_EVICT_UNLOCKED:-0}
-  export DUALPATH_PREFILL_BACKUP_TIMEOUT=${DUALPATH_PREFILL_BACKUP_TIMEOUT:-120}
+  # Retained in run metadata for compatibility; Prefill performs no backup and
+  # therefore never waits on this timeout.
+  export DUALPATH_PREFILL_BACKUP_TIMEOUT=${DUALPATH_PREFILL_BACKUP_TIMEOUT:-0}
   export PREFILL_HICACHE_WRITE_POLICY=${PREFILL_HICACHE_WRITE_POLICY:-write_through_selective}
+  # Prefill RDMA writes into a pinned Decode Host pool. Decode copies the
+  # completed request to HBM before exposing transfer success to scheduling.
+  export DUALPATH_DECODE_PD_HOST_STAGING=${DUALPATH_DECODE_PD_HOST_STAGING:-1}
+  export DUALPATH_DECODE_PD_HOST_STAGING_GB=${DUALPATH_DECODE_PD_HOST_STAGING_GB:-40}
   # Retained only as a historical/control switch; disabled for formal runs.
   export FLUSH_LOCAL_CACHE_BETWEEN_TURNS=${FLUSH_LOCAL_CACHE_BETWEEN_TURNS:-0}
-  export STORAGE_SETTLE_SECONDS=${STORAGE_SETTLE_SECONDS:-1}
+  export STORAGE_SETTLE_SECONDS=${STORAGE_SETTLE_SECONDS:-0}
+  export DUALPATH_DECODE_L3_SYNC_RANKS=${DUALPATH_DECODE_L3_SYNC_RANKS:-8}
+  export DUALPATH_DECODE_L3_SYNC_TIMEOUT=${DUALPATH_DECODE_L3_SYNC_TIMEOUT:-600}
   export COLLECT_L3_STORAGE_SNAPSHOT=${COLLECT_L3_STORAGE_SNAPSHOT:-1}
   export MODEL_DIR LOG_DIR CACHE_DIR IB_DEVICE PREFILL_PORT DECODE_PORT
   export BOOTSTRAP_PORT ROUTER_PORT SERVER_TIMEOUT
@@ -45,7 +45,10 @@ dualpath_export_common_env() {
   export PREFILL_HICACHE_EVICT_UNLOCKED
   export DUALPATH_PREFILL_BACKUP_TIMEOUT
   export PREFILL_HICACHE_WRITE_POLICY
+  export DUALPATH_DECODE_PD_HOST_STAGING
+  export DUALPATH_DECODE_PD_HOST_STAGING_GB DECODE_HICACHE_RATIO
   export FLUSH_LOCAL_CACHE_BETWEEN_TURNS STORAGE_SETTLE_SECONDS
+  export DUALPATH_DECODE_L3_SYNC_RANKS DUALPATH_DECODE_L3_SYNC_TIMEOUT
   export COLLECT_L3_STORAGE_SNAPSHOT
   export MOONCAKE_DEVICE
 }
@@ -117,9 +120,13 @@ dualpath_write_run_json() {
     "$DUALPATH_PREFILL_RELEASE_LOCAL_CACHE" \
     "$PREFILL_HICACHE_WRITE_POLICY" "$IB_DEVICE" \
     "$PREFILL_HICACHE_READ_ONLY" "$PREFILL_HICACHE_EVICT_UNLOCKED" \
-    "$DUALPATH_PREFILL_BACKUP_TIMEOUT" <<'PY'
+    "$DUALPATH_PREFILL_BACKUP_TIMEOUT" \
+    "$DUALPATH_DECODE_PD_HOST_STAGING" \
+    "$DUALPATH_DECODE_PD_HOST_STAGING_GB" \
+    "$DECODE_HICACHE_RATIO" <<'PY'
 from pathlib import Path
 import json
+import os
 import sys
 
 try:
@@ -143,7 +150,7 @@ Path(sys.argv[1]).write_text(json.dumps({
     "paper_synthetic_append_tokens": int(sys.argv[14]),
     "cache_policy": "paper-aligned-l3-reload",
     "cache_initial_state": "empty",
-    "storage_backend": "mooncake-dfs-posix-lustre",
+    "storage_backend": "sglang-file-posix-lustre",
     "artificial_inter_turn_delay": False,
     "per_turn_cache_flush": bool(int(sys.argv[15])),
     "storage_settle_seconds": float(sys.argv[16]),
@@ -157,12 +164,28 @@ Path(sys.argv[1]).write_text(json.dumps({
     "prefill_hicache_read_only": bool(int(sys.argv[23])),
     "prefill_hicache_evict_unlocked": bool(int(sys.argv[24])),
     "prefill_backup_timeout_seconds": float(sys.argv[25]),
+    "decode_pd_host_staging": bool(int(sys.argv[26])),
+    "decode_pd_host_staging_pool": "dedicated_pinned_host_pool",
+    "decode_pd_host_staging_gb_per_rank": float(sys.argv[27]),
+    "decode_hicache_ratio": float(sys.argv[28]),
+    "decode_l3_completion_sync": bool(
+        os.environ.get("DUALPATH_DECODE_L3_SYNC_DIR")
+    ),
+    "decode_l3_completion_sync_ranks": int(
+        os.environ.get("DUALPATH_DECODE_L3_SYNC_RANKS", "8")
+    ),
+    "decode_l3_completion_sync_timeout_seconds": float(
+        os.environ.get("DUALPATH_DECODE_L3_SYNC_TIMEOUT", "600")
+    ),
     "l3_storage_snapshot_kind": "recursive apparent bytes and st_blocks allocated bytes",
     "kv_buffer_semantics": (
         "DualPath paper: staging/GPU buffers released after each request; "
         "cross-turn reuse via L3 only. SGLang approximation: after successful "
         "PD ACK, release the request lock and evict unlocked Prefill L1/L2 "
-        "radix pages; Mooncake Store is retained."
+        "radix pages without Prefill offload or backup wait. P-to-D RDMA targets "
+        "a bounded pinned Decode Host staging pool; Decode copies those pages to "
+        "HBM, then publishes newly computed KV after the cached_tokens boundary "
+        "through a separate HiCache Host pool to Lustre file storage."
     ),
 }, indent=2) + "\n")
 PY
@@ -219,6 +242,7 @@ dualpath_run_replay() {
   local turn_args=()
   local flush_args=()
   local storage_args=()
+  local sync_args=()
   local host
   if (( MAX_TURNS > 0 )); then
     turn_args+=(--max-turns "$MAX_TURNS")
@@ -246,10 +270,17 @@ dualpath_run_replay() {
     echo "FLUSH_LOCAL_CACHE_BETWEEN_TURNS must be 0 or 1" >&2
     return 2
   fi
-  flush_args+=(--storage-settle-seconds "${STORAGE_SETTLE_SECONDS:-1}")
+  flush_args+=(--storage-settle-seconds "${STORAGE_SETTLE_SECONDS:-0}")
+  if [[ -n ${DUALPATH_DECODE_L3_SYNC_DIR:-} ]]; then
+    sync_args+=(
+      --decode-l3-sync-dir "$DUALPATH_DECODE_L3_SYNC_DIR"
+      --decode-l3-sync-ranks "${DUALPATH_DECODE_L3_SYNC_RANKS:-8}"
+      --decode-l3-sync-timeout "${DUALPATH_DECODE_L3_SYNC_TIMEOUT:-600}"
+    )
+  fi
   if [[ "${COLLECT_L3_STORAGE_SNAPSHOT:-1}" == 1 ]]; then
-    : "${MOONCAKE_DFS_ROOT_DIR:?MOONCAKE_DFS_ROOT_DIR is required for L3 snapshots}"
-    storage_args+=(--storage-dir "$MOONCAKE_DFS_ROOT_DIR")
+    : "${L3_STORAGE_DIR:?L3_STORAGE_DIR is required for L3 snapshots}"
+    storage_args+=(--storage-dir "$L3_STORAGE_DIR")
   elif [[ "${COLLECT_L3_STORAGE_SNAPSHOT:-1}" != 0 ]]; then
     echo "COLLECT_L3_STORAGE_SNAPSHOT must be 0 or 1" >&2
     return 2
@@ -267,6 +298,7 @@ dualpath_run_replay() {
     --request-id-prefix "$prefix" \
     "${paper_args[@]}" \
     "${flush_args[@]}" \
+    "${sync_args[@]}" \
     "${storage_args[@]}" \
     --stream
 }

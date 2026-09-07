@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# Minimal TP8 1P1D smoke test for Mooncake PD over eight DGX H100 HCAs.
-# HiCache L3 and Decode offload are disabled so only the PD path is exercised.
+# Minimal TP8 1P1D smoke for file L3 plus dedicated Decode PD Host staging.
 #SBATCH --job-name=smoke-1p1d-pd-8nic
 #SBATCH --partition=GAIA
 #SBATCH --nodes=2
@@ -24,7 +23,7 @@ export AGENT_COUNTS=${AGENT_COUNTS:-1}
 export REPETITIONS=1
 export MAX_TURNS=${MAX_TURNS:-2}
 export PAPER_EXPAND_AGENTS=1
-export ABLATION_PROFILE=no-l3
+export ABLATION_PROFILE=full
 export SERVER_SELECTION_TIMEOUT=${SERVER_SELECTION_TIMEOUT:-120}
 
 bash "$CODE_HOME/scripts/pd_1p1d_benchmark.sbatch"
@@ -72,7 +71,15 @@ if "DUALPATH_TTFT_P_TRANSFER_V2" not in prefill_text:
     raise SystemExit("Prefill PD transfer timing marker is missing")
 if "DUALPATH_TTFT_D_RECEIVE" not in decode_text:
     raise SystemExit("Decode PD receive timing marker is missing")
+if "DUALPATH_DECODE_PD_HOST_STAGING" not in decode_text:
+    raise SystemExit("Decode Host staging allocation marker is missing")
+if "DUALPATH_DECODE_L3_SYNC_COMPLETE" not in decode_text:
+    raise SystemExit("Decode L3 completion sync marker is missing")
+if decode_text.count("DUALPATH_TTFT_D_HOST_STAGING") < 8:
+    raise SystemExit("Decode Host-to-GPU timing is missing TP-rank coverage")
+if decode_text.count("DUALPATH_DECODE_HOST_STAGING_COPY") < 8:
+    raise SystemExit("Decode Host-to-GPU copy completion marker is missing")
 
-print("PASS: TP8 1P1D Mooncake PD initialized and used all eight HCAs")
+print("PASS: TP8 1P1D Mooncake PD used all HCAs and Decode Host staging")
 print("HCAs:", ",".join(devices))
 PY

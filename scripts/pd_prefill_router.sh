@@ -8,7 +8,7 @@ set -euo pipefail
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=scripts/pd_network_config.sh
 source "$SCRIPT_DIR/pd_network_config.sh"
-export DUALPATH_HICACHE_READ_ONLY=${PREFILL_HICACHE_READ_ONLY:-0}
+export DUALPATH_HICACHE_READ_ONLY=${PREFILL_HICACHE_READ_ONLY:-1}
 export DUALPATH_HICACHE_EVICT_UNLOCKED=${PREFILL_HICACHE_EVICT_UNLOCKED:-0}
 
 if [[ -z ${PREFILL_HOSTS:-} ]]; then
@@ -136,8 +136,6 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 if [[ ${START_MOONCAKE_MASTER:-0} == 1 ]]; then
-  : "${MOONCAKE_DFS_ROOT_DIR:?MOONCAKE_DFS_ROOT_DIR is required}"
-  mkdir -p "$MOONCAKE_DFS_ROOT_DIR"
   echo "Starting Mooncake master on $PREFILL_HOST"
   mooncake_master \
     --rpc_address=0.0.0.0 \

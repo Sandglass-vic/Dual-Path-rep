@@ -13,7 +13,7 @@ set -euo pipefail
 
 CODE_HOME=${CODE_HOME:-/labhome/sezhou/dual-path}
 RUNTIME_HOME=${RUNTIME_HOME:-/mnt/lustre/users/sezhou/dual-path}
-IMAGE=${IMAGE:-$RUNTIME_HOME/images/sglang:26.01-py3-mooncake0.3.13.post1-timing-v2.sqsh}
+IMAGE=${IMAGE:-$RUNTIME_HOME/images/sglang:26.01-py3-mooncake0.3.13.post1-decode-offload-v4.sqsh}
 TEST_DIR=${TEST_DIR:-$RUNTIME_HOME/kv-cache/mooncake-store-smoke/$SLURM_JOB_ID}
 LOG_DIR=${LOG_DIR:-$RUNTIME_HOME/logs/mooncake-store-smoke/$SLURM_JOB_ID}
 MASTER_PORT=${MASTER_PORT:-50051}

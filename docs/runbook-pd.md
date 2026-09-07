@@ -11,6 +11,10 @@
 `26.01-py3.sqsh` 虽然暴露 Mooncake 参数，但未安装 `mooncake` 与
 `sglang_router`，不能直接完成 PD。
 
+开发中的 patch 必须先使用 Job/commit 专属候选镜像完成本节最小测试，再发布为
+正式镜像；不得让未验证候选覆盖 benchmark 默认路径。具体流程见
+[Patch 验证与正式发布流程](containers.md#patch-验证与正式发布流程)。
+
 2026-08-31 已先完成同节点功能验证：
 
 ```text
@@ -34,7 +38,7 @@ context length：4096
 
 ```bash
 srun --nodes=1 --ntasks=1 --gres=gpu:8 \
-  --container-image="$IMAGE_DIR/sglang:26.01-py3-mooncake0.3.13.post1-timing-v2.sqsh" \
+  --container-image="$IMAGE_DIR/sglang:26.01-py3-mooncake0.3.13.post1-file-l3-dual-staging-v1.sqsh" \
   --container-mounts="/mnt/lustre:/mnt/lustre,$CODE_HOME:/workspace/dual-path" \
   --container-workdir=/workspace/dual-path \
   --no-container-mount-home \
@@ -315,7 +319,7 @@ export DECODE1_HOST=${HOSTS[2]}
 
 # 对三个服务分别使用以下 srun 骨架；ROLE_CMD 替换为上面的 Prefill/Decode 命令。
 srun --nodes=1 --ntasks=1 --nodelist="<host>" --gres=gpu:8 \
-  --container-image="$IMAGE_DIR/sglang:26.01-py3-mooncake0.3.13.post1-timing-v2.sqsh" \
+  --container-image="$IMAGE_DIR/sglang:26.01-py3-mooncake0.3.13.post1-file-l3-dual-staging-v1.sqsh" \
   --container-mounts="/mnt/lustre:/mnt/lustre,$CODE_HOME:/workspace/dual-path" \
   --container-workdir=/workspace/dual-path \
   --no-container-mount-home \
@@ -357,6 +361,12 @@ Router: 与 Prefill 同节点，绑定少量 CPU
 - Lustre 使用 `mlx5_1/7` storage rails，实际选择由 LNet 决定；
 - 正式 PD transfer 按 GPU/TP rank 一一使用
   `mlx5_0,3,4,5,6,9,10,11` 八条 compute-fabric HCA；
+- Prefill RDMA 的 Decode 目标是独立的每 rank 40 GB pinned Host staging
+  pool；Mooncake completion 后，Decode 按 request page 执行 Host→HBM，
+  归还 staging pages，并在 H2D 完成后才返回 transfer success；后续 Decode
+  D2H→Lustre 使用另一套 HiCache Host pool；
+- Prefill 仅从 L3 读取，PD completion 后立即释放 L1/L2；Decode 根据
+  `cached_tokens` 边界持久化 Prefill 新算 KV 与 Decode KV；
 - Router 不占 GPU；
 - 指标采集进程限制 CPU，避免影响 SGLang。
 

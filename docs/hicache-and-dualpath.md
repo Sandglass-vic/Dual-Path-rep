@@ -26,9 +26,20 @@ L3：Mooncake Store，负责跨轮次前缀复用
 2. Prefill 本地 L1/L2 无上一轮前缀（上一 request 的未锁定 page 已释放）→ 查询 L3。
 3. L3 将命中的 Full Blocks 加载到 Prefill staging → GPU。
 4. Prefill 只计算 append/cache-miss tokens 的 KV。
-5. Prefill 将“L3 命中的 KV + 新计算的 KV”组成完整 prompt KV，P→D 传给 Decode。
-6. Decode 生成并写回 L3；本 request 的 staging/GPU 缓冲随后释放。
+5. Prefill 将“L3 命中的 KV + 新计算的 KV”组成完整 prompt KV，通过 RDMA 写入
+   Decode 独立的 pinned Host staging pool。
+6. Decode 收到 PD completion 后把对应 pages 从 Host 搬到 HBM；八个 TP rank
+   完成共识后才进入 PREBUILT/decode。
+7. Decode 生成后经另一套 HiCache Host pool 写回 Lustre L3；本 request 的
+   GPU/Host pages 按各自完成事件释放。
 ```
+
+当前实现保留两套 Host pool：PD staging 固定为每 rank 40 GB、`layer_first`，
+H2D 完成后立即归还；Decode D2H→L3 offload 使用独立的
+`page_first_direct` HiCache Host pool。启用时，
+`DecodeKVCacheOffloadManager` 先释放本轮已从 L3 恢复的 prefix HBM pages，
+将其后的 Prefill 新算 KV 与 Decode KV 完成 D2H 后释放其余 request HBM pages；
+Host→L3 backup 完成后再释放 Decode offload pool 中的 Host pages。
 
 ### SGLang 近似实现
 
@@ -37,11 +48,11 @@ SGLang HiCache **无法**关闭 L2 pool（`--hicache-size 0` 仍按 ratio 分配
 
 1. SGLang 原生在 Prefill PD `KVPoll.Success` 后执行
    `release_kv_cache(req, tree_cache)`，解除当前 request 的 radix lock；
-2. Prefill 保留异步 write-through backup，把 page-aligned prompt 发布到 L3；
-3. 若 backup lock 尚未释放，PD ACK 清理阶段推进并等待 Prefill backup 发布
-   到 L3，随后驱逐所有 `lock_ref=0` 的 L1/L2 page；其他活跃 request 共享的
-   prefix 仍受引用计数保护；
-4. **不**清 Mooncake Store；Decode 继续负责完整上下文 offload；
+2. Prefill 为 read-only，不执行 D2H/Host→L3 backup；PD ACK 后立即驱逐所有
+   `lock_ref=0` 的 L1/L2 page；
+3. Decode 从 Prefill 传来的 `cached_tokens` 边界开始 offload，负责持久化本轮
+   新计算的全部 KV；
+4. **不**清 Mooncake Store；
 5. `STORAGE_SETTLE_SECONDS`（默认 1s）只等待 Decode→Store 对下一 turn 可见，
    不计入 `turn_wall_seconds` / `trajectory_jct`。
 
@@ -49,23 +60,21 @@ SGLang HiCache **无法**关闭 L2 pool（`--hicache-size 0` 仍按 ratio 分配
 
 ```bash
 DUALPATH_PREFILL_RELEASE_LOCAL_CACHE=1
-PREFILL_HICACHE_READ_ONLY=0
+PREFILL_HICACHE_READ_ONLY=1
 PREFILL_HICACHE_EVICT_UNLOCKED=0
 PREFILL_HICACHE_WRITE_POLICY=write_through_selective
-DUALPATH_PREFILL_BACKUP_TIMEOUT=120
+DUALPATH_PREFILL_BACKUP_TIMEOUT=0
+DUALPATH_DECODE_PD_HOST_STAGING=1
+DUALPATH_DECODE_PD_HOST_STAGING_GB=40
+DECODE_HICACHE_RATIO=1.05
 FLUSH_LOCAL_CACHE_BETWEEN_TURNS=0
-STORAGE_SETTLE_SECONDS=1
+STORAGE_SETTLE_SECONDS=0
 ```
 
-`PREFILL_HICACHE_READ_ONLY=1` 仅保留为诊断开关。Job `66572` 证明它虽能真正
-清空 Prefill L1/L2，却会破坏 SGLang 0.5.7 的持久化分工：Decode offload 只写
-增量 KV，并假定 page-aligned prompt 已由 Prefill 发布，因此正式路径必须保持
-该开关为 `0`。
-
-最终正确性 Job `66581`（1P1D、32K、1 agent、4 turns、8 HCA）完成：
-request/PD/release coverage 均为 100%，release 前最多 6976 tokens、release
-后为 0；turn 2–4 的 `cached_tokens` 与 `l3_read_tokens` 分别严格相等为
-1856、3840、5696，证明跨 turn 命中全部来自 L3，而非残留 Prefill L1/L2。
+最终正确性 Job `66987`（1P1D、32K、1 agent、2 turns、8 HCA）完成：
+request/PD/release coverage 均为 100%，release 后为 0。turn 1 Decode 从 0
+开始发布 1856 tokens；turn 2 Prefill 从 L3 恢复 1856 tokens，Decode 再从
+1856 开始发布 1984 个新 tokens，证明 Prefill 不写 L3 时闭环仍成立。
 
 Job `65694` 未 flush，prefix hit 来自 L1/L2，`l3_timing_coverage=0`，**不得**
 当作论文 L3 路径结果。
@@ -162,24 +171,21 @@ SGLang 侧使用 `MOONCAKE_MASTER=<master-host>:50051` 和
 `--hicache-storage-backend mooncake`。Decode 要发布新生成 KV 时增加
 `--disaggregation-decode-enable-offload-kvcache`。
 
-正式 backend 已从 SGLang `file` 切换为 Mooncake `0.3.13.post1` 的
-descriptor-based DFS：
+当前正式 HiCache backend 使用 SGLang `file` 直接访问共享 Lustre：
 
 ```text
-MOONCAKE_DFS_FS_ADAPTER=posix
-MOONCAKE_DFS_ROOT_DIR=<job-specific Lustre path>
-MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR=distributed_storage_backend
-replica_num=1
-dfs_replica_num=1
+HICACHE_STORAGE_BACKEND=file
+SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR=<job-specific Lustre path>
 ```
 
-`MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` 仍是 FileStorage 初始化必填项，但实际 DFS
-数据写入 `MOONCAKE_DFS_ROOT_DIR`。完整配置和 Job `65548` 跨节点验证见
+Mooncake `0.3.13.post1` 仅保留为 P→D Transfer Engine。为避免旧 file backend
+在异步写入期间被下一 turn 读取，每个 Decode TP rank 在 request 的 L3 backup
+完成后发布 marker，replay 等齐 8 个 marker 后才允许同一 trajectory 进入下一
+turn。Mooncake Store/descriptor-based DFS 仅保留为历史验证，见
 [Mooncake Store 与 Lustre POSIX DFS](mooncake-store.md)。
 
-以下 `file` backend 只保留为历史最小正确性基线，不再用于正式性能实验：
-
-最小 L3 正确性验证可以先使用 `file` backend 并把目录指向 Lustre。注意该配置仍会创建 SGLang 强制要求的 L2；它只用于证明 L3 hit 数据流：
+正式与最小 L3 验证均把 `file` backend 目录指向 Lustre。注意该配置仍会创建
+SGLang 强制要求的 L2：
 
 ```bash
 export SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR="$CACHE_DIR/file-backend"
@@ -198,9 +204,8 @@ python -m sglang.launch_server \
   --hicache-storage-prefetch-policy wait_complete
 ```
 
-旧 `file` backend 直接覆盖 `.bin`，共享 Lustre 上曾发生并发 `Short read`。
-Mooncake Store 通过 `PutStart/PutEnd` 在完整对象写完后发布 metadata，已替代
-Populate/Measured 与 scratch 目录规避方案。
+`file` backend 直接覆盖 `.bin`，因此必须保留逐 request Decode backup
+completion 屏障；不能仅依赖文件存在或固定 sleep 判断可读。
 
 Decode 侧还需启用当前版本对应的异步 offload 参数（官方新版本示例为 `--disaggregation-decode-enable-offload-kvcache`），使每轮新 KV 落入 L3；Prefill 侧启用 HiCache，从 L3 恢复前缀。以 `--help` 的实际参数名为准。
 

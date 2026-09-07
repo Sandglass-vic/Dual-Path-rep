@@ -2,6 +2,11 @@
 
 > 返回 [文档索引](README.md)。
 
+> **历史方案**：当前正式 HiCache L3 已切回共享 Lustre `file` backend，并用
+> request-scoped Decode completion barrier 防止下一 turn 读到半写文件。
+> Mooncake `0.3.13.post1` 当前仅用于 P→D Transfer Engine；本页保留此前
+> Mooncake Store/descriptor-based DFS 的实现与实验记录。
+
 ## 版本选择
 
 正式镜像固定 `mooncake-transfer-engine-cuda13==0.3.13.post1`。
@@ -13,9 +18,9 @@
 - `0.3.9` 只是早期 PD Transfer Engine 验证时可用的首个 CUDA 13 wheel，
   没有继续固定它的兼容性理由。
 
-当前 SGLang `0.5.7+nv26.1` 的 Mooncake backend 不会把
+历史派生镜像中，SGLang `0.5.7+nv26.1` 的 Mooncake backend 不会把
 `dfs_replica_num` 传入 `batch_put_from`。上游 SGLang PR `#37390` 截至
-2026-09-03 仍未合入，因此派生镜像包含一个针对当前旧 backend 的最小回移：
+2026-09-03 仍未合入，因此 v4 派生镜像包含一个针对旧 backend 的最小回移：
 
 ```text
 replica_num=1
@@ -29,15 +34,14 @@ Lustre DFS。
 
 ## 数据与一致性语义
 
-当前配置中每个 HiCache 对象有：
+历史 Mooncake Store 配置中每个 HiCache 对象有：
 
 1. 一个 Mooncake memory replica；
 2. 一个 descriptor-based DFS replica，位于共享 Lustre shard。
 
-正式 SGL(MC) 对照默认设置 `MOONCAKE_GLOBAL_SEGMENT_SIZE=1536gb`/node，对齐论文
-§A.4 的每节点 1.5 TiB Mooncake DRAM 配置；最小 smoke 为缩短启动时间显式覆盖为
-32 GiB。SGLang HiCache 自身还会分配 host pool，正式大规模运行前必须检查总
-DRAM 余量并记录实际 allocation，不能把 smoke 的 32 GiB 结果当性能配置。
+该历史方案使用 Mooncake global segment；当前 file backend 不创建 Store memory
+replica/global segment。Decode 仍保留独立的 40 GB/rank P→D staging pool 和
+另一套 HiCache offload Host pool。
 
 Mooncake master 分配 `(shard, offset, object_size)`，客户端通过 POSIX
 `WriteAt/ReadAt` 访问相同的 Lustre shard。对象只在成功 `PutEnd` 后对查询可见，
@@ -48,10 +52,9 @@ Store key 是 token-prefix 派生的内容键，而不是 agent ID。不同 agen
 创建目录：不同内容自然得到不同 key，相同内容可安全去重。实验间则使用独立 DFS
 root 和新 master，避免跨 run 污染。
 
-## 正式性能语义
+## 历史性能语义
 
-`scripts/pd_1p1d_benchmark.sbatch` / `pd_1p2d_benchmark.sbatch` /
-`pd_2p2d_benchmark.sbatch`：
+以下是切换到 file backend 前的行为：
 
 - 单次 rollout 内 Decode 持续 Put；Prefill 在每次 PD ACK 后逐请求释放未锁定的
   L1/L2 page，下一 turn 从 Store Get；

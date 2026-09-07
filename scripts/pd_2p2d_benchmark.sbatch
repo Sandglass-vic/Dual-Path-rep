@@ -16,7 +16,7 @@ set -euo pipefail
 
 CODE_HOME=${CODE_HOME:-/labhome/sezhou/dual-path}
 RUNTIME_HOME=${RUNTIME_HOME:-/mnt/lustre/users/sezhou/dual-path}
-IMAGE=${IMAGE:-$RUNTIME_HOME/images/sglang:26.01-py3-mooncake0.3.13.post1-timing-v2.sqsh}
+IMAGE=${IMAGE:-$RUNTIME_HOME/images/sglang:26.01-py3-mooncake0.3.13.post1-file-l3-dual-staging-v1.sqsh}
 # shellcheck source=scripts/pd_network_config.sh
 source "$CODE_HOME/scripts/pd_network_config.sh"
 MODEL_DIR=${MODEL_DIR:-$RUNTIME_HOME/models/Qwen2.5-32B}
@@ -91,43 +91,43 @@ launch_cluster() {
   if [[ "$MEASURED_PREFILL_L3" == 0 && "$MEASURED_DECODE_OFFLOAD" == 0 ]]; then
     start_mooncake_master=0
   fi
-  export MOONCAKE_DFS_ROOT_DIR="$run_cache_dir/dfs"
-  export MOONCAKE_OFFLOAD_FILE_STORAGE_PATH="$run_cache_dir/client-init/prefill-0"
-  mkdir -p "$MOONCAKE_DFS_ROOT_DIR" \
-    "$run_cache_dir/client-init/prefill-0" \
-    "$run_cache_dir/client-init/prefill-1"
+  export L3_STORAGE_DIR="$run_cache_dir/file"
+  export DUALPATH_DECODE_L3_SYNC_DIR="$run_cache_dir/l3-sync"
+  mkdir -p "$L3_STORAGE_DIR" "$DUALPATH_DECODE_L3_SYNC_DIR"
   touch "$run_cache_dir/.dual-path-run-cache-$SLURM_JOB_ID"
   export RUN_ID=$run_id
 
   dualpath_container_srun "$PREFILL0_HOST" \
     env ENABLE_HICACHE_L3="$MEASURED_PREFILL_L3" \
+      CACHE_DIR="$L3_STORAGE_DIR" \
       START_MOONCAKE_MASTER="$start_mooncake_master" \
       PREFILL_ID=0 PREFILL_HOST="$PREFILL0_HOST" \
-      MOONCAKE_OFFLOAD_FILE_STORAGE_PATH="$run_cache_dir/client-init/prefill-0" \
       bash scripts/pd_prefill_router.sh &
   step_pids+=("$!")
   prefill0_step_pid=$!
 
   dualpath_container_srun "$PREFILL1_HOST" \
     env ENABLE_HICACHE_L3="$MEASURED_PREFILL_L3" \
+      CACHE_DIR="$L3_STORAGE_DIR" \
       PREFILL_ID=1 PREFILL_HOST="$PREFILL1_HOST" \
-      MOONCAKE_OFFLOAD_FILE_STORAGE_PATH="$run_cache_dir/client-init/prefill-1" \
       bash scripts/pd_prefill.sh &
   step_pids+=("$!")
   prefill1_step_pid=$!
 
   dualpath_container_srun "$DECODE0_HOST" \
     env ENABLE_HICACHE_L3="$MEASURED_DECODE_OFFLOAD" \
+      CACHE_DIR="$L3_STORAGE_DIR" \
+      DUALPATH_DECODE_L3_SYNC_DIR="$DUALPATH_DECODE_L3_SYNC_DIR" \
       DECODE_OFFLOAD_KVCACHE="$MEASURED_DECODE_OFFLOAD" \
-      MOONCAKE_OFFLOAD_FILE_STORAGE_PATH="$run_cache_dir/client-init/decode-0" \
       DECODE_ID=0 DECODE_HOST="$DECODE0_HOST" bash scripts/pd_decode.sh &
   step_pids+=("$!")
   decode0_step_pid=$!
 
   dualpath_container_srun "$DECODE1_HOST" \
     env ENABLE_HICACHE_L3="$MEASURED_DECODE_OFFLOAD" \
+      CACHE_DIR="$L3_STORAGE_DIR" \
+      DUALPATH_DECODE_L3_SYNC_DIR="$DUALPATH_DECODE_L3_SYNC_DIR" \
       DECODE_OFFLOAD_KVCACHE="$MEASURED_DECODE_OFFLOAD" \
-      MOONCAKE_OFFLOAD_FILE_STORAGE_PATH="$run_cache_dir/client-init/decode-1" \
       DECODE_ID=1 DECODE_HOST="$DECODE1_HOST" bash scripts/pd_decode.sh &
   step_pids+=("$!")
   decode1_step_pid=$!

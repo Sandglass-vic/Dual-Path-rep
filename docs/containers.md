@@ -70,16 +70,28 @@ Router：sglang-router 0.3.1（sgl-model-gateway 0.3.1）
 GPU：NVIDIA H100 80GB HBM3
 ```
 
-派生镜像：
+当前正式派生镜像：
 
 ```text
-/mnt/lustre/users/sezhou/dual-path/images/sglang:26.01-py3-mooncake0.3.13.post1-timing-v2.sqsh
-最终构建 Job：66579，COMPLETED，ExitCode=0:0
-SHA-256：3cad9bcca9d58df81ff976ae1dbc2cba381cba2638f44744bdf891dcf56ad914
+/mnt/lustre/users/sezhou/dual-path/images/sglang:26.01-py3-mooncake0.3.13.post1-file-l3-dual-staging-v1.sqsh
+候选构建 Job：67193，COMPLETED，ExitCode=0:0
+TP8 1P1D smoke Job：67234，COMPLETED，ExitCode=0:0
+正式默认配置 smoke Job：67246，COMPLETED，ExitCode=0:0
+正式发布 Job：67243，COMPLETED，ExitCode=0:0
+SHA-256：5274263decb923c869b594efef573a2d1f87313538c22caf01cc2ca8470dff1d
 ```
 
-镜像目录只保留上述最终派生版和最初基础版；Mooncake `0.3.9`、旧 timing 与
-未修正 L3 timing 的中间镜像均已删除。
+该镜像使用两个独立 Host pool：40 GB/rank 的 `layer_first` Decode PD pinned
+staging，以及由 `DECODE_HICACHE_RATIO` 控制的 `page_first_direct` Decode
+HiCache Host pool。HiCache L3 使用 Lustre file backend；Mooncake 仅负责 P→D
+Transfer Engine，不使用 Mooncake Store/global segment。
+
+候选 `shared-host-v5`（构建 Job `67084`，SHA-256
+`bdeae5df...6237f2`）尝试让 P→D staging 与 Decode D2H→L3 offload 共用
+HiCache Host pool，但动态 Job `67086` 发现 Mooncake Store 会把请求的
+`layer_first` 自动改回 `page_first_direct`，因此候选未通过、不得用于正式
+benchmark。Mooncake `0.3.9`、旧 timing、共享池候选与未修正 L3 timing 的
+更早中间镜像均不得用于正式实验。
 
 实际构建入口：
 
@@ -87,12 +99,42 @@ SHA-256：3cad9bcca9d58df81ff976ae1dbc2cba381cba2638f44744bdf891dcf56ad914
 sbatch scripts/infra/build_benchmark_timing_image.sbatch
 ```
 
+### Patch 验证与正式发布流程
+
+新的 SGLang/Mooncake patch 不应直接覆盖正式镜像。推荐使用三阶段流程：
+
+1. 从最后一个稳定镜像或基础镜像创建 writable Enroot container，应用 patch；
+2. 导出到 Job/commit 专属的临时候选镜像，并用该镜像执行多节点 smoke；
+3. 仅在 smoke 成功后，原子重命名为正式镜像并更新 SHA-256、Job ID 和 benchmark
+   默认路径；失败时删除候选镜像，保留原正式版本。
+
+`build_benchmark_timing_image.sbatch` 支持通过 `OUTPUT_IMAGE` 指向候选路径：
+
+```bash
+candidate="$RUNTIME_HOME/images/candidates/sglang-shared-host-${USER}-$(date +%s).sqsh"
+build_job=$(
+  sbatch --parsable \
+    --export=ALL,OUTPUT_IMAGE="$candidate" \
+    scripts/infra/build_benchmark_timing_image.sbatch
+)
+
+# build 成功后，smoke 提交时显式覆盖 IMAGE="$candidate"。
+# smoke 验收通过后再执行同一 Lustre 文件系统内的原子 mv：
+mv -- "$candidate" "$RUNTIME_HOME/images/<正式镜像名>.sqsh"
+sha256sum "$RUNTIME_HOME/images/<正式镜像名>.sqsh"
+```
+
+候选镜像必须位于所有测试节点可见的 Lustre 路径。完全不导出 sqsh、直接修改
+每个 Pyxis runtime root 虽然可行，但多节点需要分别应用 patch，容易出现节点间
+源码不一致，因此不作为正式验证方式。候选镜像不是正式发布物，不得写入 benchmark
+默认值；测试失败或取消后应自动清理。
+
 该脚本从未修改的 `sglang:26.01-py3.sqsh` 创建 writable Enroot container，
-安装固定 wheel 与 Router，依次运行
-`scripts/infra/patch_sglang_mooncake_dfs.py`、
-`scripts/infra/patch_sglang_benchmark_timing.py`，执行
-import/API/source compile 断言后导出新 sqsh。重新运行会覆盖同名输出镜像，
-因此正式实验必须记录 SHA-256。
+安装固定 Mooncake Transfer Engine wheel 与 Router，运行
+`scripts/infra/patch_sglang_benchmark_timing.py`，执行 import/API/source compile
+断言后导出 Job 专属候选 sqsh。脚本不再注入 Mooncake Store DFS backport，且
+默认输出也位于 `images/candidates/`；正式实验必须经过 smoke、原子发布并记录
+SHA-256。
 
 基础镜像执行 `pip check` 会报告 `triton-kernels` 缺少 `pytest`。这是基础镜像已有的开发/测试依赖缺口，不是 Mooncake 安装造成的运行依赖冲突，因此未为了消除该提示修改推理环境。
 
@@ -111,7 +153,20 @@ timing 埋点。前两项上游对应功能分别为 SGLang PR `#37390` 与 `#32
 - SGLang Mooncake PD 参数检查；
 - `ReplicateConfig.dfs_replica_num` API 与 SGLang backport 静态检查；
 - Mooncake Store 跨节点 Lustre DFS 写后读（Job `65548`）；
-- Qwen2.5-32B 1P1D HiCache/PD/DFS 动态 4-turn smoke（Job `65557`）。
+- Qwen2.5-32B 1P1D HiCache/PD/DFS 动态 4-turn smoke（Job `65557`）；
+- Qwen2.5-32B 1P1D TP8、8-HCA Decode Host staging 2-turn smoke
+  （Job `66924`）：Prefill RDMA → Decode pinned Host → HBM，16/16
+  request/rank timing markers 完整；
+- Qwen2.5-32B 1P1D、32K、1-agent、2-turn Decode-owned offload
+  （Job `66987`）：Prefill read-only/立即释放，Decode 从 `cached_tokens`
+  边界发布新 KV，第二轮 L3 恢复成功。
+- Qwen2.5-32B 1P1D、32K、1-agent、2-turn file L3 与双 Host pool smoke
+  （Job `67234`）：8 张 HCA 均初始化，PD Host staging 的 TP8 H2D marker
+  完整；两轮 Decode file backup 均在 ACK 后生成 8/8 rank 原子 marker，
+  `source=file_backend` 且路径位于 run-specific `l3-sync`。
+- 使用正式默认镜像并移除 Store-only DFS/global-segment 环境后的同配置 smoke
+  （Job `67246`）再次通过，确认 Mooncake master 仅承担 P→D Transfer Engine
+  metadata 服务时数据流正常。
 
 若后续多节点 RDMA 或 HiCache Store smoke 失败：
 

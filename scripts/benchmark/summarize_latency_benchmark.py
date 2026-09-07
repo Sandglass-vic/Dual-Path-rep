@@ -488,11 +488,6 @@ def main() -> None:
         and validation["prefill_evictable_after_release_max"] != 0
     ):
         raise RuntimeError(f"Incomplete Prefill cache eviction: {validation}")
-    if (
-        expects_prefill_release
-        and validation["prefill_evictable_before_release_max"] == 0
-    ):
-        raise RuntimeError(f"Prefill cache release evicted no pages: {validation}")
     if expects_l3_reuse and validation["l3_timing_coverage"] == 0:
         raise RuntimeError(f"Expected cross-turn L3 reuse was not observed: {validation}")
     print(json.dumps(validation, indent=2))

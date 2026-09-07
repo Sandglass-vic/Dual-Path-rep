@@ -7,12 +7,12 @@
 
 阅读结果时先区分以下三类：
 
-- **正式性能口径**：Mooncake Store 动态完整 rollout；不预 Populate；Prefill
+- **正式性能口径**：共享 Lustre file-backend 动态完整 rollout；不预 Populate；Prefill
   在每个 request 的 PD ACK 后释放 radix 引用并立即驱逐所有未被活跃请求引用的
-  L1/L2 page；不使用全局 `/flush_cache`。短 `STORAGE_SETTLE_SECONDS` 仅用于
-  Decode Store 可见性，不是旧 file-backend 的长静默等待。
-- **当前可自动汇总**：客户端 streaming 指标、request/L3/P→D timing、cache hit、
-  聚合 CSV/JSON 和 SVG。
+  L1/L2 page；不使用全局 `/flush_cache`。同一 trajectory 的下一 turn 等待
+  上一 turn 全部 Decode TP rank 的 L3-complete marker。
+- **当前可自动汇总**：客户端 streaming 指标、request/L3/P→D timing、Decode
+  Host→GPU timing、cache hit、聚合 CSV/JSON 和 SVG。
 - **历史/对照口径**：Job `65032/65144/65502` 旧 file backend / 预热隔离；Job
   `65694` 未 flush、L1/L2 命中主导且 `l3_timing_coverage=0`。均不得与正式
   L3 路径混报。
@@ -78,26 +78,27 @@ turn_wall_seconds
   + turn_accounting_error_seconds
 ```
 
-正式路径中的 accounting error 应只剩浮点误差。`storage_settle_seconds` 按轮
-记录但**不进入** `turn_wall_seconds` 闭合式。正式路径不调用全局 flush，因此
+正式路径中的 accounting error 应只剩浮点误差。
+`decode_l3_sync_wait_seconds` 按轮记录、但**不进入** `turn_wall_seconds`
+闭合式；`storage_settle_seconds=0`。正式路径不调用全局 flush，因此
 `cache_flush_seconds=0`、`cache_sync_wait_seconds=0`；两字段仅保留给显式开启
 `FLUSH_LOCAL_CACHE_BETWEEN_TURNS=1` 的历史/控制实验。
 
 `DUALPATH_PREFILL_CACHE_RELEASE` 在每个成功 PD ACK 后记录释放前后的 device
 evictable tokens。SGLang 已先通过 `release_kv_cache()` 解除当前 request 的
 radix lock；随后驱逐只处理 `lock_ref=0` 的叶节点，因此不会释放并发请求仍在
-使用的共享 prefix。若 Prefill write-through backup 尚持有节点，PD ACK 清理
-阶段先推进并等待该 backup 发布到 L3，再驱逐 L1/L2。Prefill 发布 page-aligned
-prompt，Decode 只发布增量 KV；等待是为了下一 turn 的 L3 完整性，不是为了
-当前 Decode 请求。
+使用的共享 prefix。Prefill 设置为 L3 read-only，不产生 write-through/backup，
+所以 PD ACK 后无需等待存储写入即可立即驱逐 L1/L2。Decode 根据 Prefill metadata
+中的 `cached_tokens`，只发布该 page-aligned L3 前缀之后的新 KV。
 
-自动验收要求 `prefill_cache_release_coverage >= 0.95`，且
-`prefill_evictable_before_release_max > 0`、
-`prefill_evictable_after_release_max == 0`；对应字段写入 task
+自动验收要求 `prefill_cache_release_coverage >= 0.95` 且
+`prefill_evictable_after_release_max == 0`。`evictable_before` 仅作为诊断：
+短请求或已由请求生命周期提前释放的 page 可以为 0。对应字段写入 task
 `data/validation.json` 和聚合 CSV。启用 Prefill L3 与 Decode offload 的多轮
 run 还要求观测到跨 turn L3 timing，防止“本地释放成功但 L3 未发布”的假阳性。
-Job `66581` 中 turn 2–4 的 `cached_tokens == l3_read_tokens`
-（1856/3840/5696），是当前机制的通过样例。
+Job `66987` 中 turn 1 由 Decode 从 `offload_start=0` 发布 1856 tokens；turn 2
+的 Prefill 从 L3 读取 1856 tokens，随后 Decode 从 `offload_start=1856` 发布
+1984 个新 tokens，是当前机制的通过样例。
 
 长上下文并发 PD 传输显式设置 `MC_TRANSFER_TIMEOUT=120` 秒，并使用
 `SGLANG_MOONCAKE_MAX_TRANSFER_BATCH_INDICES=128` 将过大的 all-layer 同步
@@ -186,7 +187,7 @@ request 明细（见 §6）。
   L1/L2 page，因此后续 turn 的命中应主要来自 L3 prefetch，并与
   `DUALPATH_L3_TIMING` / `l3_hit_rate` 对照。
 - 若关闭 `DUALPATH_PREFILL_RELEASE_LOCAL_CACHE`，命中可来自 L1/L2，不能直接
-  归因于 Lustre DFS。
+  归因于 Lustre file backend。
 
 ### L3 read hit
 
@@ -194,8 +195,8 @@ request 明细（见 §6）。
   token 数。
 - `l3_hit_rate = l3_prefetched_tokens_logical / prompt_tokens`。
 - 只有产生 L3 prefetch marker 的请求才是可观测 L3 read。
-- 动态 rollout 不等待 Store 发布，所以早期 turn 的 L3 timing coverage 可以为
-  零；coverage 是结果，不是必须达到的正确性阈值。
+- 下一 turn 在 request-scoped Decode L3 completion 屏障后启动；若仍无 L3
+  marker，应视为 file backend 命中或 timing 采集问题。
 
 ### Qwen2.5-32B BF16 KV 大小
 
@@ -209,17 +210,15 @@ request 明细（见 §6）。
 - turn 后逻辑 KV：`(prompt_tokens + generated_tokens) × 262144`。
 - 容量图使用 GiB，即除以 `1024³`。
 
-正式 replay 在请求完成并等待 `STORAGE_SETTLE_SECONDS` 后递归采样 Mooncake
-DFS shard；采样与 settle 的耗时均不计入 `turn_wall_seconds` / trajectory JCT。
+正式 replay 在请求完成并等齐 Decode L3-complete markers 后递归采样该 run 的
+Lustre file-backend 目录；同步和采样均不计入 `turn_wall_seconds` /
+trajectory JCT。
 
-- `l3_apparent_snapshot_gib`：文件 `st_size` 总和。Mooncake 预先创建稀疏 shard，
-  因而它可能从首轮起固定为预留容量（Job `66097` 为 256 GiB），**不能**视为
-  已写入数据量。
+- `l3_apparent_snapshot_gib`：file-backend KV 文件 `st_size` 总和。
 - `l3_physical_snapshot_gib`：`st_blocks × 512` 总和，表示 Lustre 当时已分配
-  block，是当前落盘曲线使用的物理快照。写入异步，短 settle 后仍可能滞后或
-  批量跳升，不要求逐 turn 与逻辑 KV 相等。
-- Job `66097`（1P2D、32K、1 agent）最终物理快照为 6.932 GiB，证明此前的 0
-  来自缺少采样，而非 Mooncake 未落盘。
+  block，是当前落盘曲线使用的物理快照。completion barrier 后不应再有该
+  request 的异步 file write；文件系统分配与逻辑 KV 仍可能因 page 对齐不同。
+- Job `66097` 是历史 Mooncake DFS 结果，不与当前 file-backend 容量混报。
 
 ## 4. 服务端 timing marker
 
@@ -277,6 +276,13 @@ coverage 严格为零。启用 L3 时不设置 coverage 下限。
 
 ### P→D timing 与有效带宽
 
+正式路径不是 Prefill GPU 直接写 Decode GPU。每个 Decode TP rank 使用独立的
+40 GB `layer_first` pinned Host staging pool，并把 Host 指针注册给 Mooncake
+Transfer Engine。收到全部 Prefill completion ACK 后，Decode 在独立 CUDA
+stream 上把 request pages 搬入 HBM，完成后归还 staging pages，才向 scheduler
+返回 `KVPoll.Success`。后续新 KV 的 D2H→Lustre 使用另一套
+`page_first_direct` HiCache Host pool；两套 pool 不共享 allocator。
+
 ```text
 pd_effective_bandwidth_gbps
   = (page_count × page_size) × 262144 / pd_transfer_seconds / 1e9
@@ -330,12 +336,14 @@ legacy 段可能重叠，且把 Router/P→D/Decode/SSE 等塞进 `Unattributed`
 | L3 KV Read | Prefill 侧 L3 prefetch |
 | Prefill Forward + Logits + Sampling | prefill compute + first-token sample |
 | Prefill-to-Decode KV Transfer | P→D KV 传输窗口 |
+| Decode Host-to-GPU Copy | Decode pinned Host staging → HBM；八个 TP rank 取最慢 duration |
 | Decode Prebuilt-token Dispatch | KV ready → PREBUILT first-token dispatch |
 | SSE Serialization & Egress | dispatch → 首个 SSE payload yield |
 | Router, Client & Runtime Gaps | 闭合 TTFT 的剩余间隙 |
 
 Prefill 侧重叠区间按 L3 read、scheduling、prefill、P→D 的优先级只归属一次。
-Decode receive overlap 仅保留为诊断，不重复加入柱状图。所有桶必须满足：
+Decode receive wait 与 P→D 窗口重叠，仅保留为诊断；P→D ACK 后的 Host→GPU copy
+单独计入 additive breakdown。所有桶必须满足：
 
 ```text
 TTFT = Σ full-chain stages
@@ -407,7 +415,8 @@ Job 结束时统一调用 `scripts/benchmark/collect_benchmark_metrics.py`。
 - L3 read：`l3-read-data.svg` 汇总最长轨迹每个 turn 的 TP 聚合逻辑读取量，不在
   文件名中使用有歧义的 engine 0；`l3-read-time-prefill-<ID>.svg` 才按 Prefill
   replica 区分并展示其 TP ranks。1P* 只有 replica 0；2P2D 的 replica 0/1 共享
-  Mooncake DFS namespace，但一个 request 只由 Router 选中的 replica 发起读取；
+  同一 Lustre file-backend 目录，但一个 request 只由 Router 选中的 replica
+  发起读取；
 - bandwidth：`l3-bandwidth.svg`、`pd-bandwidth.svg`。
 
 `all-trajectories/latency.svg` 同时展示每个 agent 的 trajectory JCT、agent 内

@@ -17,6 +17,7 @@ FULLCHAIN_COMPONENTS = (
     ("l3_kv_read_seconds", "L3 KV read", "#f59e0b"),
     ("prefill_logits_sampling_seconds", "Prefill + sampling", "#22c55e"),
     ("pd_transfer_seconds", "P→D KV transfer", "#f97316"),
+    ("decode_host_to_device_seconds", "Decode Host→GPU", "#ef4444"),
     ("decode_dispatch_seconds", "Decode dispatch", "#8b5cf6"),
     ("sse_egress_seconds", "SSE egress", "#06b6d4"),
     ("router_client_runtime_seconds", "Router/client gaps", "#cbd5e1"),

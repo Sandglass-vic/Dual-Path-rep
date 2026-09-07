@@ -10,6 +10,7 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 source "$SCRIPT_DIR/pd_network_config.sh"
 unset DUALPATH_HICACHE_READ_ONLY
 unset DUALPATH_HICACHE_EVICT_UNLOCKED
+export DUALPATH_DECODE_PD_HOST_STAGING=${DUALPATH_DECODE_PD_HOST_STAGING:-1}
 
 DECODE_PORT=${DECODE_PORT:-30000}
 MEM_FRACTION_STATIC=${MEM_FRACTION_STATIC:-0.75}
@@ -68,7 +69,7 @@ PY
   hicache_args=(
     --page-size 64
     --enable-metrics
-    --hicache-ratio "${HICACHE_RATIO:-1.2}"
+    --hicache-ratio "${DECODE_HICACHE_RATIO:-1.05}"
     --hicache-size 0
     --hicache-mem-layout page_first_direct
     --hicache-io-backend direct

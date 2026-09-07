@@ -11,23 +11,28 @@
    `Lustre -> Prefill host DRAM -> Prefill HBM` 恢复。
 3. Prefill 只计算未命中的 suffix。Decode 所需的完整前缀由恢复的 KV 和新计算
    KV 共同组成。
-4. Prefill 通过 Mooncake 将 Decode 所需 KV 发送到选定 Decode engine。
-5. Decode 接收 KV 后执行 decode，逐 token 返回输出。
-6. 启用 `DECODE_OFFLOAD_KVCACHE=1` 时，Decode 将新增/更新后的 KV 发布到
-   Mooncake Store；Store 同时创建一个 memory replica 和一个 Lustre POSIX
-   DFS replica。
+4. Prefill 通过 Mooncake Transfer Engine 将 Decode 所需 KV 写入选定 Decode
+   engine 独立的 pinned Host staging pool；Decode H2D 完成后归还这些 pages，
+   且 H2D 完成后才进入计算。
+5. Prefill 不执行 offload，PD ACK 后立即释放未锁定 L1/L2。
+6. Decode 执行 decode；启用 `DECODE_OFFLOAD_KVCACHE=1` 时，从 Prefill
+   metadata 的 `cached_tokens` 边界开始，将 Prefill 新算 KV 与 Decode KV
+   经另一套 HiCache Host pool 写入 Lustre file backend。
+7. 8 个 Decode TP rank 都发布该 request 的 L3-complete marker 后，同一
+   trajectory 才能发下一 turn。
 
 正式路径与论文 §4.1 对齐：Prefill 在每个 request 的 PD ACK 后解锁 radix
-引用并驱逐未被活跃请求引用的 L1/L2 page，下一轮从 Mooncake Store 加载；
-默认短暂 `STORAGE_SETTLE_SECONDS` 仅保证 Decode Put 可见。
+引用并驱逐未被活跃请求引用的 L1/L2 page，下一轮从 Lustre file backend
+加载；request-scoped marker 取代固定 `STORAGE_SETTLE_SECONDS`。
 
 ```text
-turn N:   Prefill（本地无上轮前缀）-> L3 prefetch -> PD -> Decode -> Store Put
-          -> Prefill per-request release (+ optional settle)
-turn N+1: 再次从 Store 加载已发布前缀
+turn N:   Prefill（本地无上轮前缀）-> Lustre prefetch -> PD -> Decode
+          -> file L3 backup -> 8-rank completion barrier
+turn N+1: 再次从 Lustre 加载已发布前缀
 ```
 
-没有 Populate/Measured。每个独立 run 使用新的 Mooncake master 和 DFS root。
+没有 Populate/Measured。每个独立 run 使用新的 Lustre file-backend 目录；
+Mooncake master 仅为 P→D Transfer Engine 提供 metadata service。
 Job `65694` 未 flush，属于 L1/L2 顺风车对照，不是正式口径。
 
 ## Prefill 与 P→D 传输粒度
