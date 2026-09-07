@@ -50,6 +50,11 @@ from mooncake.engine import TransferEngine
 root = Path("/usr/local/lib/python3.12/dist-packages/sglang/srt")
 hiradix = (root / "mem_cache/hiradix_cache.py").read_text()
 schedule_batch = (root / "managers/schedule_batch.py").read_text()
+scheduler = (root / "managers/scheduler.py").read_text()
+schedule_policy = (root / "managers/schedule_policy.py").read_text()
+runtime_checker = (
+    root / "managers/scheduler_runtime_checker_mixin.py"
+).read_text()
 prefill = (root / "disaggregation/prefill.py").read_text()
 decode = (root / "disaggregation/decode.py").read_text()
 decode_offload = (
@@ -76,6 +81,8 @@ assert local_l3_end < hiradix.index(
 assert "DUALPATH_REQ_TIMING" in schedule_batch
 assert '"DUALPATH_TTFT_P_TRANSFER_V2 rid=%s ' in prefill
 assert "DUALPATH_PREFILL_CACHE_RELEASE" in prefill
+assert "DUALPATH_PREFILL_DECODE_L3_PREFIX" in prefill
+assert "start_decode_l3_reverse" in prefill
 assert "DUALPATH_PREFILL_RELEASE_LOCAL_CACHE" in prefill
 release_local = prefill.index("DUALPATH_PREFILL_RELEASE_LOCAL_CACHE")
 assert prefill.index("self.tree_cache.loading_check()", release_local) < (
@@ -103,6 +110,13 @@ assert "DUALPATH_BOUNDED_DECODE_HOST_STAGING" in memory_pool_host
 assert "SGLANG_MOONCAKE_MAX_TRANSFER_BATCH_INDICES" in mooncake_conn
 assert "prefill_data_indices.size <= max_batch_indices" in mooncake_conn
 assert "DUALPATH_DECODE_HOST_STAGING_COPY" in mooncake_conn
+assert "DUALPATH_DECODE_L3_READ" in mooncake_conn
+assert "DUALPATH_DECODE_L3_REVERSE" in mooncake_conn
+assert "decode_l3_hit_tokens" in mooncake_conn
+assert "DUALPATH_DECODE_L3_READ_PATH" in scheduler
+assert "dualpath_decode_l3_prefix_ready" in schedule_policy
+assert "DUALPATH_DECODE_L3_BOOTSTRAP_ALLOCATION" in runtime_checker
+assert 'self.kv_args.prefill_start_layer = 0' in mooncake_conn
 assert mooncake_conn.index(
     "stage_received_kv_to_device"
 ) < mooncake_conn.index("self.conclude_state = status")
@@ -110,6 +124,13 @@ assert "DUALPATH_TTFT_D_DISPATCH" in output_processor
 assert "DUALPATH_TTFT_HTTP_YIELD" in http_server
 compile(hiradix, str(root / "mem_cache/hiradix_cache.py"), "exec")
 compile(schedule_batch, str(root / "managers/schedule_batch.py"), "exec")
+compile(scheduler, str(root / "managers/scheduler.py"), "exec")
+compile(schedule_policy, str(root / "managers/schedule_policy.py"), "exec")
+compile(
+    runtime_checker,
+    str(root / "managers/scheduler_runtime_checker_mixin.py"),
+    "exec",
+)
 compile(prefill, str(root / "disaggregation/prefill.py"), "exec")
 compile(decode, str(root / "disaggregation/decode.py"), "exec")
 compile(

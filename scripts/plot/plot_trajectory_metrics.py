@@ -23,9 +23,15 @@ P_TRANSFER = re.compile(
     r"(?: page_aligned_tokens=(?P<page_tokens>\d+) "
     r"page_count=(?P<page_count>\d+) page_size=(?P<page_size>\d+))?"
 )
-L3_READ = re.compile(
+PREFILL_L3_READ = re.compile(
     r"DUALPATH_L3_TIMING rid=(?P<rid>\S+) "
     r"prefill_engine=(?P<engine>\S+) tp_rank=(?P<rank>\d+) .*?"
+    r"read_start=(?P<start>[0-9.]+) read_end=(?P<end>[0-9.]+) "
+    r"read_s=(?P<seconds>[0-9.]+) tokens=(?P<tokens>\d+)"
+)
+DECODE_L3_READ = re.compile(
+    r"DUALPATH_DECODE_L3_READ rid=(?P<rid>\S+) "
+    r"decode_engine=(?P<engine>\S+) tp_rank=(?P<rank>\d+) .*?"
     r"read_start=(?P<start>[0-9.]+) read_end=(?P<end>[0-9.]+) "
     r"read_s=(?P<seconds>[0-9.]+) tokens=(?P<tokens>\d+)"
 )
@@ -37,6 +43,7 @@ def parse_logs(
 ) -> tuple[
     dict[str, tuple[float, int, int, int, int]],
     dict[str, dict[str, dict[int, tuple[float, float, float, int]]]],
+    dict[str, dict[str, dict[int, tuple[float, float, float, int]]]],
 ]:
     transfer_values: dict[
         str, list[tuple[float, int, int, int, int]]
@@ -44,9 +51,10 @@ def parse_logs(
     read_values: dict[
         str, dict[str, dict[int, list[tuple[float, float, float, int]]]]
     ] = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
+    decode_read_values: dict[
+        str, dict[str, dict[int, list[tuple[float, float, float, int]]]]
+    ] = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
     for path in log_dir.glob(log_glob):
-        if "prefill" not in path.name:
-            continue
         for line in path.read_text(errors="replace").splitlines():
             transfer_match = P_TRANSFER.search(line)
             if transfer_match:
@@ -60,11 +68,24 @@ def parse_logs(
                     )
                 )
                 continue
-            read_match = L3_READ.search(line)
+            read_match = PREFILL_L3_READ.search(line)
             if read_match:
                 read_values[read_match.group("rid")][read_match.group("engine")][
                     int(read_match.group("rank"))
                 ].append(
+                    (
+                        float(read_match.group("start")),
+                        float(read_match.group("end")),
+                        float(read_match.group("seconds")),
+                        int(read_match.group("tokens")),
+                    )
+                )
+                continue
+            read_match = DECODE_L3_READ.search(line)
+            if read_match:
+                decode_read_values[read_match.group("rid")][
+                    read_match.group("engine")
+                ][int(read_match.group("rank"))].append(
                     (
                         float(read_match.group("start")),
                         float(read_match.group("end")),
@@ -83,36 +104,80 @@ def parse_logs(
         )
         for rid, items in transfer_values.items()
     }
-    l3_read = {
-        rid: {
-            engine: {
-                rank: (
-                    statistics.median(item[0] for item in items),
-                    statistics.median(item[1] for item in items),
-                    statistics.median(item[2] for item in items),
-                    round(statistics.median(item[3] for item in items)),
-                )
-                for rank, items in ranks.items()
+    def reduce_reads(values):
+        return {
+            rid: {
+                engine: {
+                    rank: (
+                        statistics.median(item[0] for item in items),
+                        statistics.median(item[1] for item in items),
+                        statistics.median(item[2] for item in items),
+                        round(statistics.median(item[3] for item in items)),
+                    )
+                    for rank, items in ranks.items()
+                }
+                for engine, ranks in engines.items()
             }
-            for engine, ranks in engines.items()
+            for rid, engines in values.items()
         }
-        for rid, engines in read_values.items()
-    }
-    return transfer, l3_read
+
+    return transfer, reduce_reads(read_values), reduce_reads(decode_read_values)
 
 
 def build_rows(
-    rounds_path: Path, log_dir: Path, log_glob: str = "prefill*.log"
+    rounds_path: Path, log_dir: Path, log_glob: str = "*.log"
 ) -> tuple[
     list[dict[str, float | int | str]],
     dict[str, list[dict[str, float | int | str]]],
 ]:
     rounds = [json.loads(line) for line in rounds_path.read_text().splitlines()]
-    transfer, l3_read = parse_logs(log_dir, log_glob=log_glob)
+    transfer, prefill_l3_read, decode_l3_read = parse_logs(
+        log_dir, log_glob=log_glob
+    )
     rows = []
     engine_rank_rows: dict[
         str, list[dict[str, float | int | str]]
     ] = defaultdict(list)
+
+    def reduce_side(item, rid, side, request_engines):
+        if len(request_engines) > 1:
+            raise RuntimeError(
+                f"request {rid} has L3 timing from multiple {side} Engines: "
+                f"{sorted(request_engines)}"
+            )
+        engine = next(iter(request_engines), "")
+        rank_timings = request_engines.get(engine, {})
+        if not rank_timings:
+            return engine, rank_timings, -1, 0.0, 0.0, 0
+        slowest_rank, (_, _, slowest_seconds, _) = max(
+            rank_timings.items(), key=lambda entry: entry[1][2]
+        )
+        union_seconds = max(entry[1] for entry in rank_timings.values()) - min(
+            entry[0] for entry in rank_timings.values()
+        )
+        tokens = min(entry[3] for entry in rank_timings.values())
+        rank_row: dict[str, float | int | str] = {
+            "trajectory_id": item["trajectory_id"],
+            "turn_id": int(item["turn_id"]),
+            "request_id": rid,
+            "side": side,
+            "engine_id": engine,
+            "l3_read_gib": tokens * KV_BYTES_PER_TOKEN / GIB,
+        }
+        for rank, (_, _, seconds, _) in sorted(rank_timings.items()):
+            rank_row[f"tp_rank_{rank}_read_seconds"] = seconds
+        rank_row["tp_slowest_read_seconds"] = slowest_seconds
+        rank_row["tp_union_read_seconds"] = union_seconds
+        engine_rank_rows[f"{side}:{engine}"].append(rank_row)
+        return (
+            engine,
+            rank_timings,
+            slowest_rank,
+            slowest_seconds,
+            union_seconds,
+            tokens,
+        )
+
     for item in rounds:
         rid = item["request_id"]
         prompt_tokens = int(item["prompt_tokens"])
@@ -128,42 +193,29 @@ def build_rows(
         ) = transfer.get(
             rid, (0.0, 0, 0, 0, 0)
         )
-        request_engines = l3_read.get(rid, {})
-        if len(request_engines) > 1:
-            raise RuntimeError(
-                f"request {rid} has L3 timing from multiple Prefill Engines: "
-                f"{sorted(request_engines)}"
-            )
-        prefill_engine = next(iter(request_engines), "")
-        rank_timings = request_engines.get(prefill_engine, {})
-        if rank_timings:
-            slowest_rank, (_, _, slowest_seconds, _) = max(
-                rank_timings.items(), key=lambda item: item[1][2]
-            )
-            l3_start = min(item[0] for item in rank_timings.values())
-            l3_end = max(item[1] for item in rank_timings.values())
-            l3_union_seconds = l3_end - l3_start
-            l3_seconds = slowest_seconds
-            l3_tokens = min(item[3] for item in rank_timings.values())
-            rank_row: dict[str, float | int | str] = {
-                "trajectory_id": item["trajectory_id"],
-                "turn_id": int(item["turn_id"]),
-                "request_id": rid,
-                "prefill_engine_id": prefill_engine,
-                "l3_read_gib": l3_tokens * KV_BYTES_PER_TOKEN / GIB,
-            }
-            for rank, (_, _, seconds, _) in sorted(rank_timings.items()):
-                rank_row[f"tp_rank_{rank}_read_seconds"] = seconds
-            rank_row["tp_slowest_read_seconds"] = slowest_seconds
-            rank_row["tp_union_read_seconds"] = l3_union_seconds
-            engine_rank_rows[prefill_engine].append(rank_row)
-        else:
-            slowest_rank, l3_seconds, l3_tokens = -1, 0.0, 0
+        (
+            prefill_engine,
+            prefill_rank_timings,
+            prefill_slowest_rank,
+            prefill_l3_seconds,
+            _,
+            prefill_l3_tokens,
+        ) = reduce_side(item, rid, "prefill", prefill_l3_read.get(rid, {}))
+        (
+            decode_engine,
+            decode_rank_timings,
+            decode_slowest_rank,
+            decode_l3_seconds,
+            _,
+            decode_l3_tokens,
+        ) = reduce_side(item, rid, "decode", decode_l3_read.get(rid, {}))
         # Page-aligned tokens estimate actual KV payload sent by all TP ranks.
         # V1 logs lack page fields and fall back to logical tokens.
         transfer_payload_tokens = transfer_page_tokens or transfer_tokens
         transfer_bytes = transfer_payload_tokens * KV_BYTES_PER_TOKEN
-        l3_bytes = l3_tokens * KV_BYTES_PER_TOKEN
+        prefill_l3_bytes = prefill_l3_tokens * KV_BYTES_PER_TOKEN
+        decode_l3_bytes = decode_l3_tokens * KV_BYTES_PER_TOKEN
+        l3_tokens = prefill_l3_tokens + decode_l3_tokens
         rows.append(
             {
                 "trajectory_id": item["trajectory_id"],
@@ -175,15 +227,20 @@ def build_rows(
                 "l3_read_tokens": l3_tokens,
                 "l3_hit_rate": l3_tokens / prompt_tokens,
                 "prefill_engine_id": prefill_engine,
-                "l3_tp_rank_count": len(rank_timings),
-                "l3_slowest_tp_rank": slowest_rank,
+                "decode_engine_id": decode_engine,
+                "l3_tp_rank_count": len(prefill_rank_timings),
+                "l3_slowest_tp_rank": prefill_slowest_rank,
                 "l3_rank_read_seconds_json": json.dumps(
                     {
                         str(rank): seconds
-                    for rank, (_, _, seconds, _) in sorted(rank_timings.items())
+                    for rank, (_, _, seconds, _) in sorted(
+                        prefill_rank_timings.items()
+                    )
                     },
                     separators=(",", ":"),
                 ),
+                "decode_l3_tp_rank_count": len(decode_rank_timings),
+                "decode_l3_slowest_tp_rank": decode_slowest_rank,
                 "append_tokens": append_tokens,
                 "generated_tokens": generated_tokens,
                 "new_logical_kv_gib": (
@@ -207,9 +264,22 @@ def build_rows(
                     if transfer_seconds > 0
                     else 0.0
                 ),
-                "l3_read_seconds": l3_seconds,
+                "l3_read_seconds": prefill_l3_seconds + decode_l3_seconds,
+                "prefill_l3_read_tokens": prefill_l3_tokens,
+                "prefill_l3_read_gib": prefill_l3_bytes / GIB,
+                "prefill_l3_read_seconds": prefill_l3_seconds,
                 "prefill_l3_effective_bandwidth_gbps": (
-                    l3_bytes / l3_seconds / GB if l3_seconds > 0 else 0.0
+                    prefill_l3_bytes / prefill_l3_seconds / GB
+                    if prefill_l3_seconds > 0
+                    else 0.0
+                ),
+                "decode_l3_read_tokens": decode_l3_tokens,
+                "decode_l3_read_gib": decode_l3_bytes / GIB,
+                "decode_l3_read_seconds": decode_l3_seconds,
+                "decode_l3_effective_bandwidth_gbps": (
+                    decode_l3_bytes / decode_l3_seconds / GB
+                    if decode_l3_seconds > 0
+                    else 0.0
                 ),
             }
         )
@@ -311,7 +381,7 @@ def main() -> None:
     source.add_argument("--rounds", type=Path)
     source.add_argument("--metrics-csv", type=Path)
     parser.add_argument("--log-dir", type=Path)
-    parser.add_argument("--log-glob", default="prefill*.log")
+    parser.add_argument("--log-glob", default="*.log")
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--csv-output", type=Path)
     parser.add_argument("--summary-output", type=Path)
@@ -386,12 +456,17 @@ def main() -> None:
         (
             (
                 "prefill_l3_effective_bandwidth_gbps",
-                "Logical effective bandwidth",
+                "Prefill L3 read",
                 "#d97706",
+            ),
+            (
+                "decode_l3_effective_bandwidth_gbps",
+                "Decode L3 read",
+                "#2563eb",
             ),
         ),
         "GB/s",
-        "Prefill L3 KV Load Bandwidth by Turn",
+        "L3 KV Load Bandwidth by Turn",
         args.output_dir / "l3-bandwidth.svg",
     )
     rank_colors = (
@@ -404,23 +479,18 @@ def main() -> None:
         "#65a30d",
         "#7c2d12",
     )
-    all_l3_rows = sorted(
+    plot(
+        rows,
         (
-            row
-            for rank_rows in engine_rank_rows.values()
-            for row in rank_rows
+            ("prefill_l3_read_gib", "Prefill L3 read", "#d97706"),
+            ("decode_l3_read_gib", "Decode L3 read", "#2563eb"),
         ),
-        key=lambda row: int(row["turn_id"]),
+        "GiB",
+        "L3 Read Data by Turn",
+        args.output_dir / "l3-read-data.svg",
     )
-    if all_l3_rows:
-        plot(
-            all_l3_rows,
-            (("l3_read_gib", "Logical KV read (TP aggregate)", "#0f766e"),),
-            "GiB",
-            "L3 Read Data by Turn",
-            args.output_dir / "l3-read-data.svg",
-        )
-    for engine, rank_rows in sorted(engine_rank_rows.items()):
+    for side_engine, rank_rows in sorted(engine_rank_rows.items()):
+        side, engine = side_engine.split(":", 1)
         for row in rank_rows:
             missing = [
                 rank
@@ -429,7 +499,7 @@ def main() -> None:
             ]
             if missing:
                 raise RuntimeError(
-                    f"Prefill Engine {engine} request {row['request_id']} "
+                    f"{side.title()} Engine {engine} request {row['request_id']} "
                     f"is missing TP rank timings: {missing}"
                 )
         rank_ids = sorted(
@@ -442,7 +512,7 @@ def main() -> None:
         )
         if len(rank_ids) != 8:
             raise RuntimeError(
-                f"Prefill Engine {engine} has {len(rank_ids)}/8 TP rank timings"
+                f"{side.title()} Engine {engine} has {len(rank_ids)}/8 TP rank timings"
             )
         series = tuple(
             (
@@ -463,9 +533,9 @@ def main() -> None:
             rank_rows,
             series,
             "Seconds",
-            f"Prefill Replica {engine}: L3 Read Time by TP Rank",
+            f"{side.title()} Replica {engine}: L3 Read Time by TP Rank",
             args.output_dir
-            / f"l3-read-time-prefill-{safe_engine}.svg",
+            / f"l3-read-time-{side}-{safe_engine}.svg",
         )
     for pattern in ("l3-read-data-engine-*.svg", "l3-read-time-engine-*.svg"):
         for legacy in args.output_dir.glob(pattern):
@@ -473,7 +543,12 @@ def main() -> None:
     positive_l3 = [
         float(row["prefill_l3_effective_bandwidth_gbps"])
         for row in rows
-        if float(row["l3_read_seconds"]) > 0
+        if float(row["prefill_l3_read_seconds"]) > 0
+    ]
+    positive_decode_l3 = [
+        float(row["decode_l3_effective_bandwidth_gbps"])
+        for row in rows
+        if float(row["decode_l3_read_seconds"]) > 0
     ]
     summary = {
         "turns": len(rows),
@@ -496,8 +571,13 @@ def main() -> None:
         "median_prefill_l3_effective_bandwidth_gbps": (
             statistics.median(positive_l3) if positive_l3 else None
         ),
-        "prefill_engine_l3_timing": {
-            engine: {
+        "median_decode_l3_effective_bandwidth_gbps": (
+            statistics.median(positive_decode_l3)
+            if positive_decode_l3
+            else None
+        ),
+        "engine_l3_timing": {
+            side_engine: {
                 "requests": len(rank_rows),
                 "median_tp_union_read_seconds": statistics.median(
                     float(row["tp_union_read_seconds"])
@@ -511,7 +591,7 @@ def main() -> None:
                     for rank in range(8)
                 },
             }
-            for engine, rank_rows in sorted(engine_rank_rows.items())
+            for side_engine, rank_rows in sorted(engine_rank_rows.items())
         },
     }
     summary_path = args.summary_output or args.output_dir / "metrics-summary.json"

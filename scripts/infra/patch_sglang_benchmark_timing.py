@@ -146,6 +146,103 @@ def patch_hiradix(path: Path) -> None:
     print(f"Patched: {path}")
 
 
+def patch_decode_l3_scheduler(path: Path) -> None:
+    source = path.read_text()
+    marker = "DUALPATH_DECODE_L3_READ_PATH"
+    if marker in source:
+        print(f"Already patched: {path}")
+        return
+
+    source = replace_once(
+        source,
+        "        if self.enable_hicache_storage:\n"
+        "            req.init_next_round_input(self.tree_cache)\n"
+        "            if req.last_node.backuped:\n",
+        "        if self.enable_hicache_storage:\n"
+        "            req.init_next_round_input(self.tree_cache)\n"
+        "            dualpath_decode_l3_read = (\n"
+        "                __import__(\"os\").environ.get(\n"
+        "                    \"DUALPATH_L3_READ_PATH\", \"prefill\"\n"
+        "                )\n"
+        "                == \"decode\"\n"
+        "            )\n"
+        "            if dualpath_decode_l3_read:\n"
+        "                # DUALPATH_DECODE_L3_READ_PATH: Decode loads the durable\n"
+        "                # prefix into its PD Host staging and reverse-sends it.\n"
+        "                return\n"
+        "            if req.last_node.backuped:\n",
+        "route L3 data prefetch to Decode",
+    )
+    source = replace_once(
+        source,
+        "            req.init_next_round_input(self.tree_cache)\n"
+        "            res = adder.add_one_req(\n",
+        "            if not getattr(\n"
+        "                req, \"dualpath_decode_l3_prefix_ready\", False\n"
+        "            ):\n"
+        "                req.init_next_round_input(self.tree_cache)\n"
+        "            res = adder.add_one_req(\n",
+        "preserve Decode-restored prefix at final Prefill admission",
+    )
+    path.write_text(source)
+    print(f"Patched: {path}")
+
+
+def patch_decode_l3_schedule_policy(path: Path) -> None:
+    source = path.read_text()
+    marker = "dualpath_decode_l3_prefix_ready"
+    if marker in source:
+        print(f"Already patched: {path}")
+        return
+
+    source = replace_once(
+        source,
+        "        for r in waiting_queue:\n"
+        "            prefix_ids = r.origin_input_ids + r.output_ids\n",
+        "        for r in waiting_queue:\n"
+        "            if getattr(r, \"dualpath_decode_l3_prefix_ready\", False):\n"
+        "                # The indices point at Prefill HBM pages populated by a\n"
+        "                # Decode-to-Prefill reverse transfer. Do not overwrite\n"
+        "                # them with the still-evicted radix metadata match.\n"
+        "                continue\n"
+        "            prefix_ids = r.origin_input_ids + r.output_ids\n",
+        "preserve Decode-provided Prefill prefix indices",
+    )
+    path.write_text(source)
+    print(f"Patched: {path}")
+
+
+def patch_decode_l3_runtime_checker(path: Path) -> None:
+    source = path.read_text()
+    marker = "DUALPATH_DECODE_L3_BOOTSTRAP_ALLOCATION"
+    if marker in source:
+        print(f"Already patched: {path}")
+        return
+
+    source = replace_once(
+        source,
+        "        if self.disaggregation_mode == DisaggregationMode.PREFILL:\n"
+        "            if len(self.disagg_prefill_inflight_queue) > 0:\n"
+        "                return\n",
+        "        if self.disaggregation_mode == DisaggregationMode.PREFILL:\n"
+        "            if len(self.disagg_prefill_inflight_queue) > 0:\n"
+        "                return\n"
+        "            if any(\n"
+        "                getattr(\n"
+        "                    req, \"dualpath_decode_l3_prefix_indices\", None\n"
+        "                )\n"
+        "                is not None\n"
+        "                for req in self.disagg_prefill_bootstrap_queue.queue\n"
+        "            ):\n"
+        "                # DUALPATH_DECODE_L3_BOOTSTRAP_ALLOCATION: the reverse\n"
+        "                # RDMA destination is live but not radix-owned yet.\n"
+        "                return\n",
+        "defer idle memory check during Decode L3 reverse bootstrap",
+    )
+    path.write_text(source)
+    print(f"Patched: {path}")
+
+
 def patch_schedule_batch(path: Path) -> None:
     source = path.read_text()
     marker = "DUALPATH_REQ_TIMING"
@@ -341,6 +438,160 @@ def patch_prefill_transfer(path: Path) -> None:
         "                            evictable_after,\n"
         "                        )\n",
         "record final KV transfer completion",
+    )
+    path.write_text(source)
+    print(f"Patched: {path}")
+
+
+def patch_prefill_decode_l3_reverse(path: Path) -> None:
+    source = path.read_text()
+    marker = "DUALPATH_PREFILL_DECODE_L3_PREFIX"
+    if marker in source:
+        print(f"Already patched: {path}")
+        return
+
+    source = replace_once(
+        source,
+        "    def pop_bootstrapped(\n"
+        "        self,\n"
+        "        return_failed_reqs: bool = False,\n"
+        "        rids_to_check: Optional[List[str]] = None,\n"
+        "    ) -> List[Req]:\n",
+        "    def _prepare_decode_l3_prefix(self, req: Req) -> bool:\n"
+        "        if (\n"
+        "            __import__(\"os\").environ.get(\n"
+        "                \"DUALPATH_L3_READ_PATH\", \"prefill\"\n"
+        "            )\n"
+        "            != \"decode\"\n"
+        "        ):\n"
+        "            return True\n"
+        "\n"
+        "        page_size = self.token_to_kv_pool.page_size\n"
+        "        if not getattr(req, \"dualpath_decode_l3_reverse_started\", False):\n"
+        "            hit_tokens = self.kv_manager.get_decode_l3_hit_tokens(\n"
+        "                req.bootstrap_room\n"
+        "            )\n"
+        "            hit_tensor = torch.tensor([hit_tokens], dtype=torch.int64)\n"
+        "            torch.distributed.all_reduce(\n"
+        "                hit_tensor,\n"
+        "                op=torch.distributed.ReduceOp.MIN,\n"
+        "                group=self.gloo_group,\n"
+        "            )\n"
+        "            hit_tokens = int(hit_tensor.item())\n"
+        "            max_hit_tokens = max(0, len(req.origin_input_ids) - 1)\n"
+        "            hit_tokens = min(hit_tokens, max_hit_tokens)\n"
+        "            hit_tokens -= hit_tokens % page_size\n"
+        "            req.dualpath_decode_l3_hit_tokens = hit_tokens\n"
+        "\n"
+        "            if hit_tokens > 0:\n"
+        "                allocator = self.scheduler.token_to_kv_pool_allocator\n"
+        "                prefix_indices = allocator.alloc(hit_tokens)\n"
+        "                if prefix_indices is None:\n"
+        "                    self.scheduler.tree_cache.evict(hit_tokens)\n"
+        "                    prefix_indices = allocator.alloc(hit_tokens)\n"
+        "                local_success = int(prefix_indices is not None)\n"
+        "                success_tensor = torch.tensor(\n"
+        "                    [local_success], dtype=torch.int64\n"
+        "                )\n"
+        "                torch.distributed.all_reduce(\n"
+        "                    success_tensor,\n"
+        "                    op=torch.distributed.ReduceOp.MIN,\n"
+        "                    group=self.gloo_group,\n"
+        "                )\n"
+        "                if int(success_tensor.item()) == 0:\n"
+        "                    if prefix_indices is not None:\n"
+        "                        allocator.free(prefix_indices)\n"
+        "                    return False\n"
+        "\n"
+        "                req.dualpath_decode_l3_prefix_indices = prefix_indices\n"
+        "                page_indices = kv_to_page_indices(\n"
+        "                    prefix_indices.cpu().numpy(), page_size\n"
+        "                )\n"
+        "                self.kv_manager.start_decode_l3_reverse(\n"
+        "                    req.bootstrap_room, page_indices\n"
+        "                )\n"
+        "            req.dualpath_decode_l3_reverse_started = True\n"
+        "            if hit_tokens > 0:\n"
+        "                return False\n"
+        "\n"
+        "        hit_tokens = req.dualpath_decode_l3_hit_tokens\n"
+        "        if hit_tokens > 0 and not self.kv_manager.decode_l3_reverse_is_done(\n"
+        "            req.bootstrap_room\n"
+        "        ):\n"
+        "            return False\n"
+        "\n"
+        "        req.init_next_round_input(None)\n"
+        "        req.prefix_indices = getattr(\n"
+        "            req,\n"
+        "            \"dualpath_decode_l3_prefix_indices\",\n"
+        "            torch.empty((0,), dtype=torch.int64),\n"
+        "        )\n"
+        "        req.last_node = self.scheduler.tree_cache.root_node\n"
+        "        req.last_host_node = self.scheduler.tree_cache.root_node\n"
+        "        req.host_hit_length = 0\n"
+        "        req.cache_protected_len = 0\n"
+        "        # ScheduleBatch.prepare_for_extend accounts prefix_indices once.\n"
+        "        req.cached_tokens = 0\n"
+        "        req.start_send_idx = hit_tokens\n"
+        "        req.set_extend_input_len(len(req.fill_ids) - hit_tokens)\n"
+        "        req.dualpath_decode_l3_prefix_ready = True\n"
+        "        if self.tp_rank == 0:\n"
+        "            logger.info(\n"
+        "                \"DUALPATH_PREFILL_DECODE_L3_PREFIX rid=%s \"\n"
+        "                \"hit_tokens=%d suffix_tokens=%d\",\n"
+        "                req.rid,\n"
+        "                hit_tokens,\n"
+        "                len(req.fill_ids) - hit_tokens,\n"
+        "            )\n"
+        "        return True\n"
+        "\n"
+        "    def _release_decode_l3_prefix(self, req: Req) -> None:\n"
+        "        prefix_indices = getattr(\n"
+        "            req, \"dualpath_decode_l3_prefix_indices\", None\n"
+        "        )\n"
+        "        if prefix_indices is not None:\n"
+        "            self.scheduler.token_to_kv_pool_allocator.free(prefix_indices)\n"
+        "            req.dualpath_decode_l3_prefix_indices = None\n"
+        "        self.kv_manager.clear_decode_l3_reverse(req.bootstrap_room)\n"
+        "\n"
+        "    def pop_bootstrapped(\n"
+        "        self,\n"
+        "        return_failed_reqs: bool = False,\n"
+        "        rids_to_check: Optional[List[str]] = None,\n"
+        "    ) -> List[Req]:\n",
+        "add Decode L3 reverse bootstrap state",
+    )
+    source = replace_once(
+        source,
+        "            elif poll == KVPoll.Failed:\n"
+        "                error_message = f\"Prefill bootstrap failed for request rank={self.tp_rank} {req.rid=} {req.bootstrap_room=}\"\n",
+        "            elif poll == KVPoll.Failed:\n"
+        "                self._release_decode_l3_prefix(req)\n"
+        "                error_message = f\"Prefill bootstrap failed for request rank={self.tp_rank} {req.rid=} {req.bootstrap_room=}\"\n",
+        "release reverse prefix after bootstrap failure",
+    )
+    source = replace_once(
+        source,
+        "            # KV.WaitingForInput - init here\n"
+        "            num_kv_indices = len(req.origin_input_ids)\n",
+        "            # KV.WaitingForInput - init here\n"
+        "            if not self._prepare_decode_l3_prefix(req):\n"
+        "                continue\n"
+        "            num_kv_indices = len(req.origin_input_ids)\n",
+        "wait for Decode L3 reverse transfer",
+    )
+    source = replace_once(
+        source,
+        "            num_pages = kv_to_page_num(num_kv_indices, self.token_to_kv_pool.page_size)\n"
+        "            req.disagg_kv_sender.init(num_pages, req.metadata_buffer_index)\n",
+        "            num_pages = kv_to_page_num(num_kv_indices, self.token_to_kv_pool.page_size)\n"
+        "            req.disagg_kv_sender.init(num_pages, req.metadata_buffer_index)\n"
+        "            if getattr(req, \"dualpath_decode_l3_prefix_ready\", False):\n"
+        "                req.disagg_kv_sender.curr_idx = (\n"
+        "                    req.dualpath_decode_l3_hit_tokens\n"
+        "                    // self.token_to_kv_pool.page_size\n"
+        "                )\n",
+        "start normal PD send after Decode-restored prefix",
     )
     path.write_text(source)
     print(f"Patched: {path}")
@@ -644,6 +895,61 @@ def patch_decode_host_staging(path: Path) -> None:
     print(f"Patched: {path}")
 
 
+def patch_decode_l3_read(path: Path) -> None:
+    source = path.read_text()
+    marker = "dualpath_decode_storage_backend"
+    if marker in source:
+        print(f"Already patched: {path}")
+        return
+
+    source = replace_once(
+        source,
+        "            kv_args.dualpath_decode_device_pool = self.token_to_kv_pool\n"
+        "            kv_args.dualpath_decode_host_staging_pool = host_staging_pool\n"
+        "            kv_data_ptrs = [tensor.data_ptr() for tensor in staging_refs]\n",
+        "            kv_args.dualpath_decode_device_pool = self.token_to_kv_pool\n"
+        "            kv_args.dualpath_decode_host_staging_pool = host_staging_pool\n"
+        "            kv_args.dualpath_decode_storage_backend = (\n"
+        "                self.scheduler.decode_offload_manager.cache_controller.storage_backend\n"
+        "                if self.scheduler.decode_offload_manager is not None\n"
+        "                else None\n"
+        "            )\n"
+        "            kv_data_ptrs = [tensor.data_ptr() for tensor in staging_refs]\n",
+        "expose Decode file backend to PD staging manager",
+    )
+    source = replace_once(
+        source,
+        "            decode_req.kv_receiver.init(\n"
+        "                page_indices, decode_req.metadata_buffer_index, state_indices\n"
+        "            )\n",
+        "            if (\n"
+        "                __import__(\"os\").environ.get(\n"
+        "                    \"DUALPATH_L3_READ_PATH\", \"prefill\"\n"
+        "                )\n"
+        "                == \"decode\"\n"
+        "                and hasattr(decode_req.kv_receiver, \"kv_mgr\")\n"
+        "                and hasattr(\n"
+        "                    decode_req.kv_receiver.kv_mgr,\n"
+        "                    \"load_decode_l3_prefix\",\n"
+        "                )\n"
+        "            ):\n"
+        "                decode_req.kv_receiver.init(\n"
+        "                    page_indices,\n"
+        "                    decode_req.metadata_buffer_index,\n"
+        "                    state_indices,\n"
+        "                    token_ids=decode_req.req.origin_input_ids,\n"
+        "                    request_id=decode_req.req.rid,\n"
+        "                )\n"
+        "            else:\n"
+        "                decode_req.kv_receiver.init(\n"
+        "                    page_indices, decode_req.metadata_buffer_index, state_indices\n"
+        "                )\n",
+        "load Decode L3 prefix into PD staging",
+    )
+    path.write_text(source)
+    print(f"Patched: {path}")
+
+
 def patch_bounded_decode_host_staging_pool(path: Path) -> None:
     source = path.read_text()
     marker = "DUALPATH_BOUNDED_DECODE_HOST_STAGING"
@@ -860,6 +1166,395 @@ def patch_mooncake_decode_host_staging(path: Path) -> None:
     print(f"Patched: {path}")
 
 
+def patch_mooncake_decode_l3_reverse(path: Path) -> None:
+    source = path.read_text()
+    marker = "DUALPATH_DECODE_L3_READ"
+    if marker in source:
+        print(f"Already patched: {path}")
+        return
+
+    source = replace_once(
+        source,
+        "from sglang.srt.disaggregation.utils import DisaggregationMode\n"
+        "from sglang.srt.server_args import ServerArgs\n",
+        "from sglang.srt.disaggregation.utils import DisaggregationMode\n"
+        "from sglang.srt.mem_cache.hicache_storage import get_hash_str\n"
+        "from sglang.srt.server_args import ServerArgs\n",
+        "import HiCache page hash for Decode L3 reads",
+    )
+    source = replace_once(
+        source,
+        "    required_dst_info_num: int\n"
+        "    is_dummy: bool\n",
+        "    required_dst_info_num: int\n"
+        "    decode_l3_hit_tokens: int\n"
+        "    is_dummy: bool\n",
+        "add Decode L3 hit metadata to bootstrap",
+    )
+    source = replace_once(
+        source,
+        "            required_dst_info_num=int(msg[7].decode(\"ascii\")),\n"
+        "            is_dummy=is_dummy,\n",
+        "            required_dst_info_num=int(msg[7].decode(\"ascii\")),\n"
+        "            decode_l3_hit_tokens=(\n"
+        "                int(msg[8].decode(\"ascii\")) if len(msg) > 8 else 0\n"
+        "            ),\n"
+        "            is_dummy=is_dummy,\n",
+        "parse Decode L3 hit metadata",
+    )
+    source = replace_once(
+        source,
+        "class MooncakeKVManager(CommonKVManager):\n"
+        "    AUX_DATA_HEADER = b\"AUX_DATA\"\n",
+        "class MooncakeKVManager(CommonKVManager):\n"
+        "    AUX_DATA_HEADER = b\"AUX_DATA\"\n"
+        "    DECODE_L3_REVERSE_FETCH_HEADER = b\"DUALPATH_DECODE_L3_FETCH\"\n"
+        "    DECODE_L3_REVERSE_COMPLETE_HEADER = b\"DUALPATH_DECODE_L3_DONE\"\n",
+        "define Decode L3 reverse control messages",
+    )
+    source = replace_once(
+        source,
+        "        self.max_transfer_batch_indices = get_int_env_var(\n"
+        "            \"SGLANG_MOONCAKE_MAX_TRANSFER_BATCH_INDICES\", 1024\n"
+        "        )\n"
+        "        if self.disaggregation_mode == DisaggregationMode.PREFILL:\n",
+        "        self.max_transfer_batch_indices = get_int_env_var(\n"
+        "            \"SGLANG_MOONCAKE_MAX_TRANSFER_BATCH_INDICES\", 1024\n"
+        "        )\n"
+        "        self.enable_custom_mem_pool = False\n"
+        "        self.custom_mem_pool_type = None\n"
+        "        self.decode_l3_read_path = (\n"
+        "            os.environ.get(\"DUALPATH_L3_READ_PATH\", \"prefill\")\n"
+        "            == \"decode\"\n"
+        "        )\n"
+        "        self.decode_l3_storage_backend = getattr(\n"
+        "            args, \"dualpath_decode_storage_backend\", None\n"
+        "        )\n"
+        "        self.decode_l3_receivers = {}\n"
+        "        self.decode_l3_reverse_pending = set()\n"
+        "        self.decode_l3_reverse_done = set()\n"
+        "        self.decode_l3_reverse_expected = {}\n"
+        "        self.decode_l3_reverse_responses = defaultdict(set)\n"
+        "        if self.disaggregation_mode == DisaggregationMode.PREFILL:\n",
+        "initialize Decode L3 reverse state",
+    )
+    source = replace_once(
+        source,
+        "    def _transfer_data(self, mooncake_session_id, transfer_blocks):\n",
+        "    def load_decode_l3_prefix(\n"
+        "        self, request_id, token_ids, host_token_indices\n"
+        "    ):\n"
+        "        if (\n"
+        "            not self.decode_l3_read_path\n"
+        "            or self.decode_l3_storage_backend is None\n"
+        "            or not self.decode_host_staging_enabled\n"
+        "        ):\n"
+        "            return 0\n"
+        "        page_size = self.decode_host_staging_pool.page_size\n"
+        "        candidate_tokens = max(0, len(token_ids) - 1)\n"
+        "        candidate_tokens -= candidate_tokens % page_size\n"
+        "        read_start = time.perf_counter()\n"
+        "        hit_tokens = 0\n"
+        "        prior_hash = None\n"
+        "        target = self.decode_host_staging_pool.get_dummy_flat_data_page()\n"
+        "        for offset in range(0, candidate_tokens, page_size):\n"
+        "            page_tokens = token_ids[offset : offset + page_size]\n"
+        "            page_hash = get_hash_str(page_tokens, prior_hash=prior_hash)\n"
+        "            data_page = self.decode_l3_storage_backend.get(page_hash, target)\n"
+        "            if data_page is None:\n"
+        "                break\n"
+        "            self.decode_host_staging_pool.set_from_flat_data_page(\n"
+        "                int(host_token_indices[offset]), data_page\n"
+        "            )\n"
+        "            hit_tokens += page_size\n"
+        "            prior_hash = page_hash\n"
+        "        read_end = time.perf_counter()\n"
+        "        logger.info(\n"
+        "            \"DUALPATH_DECODE_L3_READ rid=%s decode_engine=%s \"\n"
+        "            \"tp_rank=%d read_start=%.9f read_end=%.9f \"\n"
+        "            \"read_s=%.9f tokens=%d\",\n"
+        "            request_id,\n"
+        "            os.environ.get(\"DECODE_ID\", \"0\"),\n"
+        "            self.kv_args.engine_rank,\n"
+        "            read_start,\n"
+        "            read_end,\n"
+        "            read_end - read_start,\n"
+        "            hit_tokens,\n"
+        "        )\n"
+        "        return hit_tokens\n"
+        "\n"
+        "    def register_decode_l3_receiver(self, room, receiver):\n"
+        "        self.decode_l3_receivers[room] = receiver\n"
+        "\n"
+        "    def unregister_decode_l3_receiver(self, room, receiver):\n"
+        "        if self.decode_l3_receivers.get(room) is receiver:\n"
+        "            self.decode_l3_receivers.pop(room, None)\n"
+        "\n"
+        "    def get_decode_l3_hit_tokens(self, room):\n"
+        "        infos = self.transfer_infos.get(room, {}).values()\n"
+        "        hits = [info.decode_l3_hit_tokens for info in infos]\n"
+        "        return min(hits) if hits else 0\n"
+        "\n"
+        "    def start_decode_l3_reverse(self, room, prefill_page_indices):\n"
+        "        infos = self.transfer_infos.get(room, {})\n"
+        "        if not infos or len(prefill_page_indices) == 0:\n"
+        "            return\n"
+        "        self.decode_l3_reverse_pending.add(room)\n"
+        "        self.decode_l3_reverse_done.discard(room)\n"
+        "        self.decode_l3_reverse_expected[room] = set(infos.keys())\n"
+        "        self.decode_l3_reverse_responses.pop(room, None)\n"
+        "        packed_ptrs = b\"\".join(\n"
+        "            struct.pack(\"Q\", ptr) for ptr in self.kv_args.kv_data_ptrs\n"
+        "        )\n"
+        "        for info in infos.values():\n"
+        "            self._connect(\n"
+        "                format_tcp_address(info.endpoint, info.dst_port),\n"
+        "                is_ipv6=is_valid_ipv6_address(info.endpoint),\n"
+        "            ).send_multipart(\n"
+        "                [\n"
+        "                    self.DECODE_L3_REVERSE_FETCH_HEADER,\n"
+        "                    str(room).encode(\"ascii\"),\n"
+        "                    self.local_ip.encode(\"ascii\"),\n"
+        "                    str(self.rank_port).encode(\"ascii\"),\n"
+        "                    self.get_session_id().encode(\"ascii\"),\n"
+        "                    packed_ptrs,\n"
+        "                    np.asarray(\n"
+        "                        prefill_page_indices, dtype=np.int32\n"
+        "                    ).tobytes(),\n"
+        "                ]\n"
+        "            )\n"
+        "\n"
+        "    def decode_l3_reverse_is_pending(self, room):\n"
+        "        return room in self.decode_l3_reverse_pending\n"
+        "\n"
+        "    def decode_l3_reverse_is_done(self, room):\n"
+        "        return room in self.decode_l3_reverse_done\n"
+        "\n"
+        "    def clear_decode_l3_reverse(self, room):\n"
+        "        self.decode_l3_reverse_pending.discard(room)\n"
+        "        self.decode_l3_reverse_done.discard(room)\n"
+        "        self.decode_l3_reverse_expected.pop(room, None)\n"
+        "        self.decode_l3_reverse_responses.pop(room, None)\n"
+        "\n"
+        "    def _handle_decode_l3_reverse_fetch(self, msg):\n"
+        "        room = int(msg[1].decode(\"ascii\"))\n"
+        "        prefill_endpoint = msg[2].decode(\"ascii\")\n"
+        "        prefill_port = int(msg[3].decode(\"ascii\"))\n"
+        "        prefill_session_id = msg[4].decode(\"ascii\")\n"
+        "        dst_ptrs = list(struct.unpack(f\"{len(msg[5]) // 8}Q\", msg[5]))\n"
+        "        dst_indices = np.frombuffer(msg[6], dtype=np.int32)\n"
+        "        status = KVPoll.Failed\n"
+        "        try:\n"
+        "            receiver = self.decode_l3_receivers[room]\n"
+        "            src_indices = receiver.host_staging_page_indices[\n"
+        "                : len(dst_indices)\n"
+        "            ]\n"
+        "            if len(src_indices) != len(dst_indices):\n"
+        "                raise RuntimeError(\n"
+        "                    f\"Decode L3 prefix page mismatch for room {room}: \"\n"
+        "                    f\"{len(src_indices)} != {len(dst_indices)}\"\n"
+        "                )\n"
+        "            reverse_start = time.perf_counter()\n"
+        "            if not hasattr(self.kv_args, \"prefill_start_layer\"):\n"
+        "                self.kv_args.prefill_start_layer = 0\n"
+        "            ret = self._send_kvcache_generic(\n"
+        "                mooncake_session_id=prefill_session_id,\n"
+        "                src_data_ptrs=self.kv_args.kv_data_ptrs,\n"
+        "                dst_data_ptrs=dst_ptrs,\n"
+        "                item_lens=self.kv_args.kv_item_lens,\n"
+        "                prefill_data_indices=src_indices,\n"
+        "                dst_data_indices=dst_indices,\n"
+        "                executor=None,\n"
+        "            )\n"
+        "            reverse_end = time.perf_counter()\n"
+        "            status = KVPoll.Success if ret == 0 else KVPoll.Failed\n"
+        "            logger.info(\n"
+        "                \"DUALPATH_DECODE_L3_REVERSE rid_room=%d \"\n"
+        "                \"decode_engine=%s tp_rank=%d pages=%d \"\n"
+        "                \"transfer_s=%.9f status=%d\",\n"
+        "                room,\n"
+        "                os.environ.get(\"DECODE_ID\", \"0\"),\n"
+        "                self.kv_args.engine_rank,\n"
+        "                len(dst_indices),\n"
+        "                reverse_end - reverse_start,\n"
+        "                status,\n"
+        "            )\n"
+        "        except Exception as error:\n"
+        "            logger.exception(\n"
+        "                \"Decode L3 reverse transfer failed for room %d: %s\",\n"
+        "                room,\n"
+        "                error,\n"
+        "            )\n"
+        "        self._connect(\n"
+        "            format_tcp_address(prefill_endpoint, prefill_port),\n"
+        "            is_ipv6=is_valid_ipv6_address(prefill_endpoint),\n"
+        "        ).send_multipart(\n"
+        "            [\n"
+        "                self.DECODE_L3_REVERSE_COMPLETE_HEADER,\n"
+        "                str(room).encode(\"ascii\"),\n"
+        "                str(status).encode(\"ascii\"),\n"
+        "                self.get_session_id().encode(\"ascii\"),\n"
+        "            ]\n"
+        "        )\n"
+        "\n"
+        "    def _transfer_data(self, mooncake_session_id, transfer_blocks):\n",
+        "read Decode L3 pages and reverse-send them to Prefill",
+    )
+    source = replace_once(
+        source,
+        "                waiting_req_bytes = self.server_socket.recv_multipart()\n"
+        "                room = waiting_req_bytes[0].decode(\"ascii\")\n"
+        "                mooncake_session_id = waiting_req_bytes[3].decode(\"ascii\")\n",
+        "                waiting_req_bytes = self.server_socket.recv_multipart()\n"
+        "                if (\n"
+        "                    waiting_req_bytes[0]\n"
+        "                    == self.DECODE_L3_REVERSE_COMPLETE_HEADER\n"
+        "                ):\n"
+        "                    reverse_room = int(waiting_req_bytes[1].decode(\"ascii\"))\n"
+        "                    reverse_status = int(\n"
+        "                        waiting_req_bytes[2].decode(\"ascii\")\n"
+        "                    )\n"
+        "                    reverse_session = waiting_req_bytes[3].decode(\"ascii\")\n"
+        "                    if reverse_status != KVPoll.Success:\n"
+        "                        self.record_failure(\n"
+        "                            reverse_room,\n"
+        "                            \"Decode-to-Prefill L3 reverse transfer failed\",\n"
+        "                        )\n"
+        "                        self.update_status(reverse_room, KVPoll.Failed)\n"
+        "                    else:\n"
+        "                        self.decode_l3_reverse_responses[reverse_room].add(\n"
+        "                            reverse_session\n"
+        "                        )\n"
+        "                        expected = self.decode_l3_reverse_expected.get(\n"
+        "                            reverse_room, set()\n"
+        "                        )\n"
+        "                        if expected and expected.issubset(\n"
+        "                            self.decode_l3_reverse_responses[reverse_room]\n"
+        "                        ):\n"
+        "                            self.decode_l3_reverse_done.add(reverse_room)\n"
+        "                    continue\n"
+        "                room = waiting_req_bytes[0].decode(\"ascii\")\n"
+        "                mooncake_session_id = waiting_req_bytes[3].decode(\"ascii\")\n",
+        "handle Decode L3 reverse completion on Prefill",
+    )
+    source = replace_once(
+        source,
+        "                if msg[0] == MooncakeKVManager.AUX_DATA_HEADER:\n"
+        "                    self._handle_aux_data(msg)\n"
+        "                    continue\n",
+        "                if msg[0] == MooncakeKVManager.AUX_DATA_HEADER:\n"
+        "                    self._handle_aux_data(msg)\n"
+        "                    continue\n"
+        "                if msg[0] == self.DECODE_L3_REVERSE_FETCH_HEADER:\n"
+        "                    self._handle_decode_l3_reverse_fetch(msg)\n"
+        "                    continue\n",
+        "handle Prefill reverse-fetch command on Decode",
+    )
+    source = replace_once(
+        source,
+        "                state_indices=state_indices,\n"
+        "            )\n"
+        "\n"
+        "    def poll(self) -> KVPoll:\n"
+        "        if self.conclude_state is None:\n"
+        "            status = self.kv_mgr.check_status(self.bootstrap_room)\n"
+        "            if status in (KVPoll.Success, KVPoll.Failed):\n",
+        "                state_indices=state_indices,\n"
+        "            )\n"
+        "\n"
+        "    def poll(self) -> KVPoll:\n"
+        "        if self.conclude_state is None:\n"
+        "            status = self.kv_mgr.check_status(self.bootstrap_room)\n"
+        "            if (\n"
+        "                status == KVPoll.WaitingForInput\n"
+        "                and self.kv_mgr.decode_l3_reverse_is_pending(\n"
+        "                    self.bootstrap_room\n"
+        "                )\n"
+        "                and not self.kv_mgr.decode_l3_reverse_is_done(\n"
+        "                    self.bootstrap_room\n"
+        "                )\n"
+        "            ):\n"
+        "                return KVPoll.Bootstrapping\n"
+        "            if status in (KVPoll.Success, KVPoll.Failed):\n",
+        "keep Prefill request bootstrapping during reverse transfer",
+    )
+    source = replace_once(
+        source,
+        "    def clear(self) -> None:\n"
+        "        if self.bootstrap_room in self.kv_mgr.request_status:\n"
+        "            self.kv_mgr.request_status.pop(self.bootstrap_room)\n",
+        "    def clear(self) -> None:\n"
+        "        self.kv_mgr.clear_decode_l3_reverse(self.bootstrap_room)\n"
+        "        if self.bootstrap_room in self.kv_mgr.request_status:\n"
+        "            self.kv_mgr.request_status.pop(self.bootstrap_room)\n",
+        "clear Prefill reverse-transfer state",
+    )
+    source = replace_once(
+        source,
+        "        self.host_staging_h2d_start = None\n"
+        "        self.host_staging_h2d_end = None\n"
+        "        super().__init__(mgr, bootstrap_addr, bootstrap_room, prefill_dp_rank)\n",
+        "        self.host_staging_h2d_start = None\n"
+        "        self.host_staging_h2d_end = None\n"
+        "        self.host_staging_page_indices = np.array([], dtype=np.int32)\n"
+        "        self.decode_l3_hit_tokens = 0\n"
+        "        super().__init__(mgr, bootstrap_addr, bootstrap_room, prefill_dp_rank)\n",
+        "initialize Decode L3 receiver state",
+    )
+    source = replace_once(
+        source,
+        "        state_indices: Optional[List[int]] = None,\n"
+        "    ):\n"
+        "        if self.kv_mgr.decode_host_staging_enabled:\n"
+        "            self.kv_indices = np.array(kv_indices, dtype=np.int64, copy=True)\n"
+        "            (\n"
+        "                self.host_staging_token_indices,\n"
+        "                kv_indices,\n"
+        "            ) = self.kv_mgr.allocate_decode_host_staging(self.kv_indices)\n",
+        "        state_indices: Optional[List[int]] = None,\n"
+        "        token_ids: Optional[List[int]] = None,\n"
+        "        request_id: Optional[str] = None,\n"
+        "    ):\n"
+        "        if self.kv_mgr.decode_host_staging_enabled:\n"
+        "            self.kv_indices = np.array(kv_indices, dtype=np.int64, copy=True)\n"
+        "            (\n"
+        "                self.host_staging_token_indices,\n"
+        "                kv_indices,\n"
+        "            ) = self.kv_mgr.allocate_decode_host_staging(self.kv_indices)\n"
+        "            self.host_staging_page_indices = np.array(\n"
+        "                kv_indices, dtype=np.int32, copy=True\n"
+        "            )\n"
+        "            if token_ids is not None and request_id is not None:\n"
+        "                self.decode_l3_hit_tokens = self.kv_mgr.load_decode_l3_prefix(\n"
+        "                    request_id, token_ids, self.host_staging_token_indices\n"
+        "                )\n"
+        "                self.kv_mgr.register_decode_l3_receiver(\n"
+        "                    self.bootstrap_room, self\n"
+        "                )\n",
+        "load Decode L3 prefix during receiver initialization",
+    )
+    source = replace_once(
+        source,
+        "                        str(self.required_dst_info_num).encode(\"ascii\"),\n"
+        "                    ]\n",
+        "                        str(self.required_dst_info_num).encode(\"ascii\"),\n"
+        "                        str(self.decode_l3_hit_tokens).encode(\"ascii\"),\n"
+        "                    ]\n",
+        "send Decode L3 hit tokens to Prefill",
+    )
+    source = replace_once(
+        source,
+        "    def clear(self) -> None:\n"
+        "        if self.host_staging_token_indices is not None:\n",
+        "    def clear(self) -> None:\n"
+        "        self.kv_mgr.unregister_decode_l3_receiver(self.bootstrap_room, self)\n"
+        "        if self.host_staging_token_indices is not None:\n",
+        "unregister Decode L3 receiver",
+    )
+    path.write_text(source)
+    print(f"Patched: {path}")
+
+
 def patch_decode_owns_l3_offload(path: Path) -> None:
     source = path.read_text()
     marker = "DUALPATH_DECODE_OFFLOAD_START"
@@ -1024,17 +1719,27 @@ def main() -> None:
     args = parser.parse_args()
     srt = args.site_packages / "sglang/srt"
     patch_hiradix(srt / "mem_cache/hiradix_cache.py")
+    patch_decode_l3_scheduler(srt / "managers/scheduler.py")
+    patch_decode_l3_schedule_policy(srt / "managers/schedule_policy.py")
+    patch_decode_l3_runtime_checker(
+        srt / "managers/scheduler_runtime_checker_mixin.py"
+    )
     patch_schedule_batch(srt / "managers/schedule_batch.py")
     patch_mooncake_bounded_transfer(
         srt / "disaggregation/mooncake/conn.py"
     )
     patch_prefill_transfer(srt / "disaggregation/prefill.py")
+    patch_prefill_decode_l3_reverse(srt / "disaggregation/prefill.py")
     patch_decode_receive(srt / "disaggregation/decode.py")
     patch_bounded_decode_host_staging_pool(
         srt / "mem_cache/memory_pool_host.py"
     )
     patch_decode_host_staging(srt / "disaggregation/decode.py")
+    patch_decode_l3_read(srt / "disaggregation/decode.py")
     patch_mooncake_decode_host_staging(
+        srt / "disaggregation/mooncake/conn.py"
+    )
+    patch_mooncake_decode_l3_reverse(
         srt / "disaggregation/mooncake/conn.py"
     )
     patch_decode_owns_l3_offload(

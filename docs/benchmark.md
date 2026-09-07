@@ -97,9 +97,27 @@ Repetitions：3
   `run.json.decode_pd_host_staging*`；
 - `HICACHE_STORAGE_BACKEND=file`：HiCache L3 直接使用共享 Lustre 文件，
   Mooncake 仅负责 P→D RDMA，不再使用 Mooncake Store/global segment；
+- `DUALPATH_L3_READ_PATH=prefill|decode`：选择 durable prefix 从 Prefill 侧
+  读取后完整 P→D，或由对应 Decode engine 读入 PD Host staging、反向发送
+  prefix 后仅 P→D 新 suffix；默认 `prefill`；
 - 默认 `STORAGE_SETTLE_SECONDS=0`。Decode 每个 TP rank 在该 request 的 L3
   backup ACK 后原子发布 completion marker；同一 trajectory 发下一 turn 前
   必须等待上一 turn 的 8 个 rank marker，等待不计入 `turn_wall_seconds`；
+
+### 32K 1P2D 1-agent L3 读取分支验收
+
+2026-09-07 使用原始 32K trajectory 完整运行 26 turns，配置为
+`PAPER_EXPAND_AGENTS=0`、`TRAJECTORY_OFFSET=0`，不进行 agent/trajectory 采样。
+
+- `DUALPATH_L3_READ_PATH=prefill`：Job `67520`，结果
+  `decode-l3-branch-prefill-67514`。Prefill L3 read 共 `485632` tokens，Decode
+  L3 read 为 `0`，P→D 共传输 `512421` logical tokens；
+- `DUALPATH_L3_READ_PATH=decode`：候选镜像
+  `sglang-file-l3-dual-staging-67578.sqsh`，Job `67584`，结果
+  `decode-l3-branch-decode-67578`。Prefill L3 read 为 `0`，Decode L3 read 共
+  `485632` tokens，P→D 仅传输 suffix，共 `26789` logical tokens；
+- 两条路径的 `prefill_l3_cached_token_coverage=1.0`、P→D timing coverage 和
+  request timing coverage 均为 `1.0`，且 `stream_retry_count=0`。
 - Decode 在 rollout 中持续把新增 KV 写入 Lustre，下一轮从该目录加载；
 - JCT：`trajectory_jct` / turn_wall **不含** release/settle；batch `wall_seconds`
   含真实墙钟。

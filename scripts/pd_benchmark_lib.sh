@@ -40,6 +40,11 @@ dualpath_export_common_env() {
   export STORAGE_SETTLE_SECONDS=${STORAGE_SETTLE_SECONDS:-0}
   export DUALPATH_DECODE_L3_SYNC_RANKS=${DUALPATH_DECODE_L3_SYNC_RANKS:-8}
   export DUALPATH_DECODE_L3_SYNC_TIMEOUT=${DUALPATH_DECODE_L3_SYNC_TIMEOUT:-600}
+  export DUALPATH_L3_READ_PATH=${DUALPATH_L3_READ_PATH:-prefill}
+  if [[ "$DUALPATH_L3_READ_PATH" != prefill && "$DUALPATH_L3_READ_PATH" != decode ]]; then
+    echo "DUALPATH_L3_READ_PATH must be prefill or decode" >&2
+    return 2
+  fi
   export MODEL_DIR LOG_DIR CACHE_DIR IB_DEVICE PREFILL_PORT DECODE_PORT
   export BOOTSTRAP_PORT ROUTER_PORT SERVER_TIMEOUT
   export MC_TRANSFER_TIMEOUT SGLANG_MOONCAKE_MAX_TRANSFER_BATCH_INDICES
@@ -51,6 +56,7 @@ dualpath_export_common_env() {
   export DUALPATH_DECODE_PD_HOST_STAGING_GB DECODE_HICACHE_RATIO
   export FLUSH_LOCAL_CACHE_BETWEEN_TURNS STORAGE_SETTLE_SECONDS
   export DUALPATH_DECODE_L3_SYNC_RANKS DUALPATH_DECODE_L3_SYNC_TIMEOUT
+  export DUALPATH_L3_READ_PATH
   export MOONCAKE_DEVICE
 }
 
@@ -208,6 +214,7 @@ Path(sys.argv[1]).write_text(json.dumps({
     "decode_l3_completion_sync_timeout_seconds": float(
         os.environ.get("DUALPATH_DECODE_L3_SYNC_TIMEOUT", "600")
     ),
+    "l3_read_path": os.environ.get("DUALPATH_L3_READ_PATH", "prefill"),
     "kv_buffer_semantics": (
         "DualPath paper: staging/GPU buffers released after each request; "
         "cross-turn reuse via L3 only. SGLang approximation: after successful "

@@ -24,6 +24,12 @@ L3_PATTERN = re.compile(
     r"read_start=(?P<start>[0-9.]+) read_end=(?P<end>[0-9.]+) "
     r"read_s=(?P<read>[0-9.]+) tokens=(?P<tokens>\d+)"
 )
+DECODE_L3_PATTERN = re.compile(
+    r"DUALPATH_DECODE_L3_READ rid=(?P<rid>\S+) "
+    r"decode_engine=(?P<engine>\S+) tp_rank=(?P<rank>\d+) "
+    r"read_start=(?P<start>[0-9.]+) read_end=(?P<end>[0-9.]+) "
+    r"read_s=(?P<read>[0-9.]+) tokens=(?P<tokens>\d+)"
+)
 P_TRANSFER_PATTERN = re.compile(
     r"DUALPATH_TTFT_P_TRANSFER(?:_V2)? rid=(?P<rid>\S+) .*?"
     r"transfer_s=(?P<seconds>[0-9.]+) logical_tokens=(?P<tokens>\d+)"
@@ -49,7 +55,7 @@ def l3_cached_token_coverage(rows: list[dict[str, Any]]) -> float:
     l3_tokens = sum(
         min(
             int(item["cached_tokens"]),
-            int(item["l3_prefetched_tokens_logical"]),
+            int(item["l3_read_tokens_logical"]),
         )
         for item in reusable
     )
@@ -63,11 +69,17 @@ def parse_timing_logs(
     dict[str, dict[str, float]],
     dict[str, dict[str, float]],
     dict[str, dict[str, float]],
+    dict[str, dict[str, float]],
 ]:
     request_values: dict[str, dict[str, list[float]]] = defaultdict(
         lambda: defaultdict(list)
     )
     l3_values: dict[
+        str, dict[str, dict[int, dict[str, list[float]]]]
+    ] = defaultdict(
+        lambda: defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
+    )
+    decode_l3_values: dict[
         str, dict[str, dict[int, dict[str, list[float]]]]
     ] = defaultdict(
         lambda: defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
@@ -78,7 +90,7 @@ def parse_timing_logs(
     release_values: dict[str, dict[str, list[float]]] = defaultdict(
         lambda: defaultdict(list)
     )
-    for path in log_dir.glob("prefill*.log"):
+    for path in log_dir.glob("*.log"):
         for line in path.read_text(errors="replace").splitlines():
             match = REQUEST_PATTERN.search(line)
             if match and match.group("type").lower() == "prefill":
@@ -102,6 +114,15 @@ def parse_timing_logs(
                 l3_values[rid][engine][rank]["tokens"].append(
                     float(match.group("tokens"))
                 )
+            match = DECODE_L3_PATTERN.search(line)
+            if match:
+                rid = match.group("rid")
+                engine = match.group("engine")
+                rank = int(match.group("rank"))
+                for name in ("read", "start", "end", "tokens"):
+                    decode_l3_values[rid][engine][rank][name].append(
+                        float(match.group(name))
+                    )
             match = P_TRANSFER_PATTERN.search(line)
             if match:
                 rid = match.group("rid")
@@ -134,36 +155,44 @@ def parse_timing_logs(
         rid: {name: statistics.median(values) for name, values in fields.items()}
         for rid, fields in request_values.items()
     }
-    l3 = {}
-    for rid, engines in l3_values.items():
-        if len(engines) != 1:
-            raise RuntimeError(
-                f"{rid} has L3 timing from Prefill Engines {sorted(engines)}"
-            )
-        engine, ranks = next(iter(engines.items()))
-        if len(ranks) != 8:
-            raise RuntimeError(
-                f"{rid} on Prefill Engine {engine} has {len(ranks)}/8 "
-                "TP rank timings"
-            )
-        reduced = {
-            rank: {
-                name: statistics.median(values)
-                for name, values in fields.items()
+    def reduce_l3(
+        values: dict[str, dict[str, dict[int, dict[str, list[float]]]]],
+        side: str,
+    ) -> dict[str, dict[str, float]]:
+        result = {}
+        for rid, engines in values.items():
+            if len(engines) != 1:
+                raise RuntimeError(
+                    f"{rid} has L3 timing from {side} Engines {sorted(engines)}"
+                )
+            engine, ranks = next(iter(engines.items()))
+            if len(ranks) != 8:
+                raise RuntimeError(
+                    f"{rid} on {side} Engine {engine} has {len(ranks)}/8 "
+                    "TP rank timings"
+                )
+            reduced = {
+                rank: {
+                    name: statistics.median(field_values)
+                    for name, field_values in fields.items()
+                }
+                for rank, fields in ranks.items()
             }
-            for rank, fields in ranks.items()
-        }
-        slowest_rank, slowest = max(
-            reduced.items(), key=lambda item: item[1]["read"]
-        )
-        l3[rid] = {
-            "read": max(item["end"] for item in reduced.values())
-            - min(item["start"] for item in reduced.values()),
-            "tokens": min(item["tokens"] for item in reduced.values()),
-            "engine": engine,
-            "slowest_rank": slowest_rank,
-            "rank_count": len(reduced),
-        }
+            slowest_rank, _ = max(
+                reduced.items(), key=lambda item: item[1]["read"]
+            )
+            result[rid] = {
+                "read": max(item["end"] for item in reduced.values())
+                - min(item["start"] for item in reduced.values()),
+                "tokens": min(item["tokens"] for item in reduced.values()),
+                "engine": engine,
+                "slowest_rank": slowest_rank,
+                "rank_count": len(reduced),
+            }
+        return result
+
+    l3 = reduce_l3(l3_values, "Prefill")
+    decode_l3 = reduce_l3(decode_l3_values, "Decode")
     transfers = {
         rid: {
             name: statistics.median(values)
@@ -178,7 +207,7 @@ def parse_timing_logs(
         }
         for rid, fields in release_values.items()
     }
-    return requests, l3, transfers, releases
+    return requests, l3, decode_l3, transfers, releases
 
 
 def load_runs(result_dir: Path) -> list[dict[str, Any]]:
@@ -248,9 +277,13 @@ def main() -> None:
     args = parser.parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    request_timing, l3_timing, pd_timing, release_timing = parse_timing_logs(
-        args.log_dir
-    )
+    (
+        request_timing,
+        prefill_l3_timing,
+        decode_l3_timing,
+        pd_timing,
+        release_timing,
+    ) = parse_timing_logs(args.log_dir)
     runs = load_runs(args.result_dir)
     merged_rounds = []
     run_rows = []
@@ -261,7 +294,8 @@ def main() -> None:
         for item in rounds:
             rid = item["request_id"]
             request = request_timing.get(rid, {})
-            l3 = l3_timing.get(rid, {})
+            prefill_l3 = prefill_l3_timing.get(rid, {})
+            decode_l3 = decode_l3_timing.get(rid, {})
             pd = pd_timing.get(rid, {})
             release = release_timing.get(rid, {})
             pd_payload_tokens = int(
@@ -269,7 +303,9 @@ def main() -> None:
             )
             sch = float(request.get("queue", 0.0))
             alloc = float(request.get("alloc", 0.0))
-            read = float(l3.get("read", 0.0))
+            prefill_read = float(prefill_l3.get("read", 0.0))
+            decode_read = float(decode_l3.get("read", 0.0))
+            read = prefill_read + decode_read
             prefill = float(request.get("prefill", 0.0))
             ttft = float(item["ttft_seconds"])
             stage_sum = sch + alloc + read + prefill
@@ -283,13 +319,46 @@ def main() -> None:
                     "prefill_seconds": prefill,
                     "residual_seconds": max(0.0, ttft - stage_sum),
                     "overlap_excess_seconds": max(0.0, stage_sum - ttft),
-                    "l3_prefetched_tokens_tp0": int(l3.get("tokens", 0)),
-                    "l3_prefetched_tokens_logical": int(l3.get("tokens", 0)),
-                    "l3_prefill_engine_id": l3.get("engine", ""),
-                    "l3_slowest_tp_rank": int(l3.get("slowest_rank", -1)),
-                    "l3_tp_rank_count": int(l3.get("rank_count", 0)),
+                    "prefill_l3_read_seconds": prefill_read,
+                    "prefill_l3_read_tokens": int(prefill_l3.get("tokens", 0)),
+                    "prefill_l3_read_bytes": int(prefill_l3.get("tokens", 0))
+                    * KV_BYTES_PER_TOKEN,
+                    "prefill_l3_effective_bandwidth_gbps": (
+                        int(prefill_l3.get("tokens", 0))
+                        * KV_BYTES_PER_TOKEN
+                        / prefill_read
+                        / 1e9
+                        if prefill_read > 0
+                        else 0.0
+                    ),
+                    "decode_l3_read_seconds": decode_read,
+                    "decode_l3_read_tokens": int(decode_l3.get("tokens", 0)),
+                    "decode_l3_read_bytes": int(decode_l3.get("tokens", 0))
+                    * KV_BYTES_PER_TOKEN,
+                    "decode_l3_effective_bandwidth_gbps": (
+                        int(decode_l3.get("tokens", 0))
+                        * KV_BYTES_PER_TOKEN
+                        / decode_read
+                        / 1e9
+                        if decode_read > 0
+                        else 0.0
+                    ),
+                    "l3_read_tokens_logical": int(prefill_l3.get("tokens", 0))
+                    + int(decode_l3.get("tokens", 0)),
+                    "l3_prefetched_tokens_tp0": int(prefill_l3.get("tokens", 0)),
+                    "l3_prefetched_tokens_logical": int(prefill_l3.get("tokens", 0)),
+                    "l3_prefill_engine_id": prefill_l3.get("engine", ""),
+                    "l3_decode_engine_id": decode_l3.get("engine", ""),
+                    "l3_slowest_tp_rank": int(prefill_l3.get("slowest_rank", -1)),
+                    "l3_tp_rank_count": int(prefill_l3.get("rank_count", 0)),
+                    "decode_l3_slowest_tp_rank": int(
+                        decode_l3.get("slowest_rank", -1)
+                    ),
+                    "decode_l3_tp_rank_count": int(decode_l3.get("rank_count", 0)),
                     "has_request_timing": bool(request),
-                    "has_l3_timing": bool(l3),
+                    "has_l3_timing": bool(prefill_l3) or bool(decode_l3),
+                    "has_prefill_l3_timing": bool(prefill_l3),
+                    "has_decode_l3_timing": bool(decode_l3),
                     "pd_transfer_seconds": float(pd.get("seconds", 0.0)),
                     "pd_transfer_tokens": int(pd.get("tokens", 0)),
                     "pd_transfer_page_aligned_tokens": int(
@@ -341,6 +410,18 @@ def main() -> None:
                 "sch_mean_seconds": mean(values("sch_seconds")),
                 "alloc_mean_seconds": mean(values("alloc_seconds")),
                 "read_mean_seconds": mean(values("read_seconds")),
+                "prefill_l3_read_mean_seconds": mean(
+                    values("prefill_l3_read_seconds")
+                ),
+                "decode_l3_read_mean_seconds": mean(
+                    values("decode_l3_read_seconds")
+                ),
+                "prefill_l3_effective_bandwidth_mean_gbps": mean(
+                    values("prefill_l3_effective_bandwidth_gbps")
+                ),
+                "decode_l3_effective_bandwidth_mean_gbps": mean(
+                    values("decode_l3_effective_bandwidth_gbps")
+                ),
                 "prefill_mean_seconds": mean(values("prefill_seconds")),
                 "residual_mean_seconds": mean(values("residual_seconds")),
                 "prompt_tokens_min": min(int(item["prompt_tokens"]) for item in rounds),
@@ -495,9 +576,18 @@ def main() -> None:
         ),
         "prefill_local_prefix_reuse_rounds": sum(
             int(item["cached_tokens"]) > 0
-            and int(item["l3_prefetched_tokens_logical"])
+            and int(item["l3_read_tokens_logical"])
             < int(item["cached_tokens"])
             for item in deferred_evict_rows
+        ),
+        "l3_read_paths": sorted(
+            {str(item.get("l3_read_path", "prefill")) for item in merged_rounds}
+        ),
+        "prefill_l3_read_tokens_total": sum(
+            int(item["prefill_l3_read_tokens"]) for item in merged_rounds
+        ),
+        "decode_l3_read_tokens_total": sum(
+            int(item["decode_l3_read_tokens"]) for item in merged_rounds
         ),
         "batched_token_chunks": sum(
             int(item.get("batched_token_chunks", 0)) for item in merged_rounds
@@ -537,6 +627,18 @@ def main() -> None:
         raise RuntimeError(
             f"Unexpected Prefill local-prefix reuse after deferred eviction: {validation}"
         )
+    if validation["l3_read_paths"] == ["prefill"]:
+        if validation["decode_l3_read_tokens_total"] != 0:
+            raise RuntimeError(
+                f"Decode performed L3 reads on the Prefill-read branch: {validation}"
+            )
+    elif validation["l3_read_paths"] == ["decode"]:
+        if validation["prefill_l3_read_tokens_total"] != 0:
+            raise RuntimeError(
+                f"Prefill performed L3 reads on the Decode-read branch: {validation}"
+            )
+    else:
+        raise RuntimeError(f"Mixed or invalid L3 read paths: {validation}")
     print(json.dumps(validation, indent=2))
 
 

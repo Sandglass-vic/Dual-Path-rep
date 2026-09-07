@@ -35,6 +35,30 @@ turn N+1: 再次从 Lustre 加载已发布前缀
 Mooncake master 仅为 P→D Transfer Engine 提供 metadata service。
 Job `65694` 未 flush，属于 L1/L2 顺风车对照，不是正式口径。
 
+## L3 读取位置分支
+
+`DUALPATH_L3_READ_PATH` 控制一次 request 的 durable prefix 由哪一侧从
+Lustre 读取，取值为 `prefill`（默认）或 `decode`。
+
+`prefill` 保持原数据流：Prefill HiCache 将 L3 prefix 恢复到 Prefill HBM，
+Prefill 计算 suffix，P→D 把完整 context KV 写入 Decode 的独立 pinned Host
+staging。
+
+`decode` 使用同一个 Decode staging pool，但改变读取和传输方向：
+
+1. 对应 Decode engine 按 64-token page 从 file backend 读取 durable prefix，
+   直接写入其 `layer_first` PD Host staging。
+2. Decode 通过 Mooncake Transfer Engine 将 prefix 反向发送到 Prefill 新分配的
+   HBM pages；8 个 TP rank 完成后 request 才离开 bootstrap queue。
+3. Prefill 只计算未命中的 suffix，正常 P→D sender 从 prefix page 后继续，因而
+   只把新 KV 写入 Decode staging 的尾部。
+4. Decode 在完整 staging 上执行一次 H2D，组合已有 prefix 和 P→D suffix，之后
+   的 decode/offload/completion-marker 路径不变。
+
+该分支不共享 Decode 的 HiCache Host pool；L3 read 使用现有 40 GB/rank
+`layer_first` PD staging，Decode offload 仍使用独立的 `page_first_direct` pool。
+`run.json.l3_read_path` 固化本轮配置。
+
 ## Prefill 与 P→D 传输粒度
 
 当前 Job `65032` 的实际参数为：

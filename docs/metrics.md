@@ -243,6 +243,12 @@ request-scoped 日志，以 request ID 与客户端 `rounds.jsonl` 关联。
   - `read_end` 在该 rank 首次观察到本地 storage IO 完成时、TP 完成共识
     `all_reduce` 之前记录，因此每个 rank 的 duration 不包含等待慢 rank 的时间。
   - 用途：L3 read latency、L3 timing coverage、有效加载带宽。
+- `DUALPATH_DECODE_L3_READ`
+  - 来源：被 Router 选中的 Decode engine，在反向传输前将 file-backend page
+    直接读入独立 PD Host staging。
+  - 字段：Decode engine、TP rank、read start/end/duration、tokens。
+  - 用途：Decode 侧 L3 数据量、时间和有效带宽；每个 request 必须只有一个
+    Decode engine，并有 8/8 TP rank timing。
 - `DUALPATH_TTFT_P_TRANSFER_V2`（解析器兼容旧
   `DUALPATH_TTFT_P_TRANSFER`）
   - 来源：Prefill disaggregation sender。
@@ -419,11 +425,9 @@ Job 结束时统一调用 `scripts/benchmark/collect_benchmark_metrics.py`。
 - latency：`turn.svg`、`ttft.svg`、`ttst.svg`、`tpot.svg`；JCT 与 turn 图信息
   重复，不单独画；
 - KV/cache：`kv-new.svg`、`kv-total.svg`、`cache-hit.svg`；
-- L3 read：`l3-read-data.svg` 汇总最长轨迹每个 turn 的 TP 聚合逻辑读取量，不在
-  文件名中使用有歧义的 engine 0；`l3-read-time-prefill-<ID>.svg` 才按 Prefill
-  replica 区分并展示其 TP ranks。1P* 只有 replica 0；2P2D 的 replica 0/1 共享
-  同一 Lustre file-backend 目录，但一个 request 只由 Router 选中的 replica
-  发起读取；
+- L3 read：`l3-read-data.svg` 在每个 turn 同时画 Prefill 与 Decode TP 聚合逻辑
+  读取量，未读取的一侧为 0；`l3-read-time-prefill-<ID>.svg` 和
+  `l3-read-time-decode-<ID>.svg` 分别展示实际读取 engine 的 8 个 TP ranks；
 - bandwidth：`l3-bandwidth.svg`、`pd-bandwidth.svg`。
 
 `all-trajectories/latency.svg` 同时展示每个 agent 的 trajectory JCT、agent 内
@@ -445,6 +449,7 @@ scripts/benchmark/replay_fake_agent_traces.py
 Prefill/Decode logs
   -> DUALPATH_REQ_TIMING
   -> DUALPATH_L3_TIMING
+  -> DUALPATH_DECODE_L3_READ
   -> DUALPATH_TTFT_P_TRANSFER
   -> DUALPATH_TTFT_D_RECEIVE
   -> DUALPATH_TTFT_D_DISPATCH
@@ -467,6 +472,7 @@ scripts/benchmark/collect_benchmark_metrics.py
        -> <run>/longest-trajectory/{kv-new,kv-total,cache-hit}.svg
        -> <run>/longest-trajectory/l3-read-data.svg
        -> <run>/longest-trajectory/l3-read-time-prefill-<ID>.svg
+       -> <run>/longest-trajectory/l3-read-time-decode-<ID>.svg
        -> <run>/longest-trajectory/{l3-bandwidth,pd-bandwidth}.svg
   -> scripts/plot/plot_run_summary.py
        -> <run>/all-trajectories/latency.svg
