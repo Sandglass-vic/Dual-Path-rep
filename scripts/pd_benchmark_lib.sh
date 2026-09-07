@@ -71,8 +71,22 @@ dualpath_wait_for_url() {
   done
 }
 
+dualpath_wait_for_url_down() {
+  local name=$1
+  local url=$2
+  local deadline=$((SECONDS + ${SERVER_SHUTDOWN_TIMEOUT:-120}))
+  while curl --fail --silent --max-time 2 "$url/health" >/dev/null; do
+    if (( SECONDS >= deadline )); then
+      echo "Timed out waiting for $name to stop at $url" >&2
+      return 1
+    fi
+    sleep 1
+  done
+}
+
 dualpath_stop_steps() {
   local pid
+  local host
   for pid in "${step_pids[@]:-}"; do
     kill "$pid" 2>/dev/null || true
   done
@@ -80,12 +94,33 @@ dualpath_stop_steps() {
     wait "$pid" 2>/dev/null || true
   done
   step_pids=()
+
+  # srun can exit before the remote task has released its listening socket.
+  # Do not delete this run's cache or accept the next run as healthy until all
+  # prior services are unreachable.
+  if [[ -n ${PREFILL_HOSTS:-} ]]; then
+    for host in $PREFILL_HOSTS; do
+      dualpath_wait_for_url_down \
+        "Prefill on $host" "http://$host:$PREFILL_PORT"
+    done
+  elif [[ -n ${PREFILL_HOST:-} ]]; then
+    dualpath_wait_for_url_down \
+      "Prefill on $PREFILL_HOST" "http://$PREFILL_HOST:$PREFILL_PORT"
+  fi
+  if [[ -n ${PREFILL_HOST:-} ]]; then
+    dualpath_wait_for_url_down \
+      "router on $PREFILL_HOST" "http://$PREFILL_HOST:$ROUTER_PORT"
+  fi
+  for host in ${DECODE_HOSTS:-}; do
+    dualpath_wait_for_url_down \
+      "Decode on $host" "http://$host:$DECODE_PORT"
+  done
 }
 
 dualpath_container_srun() {
   local host=$1
   shift
-  srun --nodes=1 --ntasks=1 --nodelist="$host" \
+  exec srun --nodes=1 --ntasks=1 --nodelist="$host" \
     --gres=gpu:8 --exclusive --exact --mpi=none \
     --container-image="$IMAGE" \
     --container-mounts="/mnt/lustre:/mnt/lustre,$CODE_HOME:/workspace/dual-path" \
