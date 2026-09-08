@@ -239,22 +239,47 @@ request-scoped 日志，以 request ID 与客户端 `rounds.jsonl` 关联。
   - 用途：request timing coverage、旧 proxy breakdown、full-chain Prefill 段。
 - `DUALPATH_L3_TIMING`
   - 来源：Prefill HiRadix/HiCache storage prefetch。
-  - 字段：Prefill engine、TP rank、read start/end/duration、tokens。
+  - 字段：Prefill engine、node、TP rank、read start/end/duration、tokens。
   - `read_end` 在该 rank 首次观察到本地 storage IO 完成时、TP 完成共识
     `all_reduce` 之前记录，因此每个 rank 的 duration 不包含等待慢 rank 的时间。
   - 用途：L3 read latency、L3 timing coverage、有效加载带宽。
 - `DUALPATH_DECODE_L3_READ`
   - 来源：被 Router 选中的 Decode engine，在反向传输前将 file-backend page
     直接读入独立 PD Host staging。
-  - 字段：Decode engine、TP rank、read start/end/duration、tokens。
+  - 字段：Decode engine、node、TP rank、read start/end/duration、tokens。
   - 用途：Decode 侧 L3 数据量、时间和有效带宽；每个 request 必须只有一个
     Decode engine，并有 8/8 TP rank timing。
+- `DUALPATH_D2P_REVERSE`
+  - 来源：Prefill bootstrap scheduler。
+  - 窗口：Prefill 发起 reverse-fetch 控制消息，到该 TP rank 收到所需 Decode
+    session 的全部 completion。
+  - 字段：request ID、Prefill engine、node、TP rank、start/end/duration、tokens。
+  - TP=8 使用 `min(rank start)` 到 `max(rank end)` 的同节点 monotonic-clock union，
+    表示 Decode Host staging → Prefill HBM 的端到端关键路径，而不是仅统计 Decode
+    侧 `_send_kvcache_generic()` 调用。
+- `DUALPATH_PREFILL_PREP_BREAKDOWN`
+  - 来源：Prefill scheduler 构造 EXTEND batch。
+  - `batch_init_end → hicache_end` 对应
+    `ready_to_load_host_cache()` / `cache_controller.start_loading()`，即 Prefill
+    HiCache prefix 的 Host→GPU restore launch 窗口。
+  - `hicache_consumer >= 0` 表示该 batch 确实创建了 HiCache load producer；空
+    load queue 返回 `-1`，不得把调用开销误算为 Host→GPU。
+  - TP=8 使用同节点 `min(rank start)` 到 `max(rank end)` 的 union；仅在
+    `cached > 0` 且 producer 有效时计入 TTFT。该窗口不额外同步 CUDA finish
+    event，后续逐层完成可与 Prefill forward 重叠，因此不会为了计时改变原执行
+    行为。
+- `DUALPATH_DECODE_HANDOFF_BREAKDOWN`
+  - 来源：被选中的 Decode engine bootstrap receiver。
+  - `prealloc_start → prealloc_end` 是 `_pre_alloc()` 的 Host wall-clock 窗口，包含
+    request slot、paged HBM KV slots 和 request-to-token mapping 分配。
+  - TP=8 使用同一 Decode node 上的 union；raw duration 始终保留为 diagnostic，
+    additive TTFT 只计入 Decode-path bootstrap envelope 中不与其他阶段重叠的部分。
 - `DUALPATH_TTFT_P_TRANSFER_V2`（解析器兼容旧
   `DUALPATH_TTFT_P_TRANSFER`）
   - 来源：Prefill disaggregation sender。
   - 窗口：第一个实际 KV chunk 提交到最终 `KVPoll.Success`。
-  - 字段：start/end/duration、logical tokens、page count、page size 和
-    page-aligned tokens。
+  - 字段：Prefill engine、node、start/end/duration、logical tokens、page count、
+    page size 和 page-aligned tokens。
 - `DUALPATH_TTFT_D_RECEIVE`
   - 来源：Decode receiver。
   - 用途：Decode 接收和 KV commit 诊断。
@@ -273,7 +298,7 @@ Prefill 与 Decode 位于不同节点。原始 `perf_counter` 时间戳不能跨
 ### Coverage
 
 - `request_timing_coverage`：有 `DUALPATH_REQ_TIMING` 的请求数 / 总请求数。
-- `l3_timing_coverage`：有 `DUALPATH_L3_TIMING` 的请求数 / 总请求数。
+- `l3_timing_coverage`：有 Prefill 或 Decode L3 timing 的请求数 / 总请求数。
 - `pd_timing_coverage`：有 P→D transfer marker 的请求数 / 总请求数。
 
 正式矩阵要求 request 和 P→D coverage 至少 95%；关闭 Prefill L3 时要求 L3
@@ -281,11 +306,21 @@ coverage 严格为零。启用 L3 时不设置 coverage 下限。
 
 ### TP=8 L3 聚合
 
-同一 request 必须取得一个 Prefill engine 的 8 个 TP rank timing。请求的
+同一 request 必须取得一个 Prefill 或 Decode engine 的 8 个 TP rank timing。请求的
 `read_seconds` 使用 `max(rank read duration)`，即最慢 rank 的本地 L3 IO
-耗时；`l3_slowest_tp_rank` 记录该瓶颈 rank。另保留
+耗时；另保留
 `tp_union_read_seconds = max(read_end) - min(read_start)` 作为 rank 启动偏斜
 诊断，但它不作为有效带宽分母。不能只使用 rank 0。
+
+逻辑读量使用 8 个 TP rank 报告的最小 `tokens`，避免把 TP=8 的同一份 KV
+重复计算。汇总器同时保留 `node/engine` 归属，在
+`kv-cache-monitor-scopes.json` 输出每个 Prefill/Decode node-engine 的 tokens、GiB
+和 request 数，并在有数据时生成对应的 `l3-read-data-<side>-<node>-<engine>.svg`；
+聚合图为 `kv-cache-monitor.svg`。
+
+`kv-cache-monitor.svg` 的 P→D 曲线使用 Prefill sender 报告的逻辑 payload；在
+Decode-read 分支应接近每轮新增 KV，在 Prefill-read 分支应接近每轮 total KV。
+P→D 的 node/engine 分项与总量同样记录在 `kv-cache-monitor-scopes.json`。
 
 ### P→D timing 与有效带宽
 
@@ -345,21 +380,32 @@ legacy 段可能重叠，且把 Router/P→D/Decode/SSE 等塞进 `Unattributed`
 
 | 桶 | 含义 |
 |---|---|
-| Prefill Bootstrap & Scheduling | bootstrap / queue / scheduling |
-| L3 KV Read | Prefill 侧 L3 prefetch |
+| Prefill Bootstrap & Scheduling | 两种 L3 路径统一为通用 Prefill 本地 bootstrap 与 queue/scheduling；不包含 Prefill L3 read、Decode L3 read、Decode-specific handoff 或 D→P reverse transfer |
+| Prefill L3 KV Read | Prefill 侧 L3 prefetch |
+| Decode L3 KV Read | Decode 侧从 Lustre 读取 durable prefix；TTFT 使用同一 Decode node/engine 上 `min(rank start)` 到 `max(rank end)` 的 TP union wall time，并限制为 Prefill bootstrap envelope 中可归属的关键路径时间；最慢单 rank duration 另存为带宽诊断 |
+| Decode HBM Pre-allocation | Decode `_pre_alloc()` 的 TP union；从 Decode-path bootstrap envelope 中归因，raw duration 单独保留 |
+| Decode L3 Bootstrap Handoff | Prefill bootstrap entry 到 D→P 开始之间，扣除 Decode L3 TP union 和 Decode HBM pre-allocation 后的 Decode-path-only 等待；包括其余 receiver/metadata handoff、Prefill prefix page 分配和 TP 共识 |
+| Decode-to-Prefill KV Transfer | Decode Host staging → Prefill HBM；Prefill 时钟域端到端计时，包含 reverse-fetch 控制与 TP completion 等待 |
+| Prefill HiCache Host-to-GPU | `start_loading()` 的 Host-observed prefix restore launch 窗口；不额外同步 CUDA finish，逐层完成与 forward 的重叠不重复计入 |
 | Prefill Forward + Logits + Sampling | prefill compute + first-token sample |
 | Prefill-to-Decode KV Transfer | P→D KV 传输窗口 |
 | Decode Host-to-GPU Copy | Decode pinned Host staging → HBM；八个 TP rank 取最慢 duration |
 | Decode Prebuilt-token Dispatch | KV ready → PREBUILT first-token dispatch |
 | SSE Serialization & Egress | dispatch → 首个 SSE payload yield |
-| Router, Client & Runtime Gaps | 闭合 TTFT 的剩余间隙 |
+| Server Runtime Residual | `Decode HTTP handler_entry→yield - Σ直接观测服务器阶段`；表示服务器内部尚未细分或跨组件协调时间 |
+| Router / Client Boundary | `client TTFT - Decode HTTP handler_entry→yield`；覆盖 Router、客户端和边界网络/序列化，仅作为边界残差，不是 Router 进程内部的直接计时 |
 
-Prefill 侧重叠区间按 L3 read、scheduling、prefill、P→D 的优先级只归属一次。
+Prefill 侧重叠区间按 Prefill L3 read、D→P、scheduling、prefill、P→D 的优先级
+只归属一次。Decode L3 与 Prefill 时钟不同，因此使用 Decode 同节点 TP union
+duration，并从已排除 D→P 的 bootstrap envelope 余额中扣除；超出该余额的部分
+仅保留为 diagnostic，避免跨节点并发或时钟不可比导致重复归因。Decode 分支在
+D→P 开始前剩余的 path-specific wait 归入 `Decode L3 Bootstrap Handoff`，而不是
+通用 `Bootstrap & Scheduling`。
 Decode receive wait 与 P→D 窗口重叠，仅保留为诊断；P→D ACK 后的 Host→GPU copy
 单独计入 additive breakdown。所有桶必须满足：
 
 ```text
-TTFT = Σ full-chain stages
+TTFT = Σ full-chain stages - overlap_excess
 abs(accounting_error_seconds) <= 1e-6
 ```
 
@@ -469,7 +515,7 @@ scripts/benchmark/collect_benchmark_metrics.py
   -> scripts/plot/plot_trajectory_metrics.py
   -> scripts/plot/plot_trajectory_latency.py
        -> <run>/longest-trajectory/{turn,ttft,ttst,tpot}.svg
-       -> <run>/longest-trajectory/{kv-new,kv-total,cache-hit}.svg
+       -> <run>/longest-trajectory/{kv-new,kv-total,kv-cache-monitor,cache-hit}.svg
        -> <run>/longest-trajectory/l3-read-data.svg
        -> <run>/longest-trajectory/l3-read-time-prefill-<ID>.svg
        -> <run>/longest-trajectory/l3-read-time-decode-<ID>.svg

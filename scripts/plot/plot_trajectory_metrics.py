@@ -18,20 +18,24 @@ GIB = 1024**3
 GB = 10**9
 
 P_TRANSFER = re.compile(
-    r"DUALPATH_TTFT_P_TRANSFER(?:_V2)? rid=(?P<rid>\S+) .*?"
+    r"DUALPATH_TTFT_P_TRANSFER(?:_V2)? rid=(?P<rid>\S+) "
+    r"(?:prefill_engine=(?P<engine>\S+) )?"
+    r"(?:node=(?P<node>\S+) )?.*?"
     r"transfer_s=(?P<seconds>[0-9.]+) logical_tokens=(?P<tokens>\d+)"
     r"(?: page_aligned_tokens=(?P<page_tokens>\d+) "
     r"page_count=(?P<page_count>\d+) page_size=(?P<page_size>\d+))?"
 )
 PREFILL_L3_READ = re.compile(
     r"DUALPATH_L3_TIMING rid=(?P<rid>\S+) "
-    r"prefill_engine=(?P<engine>\S+) tp_rank=(?P<rank>\d+) .*?"
+    r"prefill_engine=(?P<engine>\S+) "
+    r"(?:node=(?P<node>\S+) )?tp_rank=(?P<rank>\d+) .*?"
     r"read_start=(?P<start>[0-9.]+) read_end=(?P<end>[0-9.]+) "
     r"read_s=(?P<seconds>[0-9.]+) tokens=(?P<tokens>\d+)"
 )
 DECODE_L3_READ = re.compile(
     r"DUALPATH_DECODE_L3_READ rid=(?P<rid>\S+) "
-    r"decode_engine=(?P<engine>\S+) tp_rank=(?P<rank>\d+) .*?"
+    r"decode_engine=(?P<engine>\S+) "
+    r"(?:node=(?P<node>\S+) )?tp_rank=(?P<rank>\d+) .*?"
     r"read_start=(?P<start>[0-9.]+) read_end=(?P<end>[0-9.]+) "
     r"read_s=(?P<seconds>[0-9.]+) tokens=(?P<tokens>\d+)"
 )
@@ -42,17 +46,18 @@ def parse_logs(
     log_glob: str = "prefill*.log",
 ) -> tuple[
     dict[str, tuple[float, int, int, int, int]],
-    dict[str, dict[str, dict[int, tuple[float, float, float, int]]]],
-    dict[str, dict[str, dict[int, tuple[float, float, float, int]]]],
+    dict[str, dict[str, dict[int, tuple[float, float, float, int, str]]]],
+    dict[str, dict[str, dict[int, tuple[float, float, float, int, str]]]],
+    dict[str, list[dict[str, float | int | str]]],
 ]:
     transfer_values: dict[
-        str, list[tuple[float, int, int, int, int]]
+        str, list[tuple[float, int, int, int, int, str, str]]
     ] = defaultdict(list)
     read_values: dict[
-        str, dict[str, dict[int, list[tuple[float, float, float, int]]]]
+        str, dict[str, dict[int, list[tuple[float, float, float, int, str]]]]
     ] = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
     decode_read_values: dict[
-        str, dict[str, dict[int, list[tuple[float, float, float, int]]]]
+        str, dict[str, dict[int, list[tuple[float, float, float, int, str]]]]
     ] = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
     for path in log_dir.glob(log_glob):
         for line in path.read_text(errors="replace").splitlines():
@@ -65,6 +70,8 @@ def parse_logs(
                         int(transfer_match.group("page_tokens") or 0),
                         int(transfer_match.group("page_count") or 0),
                         int(transfer_match.group("page_size") or 0),
+                        transfer_match.group("engine") or "unknown",
+                        transfer_match.group("node") or "unknown",
                     )
                 )
                 continue
@@ -78,6 +85,7 @@ def parse_logs(
                         float(read_match.group("end")),
                         float(read_match.group("seconds")),
                         int(read_match.group("tokens")),
+                        read_match.group("node") or "unknown",
                     )
                 )
                 continue
@@ -91,6 +99,7 @@ def parse_logs(
                         float(read_match.group("end")),
                         float(read_match.group("seconds")),
                         int(read_match.group("tokens")),
+                        read_match.group("node") or "unknown",
                     )
                 )
 
@@ -113,6 +122,7 @@ def parse_logs(
                         statistics.median(item[1] for item in items),
                         statistics.median(item[2] for item in items),
                         round(statistics.median(item[3] for item in items)),
+                        items[0][4],
                     )
                     for rank, items in ranks.items()
                 }
@@ -121,7 +131,30 @@ def parse_logs(
             for rid, engines in values.items()
         }
 
-    return transfer, reduce_reads(read_values), reduce_reads(decode_read_values)
+    transfer_details = {
+        rid: [
+            {
+                "seconds": statistics.median(item[0] for item in items),
+                "tokens": round(statistics.median(item[1] for item in items)),
+                "page_tokens": round(statistics.median(item[2] for item in items)),
+                "page_count": round(statistics.median(item[3] for item in items)),
+                "page_size": round(statistics.median(item[4] for item in items)),
+                "engine": items[0][5],
+                "node": items[0][6],
+            }
+            for items in [
+                [item for item in values if item[5] == engine and item[6] == node]
+                for engine, node in sorted({(item[5], item[6]) for item in values})
+            ]
+        ]
+        for rid, values in transfer_values.items()
+    }
+    return (
+        transfer,
+        reduce_reads(read_values),
+        reduce_reads(decode_read_values),
+        transfer_details,
+    )
 
 
 def build_rows(
@@ -131,14 +164,13 @@ def build_rows(
     dict[str, list[dict[str, float | int | str]]],
 ]:
     rounds = [json.loads(line) for line in rounds_path.read_text().splitlines()]
-    transfer, prefill_l3_read, decode_l3_read = parse_logs(
+    transfer, prefill_l3_read, decode_l3_read, transfer_details = parse_logs(
         log_dir, log_glob=log_glob
     )
     rows = []
     engine_rank_rows: dict[
         str, list[dict[str, float | int | str]]
     ] = defaultdict(list)
-
     def reduce_side(item, rid, side, request_engines):
         if len(request_engines) > 1:
             raise RuntimeError(
@@ -148,29 +180,32 @@ def build_rows(
         engine = next(iter(request_engines), "")
         rank_timings = request_engines.get(engine, {})
         if not rank_timings:
-            return engine, rank_timings, -1, 0.0, 0.0, 0
-        slowest_rank, (_, _, slowest_seconds, _) = max(
+            return engine, "unknown", rank_timings, -1, 0.0, 0.0, 0
+        slowest_rank, (_, _, slowest_seconds, _, _) = max(
             rank_timings.items(), key=lambda entry: entry[1][2]
         )
         union_seconds = max(entry[1] for entry in rank_timings.values()) - min(
             entry[0] for entry in rank_timings.values()
         )
         tokens = min(entry[3] for entry in rank_timings.values())
+        node = ",".join(sorted({entry[4] for entry in rank_timings.values()}))
         rank_row: dict[str, float | int | str] = {
             "trajectory_id": item["trajectory_id"],
             "turn_id": int(item["turn_id"]),
             "request_id": rid,
             "side": side,
             "engine_id": engine,
+            "node": node,
             "l3_read_gib": tokens * KV_BYTES_PER_TOKEN / GIB,
         }
-        for rank, (_, _, seconds, _) in sorted(rank_timings.items()):
+        for rank, (_, _, seconds, _, _) in sorted(rank_timings.items()):
             rank_row[f"tp_rank_{rank}_read_seconds"] = seconds
         rank_row["tp_slowest_read_seconds"] = slowest_seconds
         rank_row["tp_union_read_seconds"] = union_seconds
         engine_rank_rows[f"{side}:{engine}"].append(rank_row)
         return (
             engine,
+            node,
             rank_timings,
             slowest_rank,
             slowest_seconds,
@@ -195,6 +230,7 @@ def build_rows(
         )
         (
             prefill_engine,
+            prefill_node,
             prefill_rank_timings,
             prefill_slowest_rank,
             prefill_l3_seconds,
@@ -203,6 +239,7 @@ def build_rows(
         ) = reduce_side(item, rid, "prefill", prefill_l3_read.get(rid, {}))
         (
             decode_engine,
+            decode_node,
             decode_rank_timings,
             decode_slowest_rank,
             decode_l3_seconds,
@@ -228,12 +265,14 @@ def build_rows(
                 "l3_hit_rate": l3_tokens / prompt_tokens,
                 "prefill_engine_id": prefill_engine,
                 "decode_engine_id": decode_engine,
+                "prefill_l3_node": prefill_node,
+                "decode_l3_node": decode_node,
                 "l3_tp_rank_count": len(prefill_rank_timings),
                 "l3_slowest_tp_rank": prefill_slowest_rank,
                 "l3_rank_read_seconds_json": json.dumps(
                     {
                         str(rank): seconds
-                    for rank, (_, _, seconds, _) in sorted(
+                    for rank, (_, _, seconds, _, _) in sorted(
                         prefill_rank_timings.items()
                     )
                     },
@@ -258,7 +297,24 @@ def build_rows(
                 "pd_transfer_page_count": transfer_page_count,
                 "pd_transfer_page_size": transfer_page_size,
                 "pd_transfer_payload_bytes": transfer_bytes,
+                "pd_transfer_gib": transfer_bytes / GIB,
                 "pd_transfer_seconds": transfer_seconds,
+                "pd_transfer_engine_id": ",".join(
+                    sorted(
+                        {
+                            str(detail["engine"])
+                            for detail in transfer_details.get(rid, [])
+                        }
+                    )
+                ) or "unknown",
+                "pd_transfer_node": ",".join(
+                    sorted(
+                        {
+                            str(detail["node"])
+                            for detail in transfer_details.get(rid, [])
+                        }
+                    )
+                ) or "unknown",
                 "pd_effective_bandwidth_gbps": (
                     transfer_bytes / transfer_seconds / GB
                     if transfer_seconds > 0
@@ -390,6 +446,22 @@ def main() -> None:
     if args.metrics_csv:
         with args.metrics_csv.open(newline="") as stream:
             rows = list(csv.DictReader(stream))
+        for row in rows:
+            row.setdefault("prefill_l3_node", "unknown")
+            row.setdefault("decode_l3_node", "unknown")
+            row.setdefault("pd_transfer_engine_id", "unknown")
+            row.setdefault("pd_transfer_node", "unknown")
+            row.setdefault(
+                "pd_transfer_gib",
+                float(row.get("pd_transfer_payload_bytes", 0.0)) / GIB,
+            )
+            for field in (
+                "prefill_l3_read_gib",
+                "decode_l3_read_gib",
+                "prefill_l3_read_tokens",
+                "decode_l3_read_tokens",
+            ):
+                row.setdefault(field, 0)
         engine_rank_rows: dict[
             str, list[dict[str, float | int | str]]
         ] = {}
@@ -438,6 +510,105 @@ def main() -> None:
         "Total KV Data by Turn",
         args.output_dir / "kv-total.svg",
     )
+    plot(
+        rows,
+        (
+            ("total_logical_kv_gib", "Total KV", "#0f766e"),
+            ("new_logical_kv_gib", "New KV", "#16a34a"),
+            ("prefill_l3_read_gib", "Prefill L3 read", "#d97706"),
+            ("decode_l3_read_gib", "Decode L3 read", "#2563eb"),
+            ("pd_transfer_gib", "P→D transfer", "#dc2626"),
+        ),
+        "GiB",
+        "KV Cache Monitor",
+        args.output_dir / "kv-cache-monitor.svg",
+    )
+
+    def scoped_totals(
+        field: str, engine_field: str, node_field: str
+    ) -> dict[str, dict[str, float | int]]:
+        totals: dict[str, dict[str, float | int]] = {}
+        for row in rows:
+            if float(row[field]) <= 0:
+                continue
+            engine = str(row[engine_field])
+            node = str(row[node_field])
+            engine = engine or "unknown"
+            node = node or "unknown"
+            key = f"{node}/{engine}"
+            item = totals.setdefault(key, {"node": node, "engine": engine, "turns": 0})
+            item["turns"] = int(item["turns"]) + 1
+            item["gib"] = float(item.get("gib", 0.0)) + float(row[field])
+            item["tokens"] = int(item.get("tokens", 0)) + int(
+                row[field.replace("_gib", "_tokens")]
+            )
+        return totals
+
+    def with_aggregate(scopes):
+        aggregate = {
+            "node": "all",
+            "engine": "all",
+            "turns": sum(int(item["turns"]) for item in scopes.values()),
+            "gib": sum(float(item.get("gib", 0.0)) for item in scopes.values()),
+            "tokens": sum(int(item.get("tokens", 0)) for item in scopes.values()),
+        }
+        return {"aggregate": aggregate, "scopes": scopes}
+
+    scope_summary = {
+        "prefill_l3": with_aggregate(
+            scoped_totals(
+                "prefill_l3_read_gib", "prefill_engine_id", "prefill_l3_node"
+            )
+        ),
+        "decode_l3": with_aggregate(
+            scoped_totals(
+                "decode_l3_read_gib", "decode_engine_id", "decode_l3_node"
+            )
+        ),
+        "pd_transfer": with_aggregate(
+            scoped_totals(
+                "pd_transfer_gib", "pd_transfer_engine_id", "pd_transfer_node"
+            )
+        ),
+    }
+    (args.output_dir / "kv-cache-monitor-scopes.json").write_text(
+        json.dumps(scope_summary, indent=2) + "\n"
+    )
+    for side, field, token_field, engine_field, node_field, color in (
+        (
+            "prefill",
+            "prefill_l3_read_gib",
+            "prefill_l3_read_tokens",
+            "prefill_engine_id",
+            "prefill_l3_node",
+            "#d97706",
+        ),
+        (
+            "decode",
+            "decode_l3_read_gib",
+            "decode_l3_read_tokens",
+            "decode_engine_id",
+            "decode_l3_node",
+            "#2563eb",
+        ),
+    ):
+        scopes = sorted({(str(row[node_field]), str(row[engine_field])) for row in rows})
+        for node, engine in scopes:
+            scoped_rows = [
+                row
+                for row in rows
+                if str(row[node_field]) == node and str(row[engine_field]) == engine
+            ]
+            if not any(int(row[token_field]) > 0 for row in scoped_rows):
+                continue
+            safe_scope = re.sub(r"[^A-Za-z0-9_.-]+", "_", f"{node}-{engine}")
+            plot(
+                scoped_rows,
+                ((field, f"{side.title()} L3 read", color),),
+                "GiB",
+                f"{side.title()} L3 Read: {node}/{engine}",
+                args.output_dir / f"l3-read-data-{side}-{safe_scope}.svg",
+            )
     plot(
         rows,
         (
@@ -554,7 +725,9 @@ def main() -> None:
         "turns": len(rows),
         "kv_bytes_per_token": KV_BYTES_PER_TOKEN,
         "pd_timing_coverage": transfer_coverage,
-        "l3_timing_coverage": len(positive_l3) / len(rows),
+        "l3_timing_coverage": sum(
+            float(row["l3_read_seconds"]) > 0 for row in rows
+        ) / len(rows),
         "first_l3_read_turn": next(
             (
                 int(row["turn_id"])

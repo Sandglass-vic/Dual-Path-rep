@@ -120,10 +120,14 @@ def patch_hiradix(path: Path) -> None:
         "            )\n"
         "            logger.info(\n"
         "                \"DUALPATH_L3_TIMING rid=%s prefill_engine=%s \"\n"
-        "                \"tp_rank=%d read_start=%.9f \"\n"
+        "                \"node=%s tp_rank=%d read_start=%.9f \"\n"
         "                \"read_end=%.9f read_s=%.9f tokens=%d\",\n"
         "                req_id,\n"
         "                __import__(\"os\").environ.get(\"PREFILL_ID\", \"0\"),\n"
+        "                __import__(\"os\").environ.get(\n"
+        "                    \"PREFILL_HOST\",\n"
+        "                    __import__(\"os\").environ.get(\"HOSTNAME\", \"unknown\"),\n"
+        "                ),\n"
         "                self.cache_controller.tp_rank,\n"
         "                dualpath_start,\n"
         "                dualpath_end,\n"
@@ -284,6 +288,156 @@ def patch_schedule_batch(path: Path) -> None:
     print(f"Patched: {path}")
 
 
+def patch_prefill_prepare_breakdown(
+    scheduler_path: Path, schedule_batch_path: Path
+) -> None:
+    source = schedule_batch_path.read_text()
+    marker = "dualpath_prepare_input_tensors_end"
+    if marker not in source:
+        source = replace_once(
+            source,
+            "    def prepare_for_extend(self):\n"
+            "        self.forward_mode = ForwardMode.EXTEND\n",
+            "    def prepare_for_extend(self):\n"
+            "        dualpath_prepare_start = time.perf_counter()\n"
+            "        self.forward_mode = ForwardMode.EXTEND\n",
+            "start Prefill batch preparation timing",
+        )
+        source = replace_once(
+            source,
+            "        # Allocate memory\n"
+            "        out_cache_loc, req_pool_indices_tensor, req_pool_indices = alloc_for_extend(\n"
+            "            self\n"
+            "        )\n",
+            "        self.dualpath_prepare_input_tensors_end = time.perf_counter()\n"
+            "        # Allocate memory\n"
+            "        dualpath_alloc_start = time.perf_counter()\n"
+            "        out_cache_loc, req_pool_indices_tensor, req_pool_indices = alloc_for_extend(\n"
+            "            self\n"
+            "        )\n"
+            "        self.dualpath_prepare_alloc_start = dualpath_alloc_start\n"
+            "        self.dualpath_prepare_alloc_end = time.perf_counter()\n",
+            "time Prefill KV and request-slot allocation",
+        )
+        source = replace_once(
+            source,
+            "        if self.return_logprob:\n"
+            "            extend_input_logprob_token_ids = torch.tensor(\n",
+            "        self.dualpath_prepare_req_fields_end = time.perf_counter()\n"
+            "        if self.return_logprob:\n"
+            "            extend_input_logprob_token_ids = torch.tensor(\n",
+            "time Prefill request field preparation",
+        )
+        source = replace_once(
+            source,
+            "        # Build sampling info\n"
+            "        self.sampling_info = SamplingBatchInfo.from_schedule_batch(\n"
+            "            self,\n"
+            "            self.model_config.vocab_size,\n"
+            "        )\n",
+            "        # Build sampling info\n"
+            "        dualpath_sampling_start = time.perf_counter()\n"
+            "        self.sampling_info = SamplingBatchInfo.from_schedule_batch(\n"
+            "            self,\n"
+            "            self.model_config.vocab_size,\n"
+            "        )\n"
+            "        self.dualpath_prepare_sampling_start = dualpath_sampling_start\n"
+            "        self.dualpath_prepare_sampling_end = time.perf_counter()\n"
+            "        self.dualpath_prepare_start = dualpath_prepare_start\n"
+            "        self.dualpath_prepare_end = time.perf_counter()\n",
+            "time Prefill sampling metadata preparation",
+        )
+        schedule_batch_path.write_text(source)
+        print(f"Patched: {schedule_batch_path}")
+    else:
+        print(f"Already patched: {schedule_batch_path}")
+
+    source = scheduler_path.read_text()
+    marker = "DUALPATH_PREFILL_PREP_BREAKDOWN"
+    if marker in source:
+        print(f"Already patched: {scheduler_path}")
+        return
+    source = replace_once(
+        source,
+        "        # Create a new batch\n"
+        "        new_batch = ScheduleBatch.init_new(\n",
+        "        # Create a new batch\n"
+        "        dualpath_batch_init_start = time.perf_counter()\n"
+        "        new_batch = ScheduleBatch.init_new(\n",
+        "start Prefill ScheduleBatch initialization timing",
+    )
+    source = replace_once(
+        source,
+        "            dllm_config=self.dllm_config,\n"
+        "        )\n"
+        "        if self.enable_hierarchical_cache:\n",
+        "            dllm_config=self.dllm_config,\n"
+        "        )\n"
+        "        dualpath_batch_init_end = time.perf_counter()\n"
+        "        if self.enable_hierarchical_cache:\n",
+        "finish Prefill ScheduleBatch initialization timing",
+    )
+    source = replace_once(
+        source,
+        "        new_batch.prepare_for_extend()\n"
+        "\n"
+        "        # Mixed-style chunked prefill\n",
+        "        dualpath_hicache_consumer_end = time.perf_counter()\n"
+        "        new_batch.prepare_for_extend()\n"
+        "        dualpath_schedule_return = time.perf_counter()\n"
+        "        for dualpath_req in can_run_list:\n"
+        "            dualpath_req.dualpath_batch_init_start = dualpath_batch_init_start\n"
+        "            dualpath_req.dualpath_batch_init_end = dualpath_batch_init_end\n"
+        "            dualpath_req.dualpath_hicache_consumer_end = dualpath_hicache_consumer_end\n"
+        "            dualpath_req.dualpath_schedule_return = dualpath_schedule_return\n"
+        "\n"
+        "        # Mixed-style chunked prefill\n",
+        "retain Prefill preparation timestamps on requests",
+    )
+    source = replace_once(
+        source,
+        "        if batch.forward_mode == ForwardMode.EXTEND:\n"
+        "            current_time = time.perf_counter()\n"
+        "            for req in batch.reqs:\n"
+        "                req.time_stats.prefill_start_time_host = current_time\n",
+        "        if batch.forward_mode == ForwardMode.EXTEND:\n"
+        "            current_time = time.perf_counter()\n"
+        "            for req in batch.reqs:\n"
+        "                req.time_stats.prefill_start_time_host = current_time\n"
+        "                logger.info(\n"
+        "                    \"DUALPATH_PREFILL_PREP_BREAKDOWN rid=%s tp_rank=%d \"\n"
+        "                    \"selected=%.9f batch_init_start=%.9f batch_init_end=%.9f \"\n"
+        "                    \"hicache_end=%.9f hicache_consumer=%d \"\n"
+        "                    \"prepare_start=%.9f tensors_end=%.9f \"\n"
+        "                    \"alloc_start=%.9f alloc_end=%.9f req_fields_end=%.9f \"\n"
+        "                    \"sampling_start=%.9f sampling_end=%.9f prepare_end=%.9f \"\n"
+        "                    \"schedule_return=%.9f run_batch_start=%.9f tokens=%d cached=%d\",\n"
+        "                    req.rid,\n"
+        "                    self.attn_tp_rank,\n"
+        "                    req.time_stats.forward_entry_time,\n"
+        "                    req.dualpath_batch_init_start,\n"
+        "                    req.dualpath_batch_init_end,\n"
+        "                    req.dualpath_hicache_consumer_end,\n"
+        "                    batch.hicache_consumer_index,\n"
+        "                    batch.dualpath_prepare_start,\n"
+        "                    batch.dualpath_prepare_input_tensors_end,\n"
+        "                    batch.dualpath_prepare_alloc_start,\n"
+        "                    batch.dualpath_prepare_alloc_end,\n"
+        "                    batch.dualpath_prepare_req_fields_end,\n"
+        "                    batch.dualpath_prepare_sampling_start,\n"
+        "                    batch.dualpath_prepare_sampling_end,\n"
+        "                    batch.dualpath_prepare_end,\n"
+        "                    req.dualpath_schedule_return,\n"
+        "                    current_time,\n"
+        "                    len(req.fill_ids),\n"
+        "                    len(req.prefix_indices),\n"
+        "                )\n",
+        "log Prefill preparation breakdown",
+    )
+    scheduler_path.write_text(source)
+    print(f"Patched: {scheduler_path}")
+
+
 def patch_mooncake_bounded_transfer(path: Path) -> None:
     """Bound all-layer Mooncake calls by KV-index count.
 
@@ -402,10 +556,16 @@ def patch_prefill_transfer(path: Path) -> None:
         "                        req, \"dualpath_transfer_page_size\", 0\n"
         "                    )\n"
         "                    logger.info(\n"
-        "                        \"DUALPATH_TTFT_P_TRANSFER_V2 rid=%s transfer_start=%.9f \"\n"
-        "                        \"transfer_end=%.9f transfer_s=%.9f logical_tokens=%d \"\n"
+        "                        \"DUALPATH_TTFT_P_TRANSFER_V2 rid=%s prefill_engine=%s \"\n"
+        "                        \"node=%s transfer_start=%.9f transfer_end=%.9f \"\n"
+        "                        \"transfer_s=%.9f logical_tokens=%d \"\n"
         "                        \"page_aligned_tokens=%d page_count=%d page_size=%d\",\n"
         "                        req.rid,\n"
+        "                        __import__(\"os\").environ.get(\"PREFILL_ID\", \"0\"),\n"
+        "                        __import__(\"os\").environ.get(\n"
+        "                            \"PREFILL_HOST\",\n"
+        "                            __import__(\"os\").environ.get(\"HOSTNAME\", \"unknown\"),\n"
+        "                        ),\n"
         "                        dualpath_transfer_start,\n"
         "                        dualpath_transfer_end,\n"
         "                        dualpath_transfer_end - dualpath_transfer_start,\n"
@@ -507,6 +667,9 @@ def patch_prefill_decode_l3_reverse(path: Path) -> None:
         "                page_indices = kv_to_page_indices(\n"
         "                    prefix_indices.cpu().numpy(), page_size\n"
         "                )\n"
+        "                req.dualpath_decode_l3_reverse_start = (\n"
+        "                    __import__(\"time\").perf_counter()\n"
+        "                )\n"
         "                self.kv_manager.start_decode_l3_reverse(\n"
         "                    req.bootstrap_room, page_indices\n"
         "                )\n"
@@ -519,6 +682,29 @@ def patch_prefill_decode_l3_reverse(path: Path) -> None:
         "            req.bootstrap_room\n"
         "        ):\n"
         "            return False\n"
+        "\n"
+        "        if hit_tokens > 0 and not getattr(\n"
+        "            req, \"dualpath_decode_l3_reverse_logged\", False\n"
+        "        ):\n"
+        "            reverse_end = __import__(\"time\").perf_counter()\n"
+        "            reverse_start = req.dualpath_decode_l3_reverse_start\n"
+        "            logger.info(\n"
+        "                \"DUALPATH_D2P_REVERSE rid=%s prefill_engine=%s \"\n"
+        "                \"node=%s tp_rank=%d reverse_start=%.9f \"\n"
+        "                \"reverse_end=%.9f reverse_s=%.9f tokens=%d\",\n"
+        "                req.rid,\n"
+        "                __import__(\"os\").environ.get(\"PREFILL_ID\", \"0\"),\n"
+        "                __import__(\"os\").environ.get(\n"
+        "                    \"PREFILL_HOST\",\n"
+        "                    __import__(\"os\").environ.get(\"HOSTNAME\", \"unknown\"),\n"
+        "                ),\n"
+        "                self.tp_rank,\n"
+        "                reverse_start,\n"
+        "                reverse_end,\n"
+        "                reverse_end - reverse_start,\n"
+        "                hit_tokens,\n"
+        "            )\n"
+        "            req.dualpath_decode_l3_reverse_logged = True\n"
         "\n"
         "        req.init_next_round_input(None)\n"
         "        req.prefix_indices = getattr(\n"
@@ -950,6 +1136,385 @@ def patch_decode_l3_read(path: Path) -> None:
     print(f"Patched: {path}")
 
 
+def patch_decode_handoff_breakdown(path: Path) -> None:
+    source = path.read_text()
+    marker = "DUALPATH_DECODE_HANDOFF_BREAKDOWN"
+    if marker in source:
+        print(f"Already patched: {path}")
+        return
+    source = replace_once(
+        source,
+        "            elif poll == KVPoll.WaitingForInput:\n"
+        "                decode_req.waiting_for_input = True\n",
+        "            elif poll == KVPoll.WaitingForInput:\n"
+        "                decode_req.waiting_for_input = True\n"
+        "                if not hasattr(decode_req, \"dualpath_handshake_ready\"):\n"
+        "                    decode_req.dualpath_handshake_ready = time.perf_counter()\n",
+        "record Decode handshake completion",
+    )
+    source = replace_once(
+        source,
+        "            if not decode_req.waiting_for_input:\n"
+        "                continue\n"
+        "\n"
+        "            if self.req_to_token_pool.available_size() <= 0:\n",
+        "            if not decode_req.waiting_for_input:\n"
+        "                continue\n"
+        "\n"
+        "            if not hasattr(decode_req, \"dualpath_admission_first_check\"):\n"
+        "                decode_req.dualpath_admission_first_check = time.perf_counter()\n"
+        "            if self.req_to_token_pool.available_size() <= 0:\n",
+        "record first Decode admission check",
+    )
+    source = replace_once(
+        source,
+        "            allocatable_tokens -= required_tokens_for_request\n"
+        "            self._pre_alloc(decode_req.req)\n"
+        "\n"
+        "            kv_indices = (\n",
+        "            allocatable_tokens -= required_tokens_for_request\n"
+        "            dualpath_admission_pass = time.perf_counter()\n"
+        "            dualpath_prealloc_start = time.perf_counter()\n"
+        "            self._pre_alloc(decode_req.req)\n"
+        "            dualpath_prealloc_end = time.perf_counter()\n"
+        "\n"
+        "            kv_indices = (\n",
+        "time Decode HBM preallocation",
+    )
+    source = replace_once(
+        source,
+        "            page_indices = kv_to_page_indices(kv_indices, page_size)\n"
+        "            if (\n",
+        "            page_indices = kv_to_page_indices(kv_indices, page_size)\n"
+        "            dualpath_indices_end = time.perf_counter()\n"
+        "            dualpath_receiver_init_start = time.perf_counter()\n"
+        "            if (\n",
+        "time Decode page-index preparation",
+    )
+    source = replace_once(
+        source,
+        "                decode_req.kv_receiver.init(\n"
+        "                    page_indices, decode_req.metadata_buffer_index, state_indices\n"
+        "                )\n"
+        "            preallocated_reqs.append(decode_req)\n",
+        "                decode_req.kv_receiver.init(\n"
+        "                    page_indices, decode_req.metadata_buffer_index, state_indices\n"
+        "                )\n"
+        "            dualpath_receiver_init_end = time.perf_counter()\n"
+        "            logger.info(\n"
+        "                \"DUALPATH_DECODE_HANDOFF_BREAKDOWN rid=%s decode_engine=%s \"\n"
+        "                \"node=%s tp_rank=%d queue_entry=%.9f handshake_ready=%.9f \"\n"
+        "                \"admission_first=%.9f admission_pass=%.9f prealloc_start=%.9f \"\n"
+        "                \"prealloc_end=%.9f indices_end=%.9f receiver_init_start=%.9f \"\n"
+        "                \"host_alloc_start=%.9f host_alloc_end=%.9f l3_start=%.9f \"\n"
+        "                \"l3_end=%.9f receiver_init_end=%.9f tokens=%d\",\n"
+        "                decode_req.req.rid,\n"
+        "                __import__(\"os\").environ.get(\"DECODE_ID\", \"0\"),\n"
+        "                __import__(\"os\").environ.get(\n"
+        "                    \"DECODE_HOST\", __import__(\"os\").environ.get(\"HOSTNAME\", \"unknown\")\n"
+        "                ),\n"
+        "                self.tp_rank,\n"
+        "                decode_req.req.time_stats.decode_prealloc_queue_entry_time,\n"
+        "                getattr(decode_req, \"dualpath_handshake_ready\", dualpath_admission_pass),\n"
+        "                getattr(decode_req, \"dualpath_admission_first_check\", dualpath_admission_pass),\n"
+        "                dualpath_admission_pass,\n"
+        "                dualpath_prealloc_start,\n"
+        "                dualpath_prealloc_end,\n"
+        "                dualpath_indices_end,\n"
+        "                dualpath_receiver_init_start,\n"
+        "                getattr(decode_req.kv_receiver, \"dualpath_host_alloc_start\", dualpath_receiver_init_start),\n"
+        "                getattr(decode_req.kv_receiver, \"dualpath_host_alloc_end\", dualpath_receiver_init_start),\n"
+        "                getattr(decode_req.kv_receiver, \"dualpath_l3_load_start\", dualpath_receiver_init_start),\n"
+        "                getattr(decode_req.kv_receiver, \"dualpath_l3_load_end\", dualpath_receiver_init_start),\n"
+        "                dualpath_receiver_init_end,\n"
+        "                len(decode_req.req.origin_input_ids),\n"
+        "            )\n"
+        "            preallocated_reqs.append(decode_req)\n",
+        "log Decode handoff breakdown",
+    )
+    path.write_text(source)
+    print(f"Patched: {path}")
+
+
+def patch_decode_prealloc_inner_breakdown(path: Path) -> None:
+    source = path.read_text()
+    marker = "DUALPATH_DECODE_PREALLOC_INNER"
+    if marker in source:
+        print(f"Already patched: {path}")
+        return
+    source = replace_once(
+        source,
+        "    def _pre_alloc(self, req: Req) -> torch.Tensor:\n"
+        "        \"\"\"Pre-allocate the memory for req_to_token and token_kv_pool\"\"\"\n",
+        "    def _pre_alloc(self, req: Req) -> torch.Tensor:\n"
+        "        \"\"\"Pre-allocate the memory for req_to_token and token_kv_pool\"\"\"\n"
+        "        req.dualpath_prealloc_inner_start = time.perf_counter()\n",
+        "start Decode inner preallocation timing",
+    )
+    source = replace_once(
+        source,
+        "        req.req_pool_idx = req_pool_indices[0]\n"
+        "\n"
+        "        # Alloc all tokens for the prebuilt req",
+        "        req.req_pool_idx = req_pool_indices[0]\n"
+        "        req.dualpath_prealloc_req_slot_end = time.perf_counter()\n"
+        "\n"
+        "        # Alloc all tokens for the prebuilt req",
+        "time Decode request-slot allocation",
+    )
+    source = replace_once(
+        source,
+        "        req.kv_allocated_len = fill_len\n"
+        "        req.kv_committed_len = fill_len\n"
+        "        if self.token_to_kv_pool_allocator.page_size == 1:\n",
+        "        req.kv_allocated_len = fill_len\n"
+        "        req.kv_committed_len = fill_len\n"
+        "        req.dualpath_prealloc_kv_start = time.perf_counter()\n"
+        "        if self.token_to_kv_pool_allocator.page_size == 1:\n",
+        "start Decode KV-slot allocation timing",
+    )
+    source = replace_once(
+        source,
+        "                extend_num_tokens=fill_len,\n"
+        "            )\n"
+        "\n"
+        "        assert (\n",
+        "                extend_num_tokens=fill_len,\n"
+        "            )\n"
+        "        req.dualpath_prealloc_kv_end = time.perf_counter()\n"
+        "\n"
+        "        assert (\n",
+        "finish Decode KV-slot allocation timing",
+    )
+    source = replace_once(
+        source,
+        "        self.req_to_token_pool.write((req.req_pool_idx, slice(0, len(kv_loc))), kv_loc)\n"
+        "\n"
+        "        # populate metadata\n",
+        "        req.dualpath_prealloc_pool_write_start = time.perf_counter()\n"
+        "        self.req_to_token_pool.write((req.req_pool_idx, slice(0, len(kv_loc))), kv_loc)\n"
+        "        req.dualpath_prealloc_pool_write_end = time.perf_counter()\n"
+        "\n"
+        "        # populate metadata\n",
+        "time Decode request-to-token pool write",
+    )
+    source = replace_once(
+        source,
+        "        req.fill_ids = req.origin_input_ids + req.output_ids\n"
+        "        req.set_extend_input_len(len(req.fill_ids))\n"
+        "\n"
+        "        return kv_loc\n",
+        "        req.fill_ids = req.origin_input_ids + req.output_ids\n"
+        "        req.set_extend_input_len(len(req.fill_ids))\n"
+        "        req.dualpath_prealloc_inner_end = time.perf_counter()\n"
+        "        logger.info(\n"
+        "            \"DUALPATH_DECODE_PREALLOC_INNER rid=%s tp_rank=%d \"\n"
+        "            \"inner_start=%.9f req_slot_end=%.9f kv_start=%.9f kv_end=%.9f \"\n"
+        "            \"pool_write_start=%.9f pool_write_end=%.9f inner_end=%.9f \"\n"
+        "            \"tokens=%d page_size=%d\",\n"
+        "            req.rid,\n"
+        "            self.tp_rank,\n"
+        "            req.dualpath_prealloc_inner_start,\n"
+        "            req.dualpath_prealloc_req_slot_end,\n"
+        "            req.dualpath_prealloc_kv_start,\n"
+        "            req.dualpath_prealloc_kv_end,\n"
+        "            req.dualpath_prealloc_pool_write_start,\n"
+        "            req.dualpath_prealloc_pool_write_end,\n"
+        "            req.dualpath_prealloc_inner_end,\n"
+        "            fill_len,\n"
+        "            self.token_to_kv_pool_allocator.page_size,\n"
+        "        )\n"
+        "\n"
+        "        return kv_loc\n",
+        "log Decode inner preallocation breakdown",
+    )
+    path.write_text(source)
+    print(f"Patched: {path}")
+
+
+def patch_decode_allocator_merge_breakdown(path: Path) -> None:
+    source = path.read_text()
+    marker = "DUALPATH_DECODE_ALLOCATOR_MERGE"
+    if marker in source:
+        print(f"Already patched: {path}")
+        return
+    source = replace_once(
+        source,
+        "        else:\n"
+        "            device = self.token_to_kv_pool_allocator.device\n"
+        "            kv_loc = self.token_to_kv_pool_allocator.alloc_extend(\n",
+        "        else:\n"
+        "            allocator = self.token_to_kv_pool_allocator\n"
+        "            device = allocator.device\n"
+        "            dualpath_free_before = len(allocator.free_pages)\n"
+        "            dualpath_release_before = len(allocator.release_pages)\n"
+        "            dualpath_need_pages = fill_len // allocator.page_size + 2\n"
+        "            dualpath_merge_start = time.perf_counter()\n"
+        "            dualpath_did_merge = bool(\n"
+        "                allocator.need_sort\n"
+        "                and dualpath_need_pages > dualpath_free_before\n"
+        "                and dualpath_release_before > 0\n"
+        "            )\n"
+        "            if dualpath_did_merge:\n"
+        "                allocator.merge_and_sort_free()\n"
+        "            dualpath_merge_end = time.perf_counter()\n"
+        "            kv_loc = allocator.alloc_extend(\n",
+        "separate Decode allocator free-page merge timing",
+    )
+    source = replace_once(
+        source,
+        "        req.dualpath_prealloc_inner_end = time.perf_counter()\n"
+        "        logger.info(\n"
+        "            \"DUALPATH_DECODE_PREALLOC_INNER rid=%s tp_rank=%d \"\n",
+        "        req.dualpath_prealloc_inner_end = time.perf_counter()\n"
+        "        if self.token_to_kv_pool_allocator.page_size != 1:\n"
+        "            logger.info(\n"
+        "                \"DUALPATH_DECODE_ALLOCATOR_MERGE rid=%s tp_rank=%d \"\n"
+        "                \"merge_start=%.9f merge_end=%.9f merge_s=%.9f \"\n"
+        "                \"did_merge=%d free_before=%d release_before=%d \"\n"
+        "                \"free_after=%d release_after=%d need_pages=%d tokens=%d\",\n"
+        "                req.rid,\n"
+        "                self.tp_rank,\n"
+        "                dualpath_merge_start,\n"
+        "                dualpath_merge_end,\n"
+        "                dualpath_merge_end - dualpath_merge_start,\n"
+        "                int(dualpath_did_merge),\n"
+        "                dualpath_free_before,\n"
+        "                dualpath_release_before,\n"
+        "                len(self.token_to_kv_pool_allocator.free_pages),\n"
+        "                len(self.token_to_kv_pool_allocator.release_pages),\n"
+        "                dualpath_need_pages,\n"
+        "                fill_len,\n"
+        "            )\n"
+        "        logger.info(\n"
+        "            \"DUALPATH_DECODE_PREALLOC_INNER rid=%s tp_rank=%d \"\n",
+        "log Decode allocator merge details",
+    )
+    path.write_text(source)
+    print(f"Patched: {path}")
+
+
+def patch_allocator_kernel_breakdown(path: Path) -> None:
+    source = path.read_text()
+    marker = "DUALPATH_ALLOC_EXTEND_DETAIL"
+    if marker in source:
+        print(f"Already patched: {path}")
+        return
+    source = replace_once(
+        source,
+        "import abc\n",
+        "import abc\nimport logging\nimport time\n",
+        "import logging and time for allocator timing",
+    )
+    source = replace_once(
+        source,
+        "if TYPE_CHECKING:\n",
+        "logger = logging.getLogger(__name__)\n\n\nif TYPE_CHECKING:\n",
+        "initialize allocator timing logger",
+    )
+    source = replace_once(
+        source,
+        "        out_indices = torch.empty(\n"
+        "            (extend_num_tokens,), dtype=torch.int64, device=self.device\n"
+        "        )\n"
+        "        alloc_extend_kernel[(bs,)](\n",
+        "        dualpath_detail_start = time.perf_counter()\n"
+        "        out_indices = torch.empty(\n"
+        "            (extend_num_tokens,), dtype=torch.int64, device=self.device\n"
+        "        )\n"
+        "        dualpath_empty_end = time.perf_counter()\n"
+        "        dualpath_kernel_start = time.perf_counter()\n"
+        "        alloc_extend_kernel[(bs,)](\n",
+        "time Decode paged allocator tensor creation and kernel",
+    )
+    source = replace_once(
+        source,
+        "            self.seen_max_num_extend_tokens_next_power_of_2,\n"
+        "        )\n"
+        "\n"
+        "        if self.debug_mode:\n",
+        "            self.seen_max_num_extend_tokens_next_power_of_2,\n"
+        "        )\n"
+        "        dualpath_kernel_end = time.perf_counter()\n"
+        "\n"
+        "        if self.debug_mode:\n",
+        "finish Decode paged allocator kernel timing",
+    )
+    source = replace_once(
+        source,
+        "        num_new_pages = get_num_new_pages(\n"
+        "            seq_lens=seq_lens_cpu,\n"
+        "            page_size=self.page_size,\n"
+        "            prefix_lens=prefix_lens_cpu,\n"
+        "        )\n"
+        "        if num_new_pages > len(self.free_pages):\n",
+        "        num_new_pages = get_num_new_pages(\n"
+        "            seq_lens=seq_lens_cpu,\n"
+        "            page_size=self.page_size,\n"
+        "            prefix_lens=prefix_lens_cpu,\n"
+        "        )\n"
+        "        dualpath_num_pages_end = time.perf_counter()\n"
+        "        logger.info(\n"
+        "            \"DUALPATH_ALLOC_EXTEND_DETAIL tokens=%d max_tokens=%d \"\n"
+        "            \"empty_s=%.9f kernel_s=%.9f num_pages_s=%.9f total_s=%.9f\",\n"
+        "            extend_num_tokens,\n"
+        "            self.seen_max_num_extend_tokens_next_power_of_2,\n"
+        "            dualpath_empty_end - dualpath_detail_start,\n"
+        "            dualpath_kernel_end - dualpath_kernel_start,\n"
+        "            dualpath_num_pages_end - dualpath_kernel_end,\n"
+        "            dualpath_num_pages_end - dualpath_detail_start,\n"
+        "        )\n"
+        "        if num_new_pages > len(self.free_pages):\n",
+        "log Decode paged allocator kernel breakdown",
+    )
+    path.write_text(source)
+    print(f"Patched: {path}")
+
+
+def patch_decode_receiver_breakdown(path: Path) -> None:
+    source = path.read_text()
+    marker = "dualpath_host_alloc_start"
+    if marker in source:
+        print(f"Already patched: {path}")
+        return
+    source = replace_once(
+        source,
+        "        if self.kv_mgr.decode_host_staging_enabled:\n"
+        "            self.kv_indices = np.array(kv_indices, dtype=np.int64, copy=True)\n"
+        "            (\n"
+        "                self.host_staging_token_indices,\n"
+        "                kv_indices,\n"
+        "            ) = self.kv_mgr.allocate_decode_host_staging(self.kv_indices)\n"
+        "            self.host_staging_page_indices = np.array(\n",
+        "        if self.kv_mgr.decode_host_staging_enabled:\n"
+        "            self.kv_indices = np.array(kv_indices, dtype=np.int64, copy=True)\n"
+        "            self.dualpath_host_alloc_start = time.perf_counter()\n"
+        "            (\n"
+        "                self.host_staging_token_indices,\n"
+        "                kv_indices,\n"
+        "            ) = self.kv_mgr.allocate_decode_host_staging(self.kv_indices)\n"
+        "            self.dualpath_host_alloc_end = time.perf_counter()\n"
+        "            self.host_staging_page_indices = np.array(\n",
+        "time Decode Host staging allocation",
+    )
+    source = replace_once(
+        source,
+        "            if token_ids is not None and request_id is not None:\n"
+        "                self.decode_l3_hit_tokens = self.kv_mgr.load_decode_l3_prefix(\n"
+        "                    request_id, token_ids, self.host_staging_token_indices\n"
+        "                )\n",
+        "            if token_ids is not None and request_id is not None:\n"
+        "                self.dualpath_l3_load_start = time.perf_counter()\n"
+        "                self.decode_l3_hit_tokens = self.kv_mgr.load_decode_l3_prefix(\n"
+        "                    request_id, token_ids, self.host_staging_token_indices\n"
+        "                )\n"
+        "                self.dualpath_l3_load_end = time.perf_counter()\n",
+        "retain Decode L3 load timestamps on receiver",
+    )
+    path.write_text(source)
+    print(f"Patched: {path}")
+
+
 def patch_bounded_decode_host_staging_pool(path: Path) -> None:
     source = path.read_text()
     marker = "DUALPATH_BOUNDED_DECODE_HOST_STAGING"
@@ -1271,10 +1836,13 @@ def patch_mooncake_decode_l3_reverse(path: Path) -> None:
         "        read_end = time.perf_counter()\n"
         "        logger.info(\n"
         "            \"DUALPATH_DECODE_L3_READ rid=%s decode_engine=%s \"\n"
-        "            \"tp_rank=%d read_start=%.9f read_end=%.9f \"\n"
+        "            \"node=%s tp_rank=%d read_start=%.9f read_end=%.9f \"\n"
         "            \"read_s=%.9f tokens=%d\",\n"
         "            request_id,\n"
         "            os.environ.get(\"DECODE_ID\", \"0\"),\n"
+        "            os.environ.get(\n"
+        "                \"DECODE_HOST\", os.environ.get(\"HOSTNAME\", \"unknown\")\n"
+        "            ),\n"
         "            self.kv_args.engine_rank,\n"
         "            read_start,\n"
         "            read_end,\n"
@@ -1370,10 +1938,13 @@ def patch_mooncake_decode_l3_reverse(path: Path) -> None:
         "            status = KVPoll.Success if ret == 0 else KVPoll.Failed\n"
         "            logger.info(\n"
         "                \"DUALPATH_DECODE_L3_REVERSE rid_room=%d \"\n"
-        "                \"decode_engine=%s tp_rank=%d pages=%d \"\n"
+        "                \"decode_engine=%s node=%s tp_rank=%d pages=%d \"\n"
         "                \"transfer_s=%.9f status=%d\",\n"
         "                room,\n"
         "                os.environ.get(\"DECODE_ID\", \"0\"),\n"
+        "                os.environ.get(\n"
+        "                    \"DECODE_HOST\", os.environ.get(\"HOSTNAME\", \"unknown\")\n"
+        "                ),\n"
         "                self.kv_args.engine_rank,\n"
         "                len(dst_indices),\n"
         "                reverse_end - reverse_start,\n"
@@ -1725,6 +2296,9 @@ def main() -> None:
         srt / "managers/scheduler_runtime_checker_mixin.py"
     )
     patch_schedule_batch(srt / "managers/schedule_batch.py")
+    patch_prefill_prepare_breakdown(
+        srt / "managers/scheduler.py", srt / "managers/schedule_batch.py"
+    )
     patch_mooncake_bounded_transfer(
         srt / "disaggregation/mooncake/conn.py"
     )
@@ -1736,10 +2310,17 @@ def main() -> None:
     )
     patch_decode_host_staging(srt / "disaggregation/decode.py")
     patch_decode_l3_read(srt / "disaggregation/decode.py")
+    patch_decode_handoff_breakdown(srt / "disaggregation/decode.py")
+    patch_decode_prealloc_inner_breakdown(srt / "disaggregation/decode.py")
+    patch_decode_allocator_merge_breakdown(srt / "disaggregation/decode.py")
+    patch_allocator_kernel_breakdown(srt / "mem_cache/allocator.py")
     patch_mooncake_decode_host_staging(
         srt / "disaggregation/mooncake/conn.py"
     )
     patch_mooncake_decode_l3_reverse(
+        srt / "disaggregation/mooncake/conn.py"
+    )
+    patch_decode_receiver_breakdown(
         srt / "disaggregation/mooncake/conn.py"
     )
     patch_decode_owns_l3_offload(

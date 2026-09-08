@@ -62,6 +62,7 @@ decode_offload = (
 ).read_text()
 mooncake_conn = (root / "disaggregation/mooncake/conn.py").read_text()
 memory_pool_host = (root / "mem_cache/memory_pool_host.py").read_text()
+allocator = (root / "mem_cache/allocator.py").read_text()
 output_processor = (
     root / "managers/scheduler_output_processor_mixin.py"
 ).read_text()
@@ -79,6 +80,9 @@ assert local_l3_end < hiradix.index(
     "torch.distributed.all_reduce(", local_l3_end
 )
 assert "DUALPATH_REQ_TIMING" in schedule_batch
+assert "dualpath_prepare_input_tensors_end" in schedule_batch
+assert "DUALPATH_PREFILL_PREP_BREAKDOWN" in scheduler
+assert "hicache_consumer=%d" in scheduler
 assert '"DUALPATH_TTFT_P_TRANSFER_V2 rid=%s ' in prefill
 assert "DUALPATH_PREFILL_CACHE_RELEASE" in prefill
 assert "DUALPATH_PREFILL_DECODE_L3_PREFIX" in prefill
@@ -95,6 +99,9 @@ assert "ongoing_write_through" not in prefill[
 assert "dualpath_transfer_page_count" in prefill
 assert "page_aligned_tokens=%d" in prefill
 assert "DUALPATH_TTFT_D_RECEIVE" in decode
+assert "DUALPATH_DECODE_HANDOFF_BREAKDOWN" in decode
+assert "DUALPATH_DECODE_PREALLOC_INNER" in decode
+assert "DUALPATH_DECODE_ALLOCATOR_MERGE" in decode
 assert "DUALPATH_DECODE_PD_HOST_STAGING" in decode
 assert "DUALPATH_DECODE_STAGING_BACKPRESSURE" in decode
 assert '"bounded_dedicated_pool"' in decode
@@ -107,11 +114,17 @@ assert decode_offload.index('getattr(storage_backend, "file_path", None)') < (
 )
 assert "cached_tokens // self.page_size" in decode_offload
 assert "DUALPATH_BOUNDED_DECODE_HOST_STAGING" in memory_pool_host
+assert "DUALPATH_ALLOC_EXTEND_DETAIL" in allocator
+assert "import time" in allocator
+assert "import logging" in allocator
+assert "logger = logging.getLogger(__name__)" in allocator
 assert "SGLANG_MOONCAKE_MAX_TRANSFER_BATCH_INDICES" in mooncake_conn
 assert "prefill_data_indices.size <= max_batch_indices" in mooncake_conn
 assert "DUALPATH_DECODE_HOST_STAGING_COPY" in mooncake_conn
 assert "DUALPATH_DECODE_L3_READ" in mooncake_conn
 assert "DUALPATH_DECODE_L3_REVERSE" in mooncake_conn
+assert "dualpath_host_alloc_start" in mooncake_conn
+assert "DUALPATH_D2P_REVERSE" in prefill
 assert "decode_l3_hit_tokens" in mooncake_conn
 assert "DUALPATH_DECODE_L3_READ_PATH" in scheduler
 assert "dualpath_decode_l3_prefix_ready" in schedule_policy
@@ -148,6 +161,7 @@ compile(
     str(root / "mem_cache/memory_pool_host.py"),
     "exec",
 )
+compile(allocator, str(root / "mem_cache/allocator.py"), "exec")
 compile(
     output_processor,
     str(root / "managers/scheduler_output_processor_mixin.py"),

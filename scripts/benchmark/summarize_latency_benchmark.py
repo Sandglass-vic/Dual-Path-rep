@@ -20,18 +20,22 @@ REQUEST_PATTERN = re.compile(
 )
 L3_PATTERN = re.compile(
     r"DUALPATH_L3_TIMING rid=(?P<rid>\S+) "
-    r"(?:prefill_engine=(?P<engine>\S+) )?tp_rank=(?P<rank>\d+) "
+    r"(?:prefill_engine=(?P<engine>\S+) )?"
+    r"(?:node=(?P<node>\S+) )?tp_rank=(?P<rank>\d+) "
     r"read_start=(?P<start>[0-9.]+) read_end=(?P<end>[0-9.]+) "
     r"read_s=(?P<read>[0-9.]+) tokens=(?P<tokens>\d+)"
 )
 DECODE_L3_PATTERN = re.compile(
     r"DUALPATH_DECODE_L3_READ rid=(?P<rid>\S+) "
-    r"decode_engine=(?P<engine>\S+) tp_rank=(?P<rank>\d+) "
+    r"decode_engine=(?P<engine>\S+) "
+    r"(?:node=(?P<node>\S+) )?tp_rank=(?P<rank>\d+) "
     r"read_start=(?P<start>[0-9.]+) read_end=(?P<end>[0-9.]+) "
     r"read_s=(?P<read>[0-9.]+) tokens=(?P<tokens>\d+)"
 )
 P_TRANSFER_PATTERN = re.compile(
-    r"DUALPATH_TTFT_P_TRANSFER(?:_V2)? rid=(?P<rid>\S+) .*?"
+    r"DUALPATH_TTFT_P_TRANSFER(?:_V2)? rid=(?P<rid>\S+) "
+    r"(?:prefill_engine=(?P<engine>\S+) )?"
+    r"(?:node=(?P<node>\S+) )?.*?"
     r"transfer_s=(?P<seconds>[0-9.]+) logical_tokens=(?P<tokens>\d+)"
     r"(?: page_aligned_tokens=(?P<page_tokens>\d+) "
     r"page_count=(?P<page_count>\d+) page_size=(?P<page_size>\d+))?"
@@ -84,8 +88,16 @@ def parse_timing_logs(
     ] = defaultdict(
         lambda: defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
     )
-    transfer_values: dict[str, dict[str, list[float]]] = defaultdict(
-        lambda: defaultdict(list)
+    l3_nodes: dict[str, dict[str, set[str]]] = defaultdict(
+        lambda: defaultdict(set)
+    )
+    decode_l3_nodes: dict[str, dict[str, set[str]]] = defaultdict(
+        lambda: defaultdict(set)
+    )
+    transfer_values: dict[
+        str, dict[tuple[str, str], dict[str, list[float]]]
+    ] = defaultdict(
+        lambda: defaultdict(lambda: defaultdict(list))
     )
     release_values: dict[str, dict[str, list[float]]] = defaultdict(
         lambda: defaultdict(list)
@@ -101,6 +113,7 @@ def parse_timing_logs(
             if match:
                 rid = match.group("rid")
                 engine = match.group("engine") or "0"
+                l3_nodes[rid][engine].add(match.group("node") or "unknown")
                 rank = int(match.group("rank"))
                 l3_values[rid][engine][rank]["read"].append(
                     float(match.group("read"))
@@ -118,6 +131,7 @@ def parse_timing_logs(
             if match:
                 rid = match.group("rid")
                 engine = match.group("engine")
+                decode_l3_nodes[rid][engine].add(match.group("node") or "unknown")
                 rank = int(match.group("rank"))
                 for name in ("read", "start", "end", "tokens"):
                     decode_l3_values[rid][engine][rank][name].append(
@@ -126,21 +140,14 @@ def parse_timing_logs(
             match = P_TRANSFER_PATTERN.search(line)
             if match:
                 rid = match.group("rid")
-                transfer_values[rid]["seconds"].append(
-                    float(match.group("seconds"))
+                key = (
+                    match.group("engine") or "unknown",
+                    match.group("node") or "unknown",
                 )
-                transfer_values[rid]["tokens"].append(
-                    float(match.group("tokens"))
-                )
-                transfer_values[rid]["page_tokens"].append(
-                    float(match.group("page_tokens") or 0)
-                )
-                transfer_values[rid]["page_count"].append(
-                    float(match.group("page_count") or 0)
-                )
-                transfer_values[rid]["page_size"].append(
-                    float(match.group("page_size") or 0)
-                )
+                for name in ("seconds", "tokens", "page_tokens", "page_count", "page_size"):
+                    transfer_values[rid][key][name].append(
+                        float(match.group(name) or 0)
+                    )
             match = PREFILL_RELEASE_PATTERN.search(line)
             if match:
                 rid = match.group("rid")
@@ -157,6 +164,7 @@ def parse_timing_logs(
     }
     def reduce_l3(
         values: dict[str, dict[str, dict[int, dict[str, list[float]]]]],
+        nodes: dict[str, dict[str, set[str]]],
         side: str,
     ) -> dict[str, dict[str, float]]:
         result = {}
@@ -186,20 +194,33 @@ def parse_timing_logs(
                 - min(item["start"] for item in reduced.values()),
                 "tokens": min(item["tokens"] for item in reduced.values()),
                 "engine": engine,
+                "node": ",".join(sorted(nodes[rid][engine])) or "unknown",
                 "slowest_rank": slowest_rank,
                 "rank_count": len(reduced),
             }
         return result
 
-    l3 = reduce_l3(l3_values, "Prefill")
-    decode_l3 = reduce_l3(decode_l3_values, "Decode")
-    transfers = {
-        rid: {
-            name: statistics.median(values)
-            for name, values in fields.items()
+    l3 = reduce_l3(l3_values, l3_nodes, "Prefill")
+    decode_l3 = reduce_l3(decode_l3_values, decode_l3_nodes, "Decode")
+    transfers = {}
+    for rid, engines in transfer_values.items():
+        reduced = {
+            key: {
+                name: statistics.median(values)
+                for name, values in fields.items()
+            }
+            for key, fields in engines.items()
         }
-        for rid, fields in transfer_values.items()
-    }
+        transfers[rid] = {
+            name: sum(item[name] for item in reduced.values())
+            for name in ("tokens", "page_tokens", "page_count")
+        }
+        transfers[rid]["seconds"] = max(
+            item["seconds"] for item in reduced.values()
+        )
+        transfers[rid]["engine"] = ",".join(sorted(key[0] for key in reduced))
+        transfers[rid]["node"] = ",".join(sorted(key[1] for key in reduced))
+        transfers[rid]["by_engine"] = reduced
     releases = {
         rid: {
             name: statistics.median(values)
@@ -349,6 +370,8 @@ def main() -> None:
                     "l3_prefetched_tokens_logical": int(prefill_l3.get("tokens", 0)),
                     "l3_prefill_engine_id": prefill_l3.get("engine", ""),
                     "l3_decode_engine_id": decode_l3.get("engine", ""),
+                    "prefill_l3_node": prefill_l3.get("node", "unknown"),
+                    "decode_l3_node": decode_l3.get("node", "unknown"),
                     "l3_slowest_tp_rank": int(prefill_l3.get("slowest_rank", -1)),
                     "l3_tp_rank_count": int(prefill_l3.get("rank_count", 0)),
                     "decode_l3_slowest_tp_rank": int(
@@ -361,6 +384,8 @@ def main() -> None:
                     "has_decode_l3_timing": bool(decode_l3),
                     "pd_transfer_seconds": float(pd.get("seconds", 0.0)),
                     "pd_transfer_tokens": int(pd.get("tokens", 0)),
+                    "pd_transfer_engine_id": pd.get("engine", "unknown"),
+                    "pd_transfer_node": pd.get("node", "unknown"),
                     "pd_transfer_page_aligned_tokens": int(
                         pd.get("page_tokens", 0)
                     ),

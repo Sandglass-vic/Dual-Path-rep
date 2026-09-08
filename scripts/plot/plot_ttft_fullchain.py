@@ -11,7 +11,24 @@ from pathlib import Path
 
 COMPONENTS = (
     ("bootstrap_and_scheduling_seconds", "Prefill Bootstrap & Scheduling", "#64748b"),
-    ("l3_kv_read_seconds", "L3 KV Read (exclusive)", "#f59e0b"),
+    ("prefill_l3_kv_read_seconds", "Prefill L3 KV Read (exclusive)", "#f59e0b"),
+    ("decode_l3_kv_read_seconds", "Decode L3 KV Read", "#2563eb"),
+    ("decode_prealloc_seconds", "Decode HBM Pre-allocation", "#7e22ce"),
+    (
+        "decode_l3_bootstrap_handoff_seconds",
+        "Decode L3 Bootstrap Handoff",
+        "#0891b2",
+    ),
+    (
+        "decode_to_prefill_kv_transfer_seconds",
+        "Decode-to-Prefill KV Transfer",
+        "#0f766e",
+    ),
+    (
+        "prefill_host_to_device_seconds",
+        "Prefill HiCache Host-to-GPU",
+        "#be123c",
+    ),
     (
         "prefill_logits_sampling_seconds",
         "Prefill Forward + Logits + Sampling",
@@ -21,7 +38,8 @@ COMPONENTS = (
     ("decode_host_to_device_seconds", "Decode Host-to-GPU Copy", "#ef4444"),
     ("decode_dispatch_seconds", "Decode Prebuilt-token Dispatch", "#8b5cf6"),
     ("sse_egress_seconds", "SSE Serialization & Egress", "#06b6d4"),
-    ("router_client_runtime_seconds", "Router, Client & Runtime Gaps", "#cbd5e1"),
+    ("server_runtime_residual_seconds", "Server Runtime Residual", "#94a3b8"),
+    ("router_client_runtime_seconds", "Router/Client Boundary", "#cbd5e1"),
 )
 
 
@@ -41,6 +59,17 @@ def main() -> None:
     rows = [json.loads(line) for line in args.rounds.read_text().splitlines()]
     if not rows:
         raise RuntimeError("No full-chain rounds to plot")
+    for row in rows:
+        row.setdefault(
+            "prefill_l3_kv_read_seconds",
+            row.get("l3_kv_read_seconds", 0.0),
+        )
+        row.setdefault("decode_l3_kv_read_seconds", 0.0)
+        row.setdefault("decode_prealloc_seconds", 0.0)
+        row.setdefault("decode_l3_bootstrap_handoff_seconds", 0.0)
+        row.setdefault("decode_to_prefill_kv_transfer_seconds", 0.0)
+        row.setdefault("prefill_host_to_device_seconds", 0.0)
+        row.setdefault("server_runtime_residual_seconds", 0.0)
 
     width, height = 1280, 520
     plot_left, plot_right = 90.0, 820.0
@@ -92,14 +121,17 @@ def main() -> None:
                 )
             )
 
-    legend_x, legend_y = 875.0, 92.0
+    legend_x, legend_y = 850.0, 92.0
+    legend_rows = (len(COMPONENTS) + 1) // 2
     for index, (_, label, color) in enumerate(COMPONENTS):
-        y = legend_y + index * 35
+        column, row = divmod(index, legend_rows)
+        item_x = legend_x + column * 210
+        y = legend_y + row * 45
         elements.append(
-            f'<rect x="{legend_x}" y="{y - 12:.1f}" width="16" height="16" '
+            f'<rect x="{item_x}" y="{y - 12:.1f}" width="16" height="16" '
             f'fill="{color}"/>'
         )
-        elements.append(text(legend_x + 25, y + 1, label, 11, "start"))
+        elements.append(text(item_x + 24, y + 1, label, 11, "start"))
     elements.append(
         '<text x="22" y="260" font-family="sans-serif" font-size="12" '
         'text-anchor="middle" transform="rotate(-90 22 260)">TTFT (ms)</text>'

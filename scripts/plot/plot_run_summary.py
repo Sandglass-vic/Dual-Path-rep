@@ -14,13 +14,31 @@ from pathlib import Path
 
 FULLCHAIN_COMPONENTS = (
     ("bootstrap_and_scheduling_seconds", "Bootstrap & scheduling", "#64748b"),
-    ("l3_kv_read_seconds", "L3 KV read", "#f59e0b"),
+    ("prefill_l3_kv_read_seconds", "Prefill L3 KV read", "#f59e0b"),
+    ("decode_l3_kv_read_seconds", "Decode L3 KV read", "#2563eb"),
+    ("decode_prealloc_seconds", "Decode HBM pre-allocation", "#7e22ce"),
+    (
+        "decode_l3_bootstrap_handoff_seconds",
+        "Decode L3 bootstrap handoff",
+        "#0891b2",
+    ),
+    (
+        "decode_to_prefill_kv_transfer_seconds",
+        "D→P KV transfer",
+        "#0f766e",
+    ),
+    (
+        "prefill_host_to_device_seconds",
+        "Prefill HiCache Host→GPU",
+        "#be123c",
+    ),
     ("prefill_logits_sampling_seconds", "Prefill + sampling", "#22c55e"),
     ("pd_transfer_seconds", "P→D KV transfer", "#f97316"),
     ("decode_host_to_device_seconds", "Decode Host→GPU", "#ef4444"),
     ("decode_dispatch_seconds", "Decode dispatch", "#8b5cf6"),
     ("sse_egress_seconds", "SSE egress", "#06b6d4"),
-    ("router_client_runtime_seconds", "Router/client gaps", "#cbd5e1"),
+    ("server_runtime_residual_seconds", "Server runtime residual", "#94a3b8"),
+    ("router_client_runtime_seconds", "Router/client boundary", "#cbd5e1"),
 )
 
 
@@ -201,6 +219,18 @@ def write_latency(
 
 def write_breakdown(rounds_path: Path, output: Path) -> dict[str, float]:
     rows = [json.loads(line) for line in rounds_path.read_text().splitlines()]
+    for row in rows:
+        # Keep historical fullchain artifacts readable after the split.
+        row.setdefault(
+            "prefill_l3_kv_read_seconds",
+            row.get("l3_kv_read_seconds", 0.0),
+        )
+        row.setdefault("decode_l3_kv_read_seconds", 0.0)
+        row.setdefault("decode_prealloc_seconds", 0.0)
+        row.setdefault("decode_l3_bootstrap_handoff_seconds", 0.0)
+        row.setdefault("decode_to_prefill_kv_transfer_seconds", 0.0)
+        row.setdefault("prefill_host_to_device_seconds", 0.0)
+        row.setdefault("server_runtime_residual_seconds", 0.0)
     means = {
         field: statistics.fmean(float(row[field]) for row in rows)
         for field, _, _ in FULLCHAIN_COMPONENTS
@@ -234,10 +264,16 @@ def write_breakdown(rounds_path: Path, output: Path) -> dict[str, float]:
             f'fill="{color}"/>'
         )
     elements.append(text(x, cursor - 10, f"{means['mean_ttft_seconds'] * 1000:.1f} ms", 11))
+    legend_rows = (len(FULLCHAIN_COMPONENTS) + 1) // 2
     for index, (_, label, color) in enumerate(FULLCHAIN_COMPONENTS):
-        y = 100 + index * 38
-        elements.append(f'<rect x="570" y="{y - 12}" width="16" height="16" fill="{color}"/>')
-        elements.append(text(594, y + 1, label, 11, "start"))
+        column, row = divmod(index, legend_rows)
+        legend_x = 570 + column * 205
+        y = 100 + row * 45
+        elements.append(
+            f'<rect x="{legend_x}" y="{y - 12}" width="16" height="16" '
+            f'fill="{color}"/>'
+        )
+        elements.append(text(legend_x + 24, y + 1, label, 11, "start"))
     output.write_text(
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" '
         f'height="{height}" viewBox="0 0 {width} {height}">\n'
