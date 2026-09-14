@@ -177,7 +177,7 @@ Slurm Job：64893，COMPLETED，ExitCode=0:0，耗时 1m27s
 数据：32K 档，从 trajectory 250 开始取 2 条，每条执行前 2 轮
 并发 agents：2
 完成：2 trajectories / 4 turns / 0 errors
-脚本：scripts/pd_1p2d_benchmark.sbatch（原 replay smoke 已并入正式矩阵）
+当前复现入口：scripts/pd_benchmark.sh（当时使用的 replay smoke 已移除）
 日志：/mnt/lustre/users/sezhou/dual-path/logs/fake-replay/64893/
 ```
 

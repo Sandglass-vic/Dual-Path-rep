@@ -12,7 +12,7 @@ set -euo pipefail
 CODE_HOME=${CODE_HOME:-/labhome/sezhou/dual-path}
 RUNTIME_HOME=${RUNTIME_HOME:-/mnt/lustre/users/sezhou/dual-path}
 BASE_IMAGE=${BASE_IMAGE:-$RUNTIME_HOME/images/sglang:26.01-py3.sqsh}
-OUTPUT_IMAGE=${OUTPUT_IMAGE:-$RUNTIME_HOME/images/candidates/sglang-file-l3-dual-staging-${SLURM_JOB_ID}.sqsh}
+OUTPUT_IMAGE=${OUTPUT_IMAGE:-$RUNTIME_HOME/images/sglang-file-l3-dual-staging-${SLURM_JOB_ID}.sqsh}
 MOONCAKE_VERSION=${MOONCAKE_VERSION:-0.3.13.post1}
 CONTAINER_NAME=sglang-timing-"$SLURM_JOB_ID"
 

@@ -94,7 +94,7 @@ memory segment；另一节点随后按 key 从 Store 读取，逐对象验证长
 
 - `scripts/smoke/mooncake_store_dfs_smoke.py`
 - `scripts/smoke/mooncake_store_lustre_smoke.sbatch`
-- `scripts/pd_1p1d_benchmark.sbatch`（正式 1P1D；含 L3/Mooncake）
+- `scripts/pd_benchmark.sh`（当前正式 NP/ND 手工启动入口）
 
 ## 已完成 SGLang HiCache 集成验证
 

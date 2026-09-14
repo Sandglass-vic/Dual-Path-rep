@@ -12,10 +12,13 @@ import statistics
 from collections import defaultdict
 from pathlib import Path
 
+from plot_style import COLORS, add_title_suffix
+
 
 KV_BYTES_PER_TOKEN = 64 * 8 * 128 * 2 * 2  # layers * KV heads * head dim * K/V * BF16
 GIB = 1024**3
 GB = 10**9
+TITLE_SUFFIX = ""
 
 P_TRANSFER = re.compile(
     r"DUALPATH_TTFT_P_TRANSFER(?:_V2)? rid=(?P<rid>\S+) "
@@ -59,7 +62,7 @@ def parse_logs(
     decode_read_values: dict[
         str, dict[str, dict[int, list[tuple[float, float, float, int, str]]]]
     ] = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
-    for path in log_dir.glob(log_glob):
+    for path in log_dir.rglob(log_glob):
         for line in path.read_text(errors="replace").splitlines():
             transfer_match = P_TRANSFER.search(line)
             if transfer_match:
@@ -360,11 +363,11 @@ def plot(
     output: Path,
     y_limit: float | None = None,
 ) -> None:
-    width, height = 1280, 460
+    width, height = 1120, 410
     legend_columns = min(4, len(series))
     legend_rows = (len(series) + legend_columns - 1) // legend_columns
-    left, right = 85.0, 1240.0
-    top, bottom = 55.0 + max(0, legend_rows - 1) * 18, 390.0
+    left, right = 70.0, 1080.0
+    top, bottom = 52.0 + max(0, legend_rows - 1) * 15, 345.0
     turns = [int(row["turn_id"]) for row in rows]
     values = [
         float(row[field])
@@ -381,8 +384,8 @@ def plot(
         return bottom - value / y_max * (bottom - top)
 
     elements = [
-        '<rect width="1280" height="460" fill="white"/>',
-        svg_text(640, 25, title, 16),
+        f'<rect width="{width}" height="{height}" fill="white"/>',
+        svg_text(width / 2, 23, add_title_suffix(title, TITLE_SUFFIX), 14),
     ]
     for tick in range(6):
         value = y_max * tick / 5
@@ -394,7 +397,7 @@ def plot(
         elements.append(svg_text(left - 8, y + 4, f"{value:.2f}", 10, "end"))
     for tick in range(0, len(turns), max(1, len(turns) // 10)):
         turn = turns[tick]
-        elements.append(svg_text(x_pos(turn), 410, str(turn), 10))
+        elements.append(svg_text(x_pos(turn), 363, str(turn), 9))
     for index, (field, label, color) in enumerate(series):
         points = " ".join(
             f"{x_pos(int(row['turn_id'])):.1f},{y_pos(float(row[field])):.1f}"
@@ -407,8 +410,8 @@ def plot(
         )
         legend_column = index % legend_columns
         legend_row = index // legend_columns
-        legend_x = 100 + legend_column * 290
-        legend_y = 43 + legend_row * 18
+        legend_x = 90 + legend_column * 255
+        legend_y = 38 + legend_row * 16
         elements.append(
             f'<line x1="{legend_x}" y1="{legend_y}" '
             f'x2="{legend_x + 24}" y2="{legend_y}" '
@@ -417,15 +420,15 @@ def plot(
         elements.append(
             svg_text(legend_x + 31, legend_y + 4, label, 11, "start")
         )
-    elements.append(svg_text(640, 438, "Turn", 12))
+    elements.append(svg_text(width / 2, 390, "Turn", 11))
     elements.append(
-        f'<text x="20" y="225" font-family="sans-serif" font-size="12" '
-        f'text-anchor="middle" transform="rotate(-90 20 225)">'
+        f'<text x="15" y="195" font-family="sans-serif" font-size="11" '
+        f'text-anchor="middle" transform="rotate(-90 15 195)">'
         f"{html.escape(ylabel)}</text>"
     )
     output.write_text(
-        '<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="460" '
-        'viewBox="0 0 1280 460">\n'
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" '
+        f'viewBox="0 0 {width} {height}">\n'
         + "\n".join(elements)
         + "\n</svg>\n"
     )
@@ -441,7 +444,10 @@ def main() -> None:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--csv-output", type=Path)
     parser.add_argument("--summary-output", type=Path)
+    parser.add_argument("--title-suffix", default="")
     args = parser.parse_args()
+    global TITLE_SUFFIX
+    TITLE_SUFFIX = args.title_suffix
     args.output_dir.mkdir(parents=True, exist_ok=True)
     if args.metrics_csv:
         with args.metrics_csv.open(newline="") as stream:
@@ -489,7 +495,7 @@ def main() -> None:
         rows,
         (
             ("cache_hit_rate", "Reusable-prefix hit rate", "#2563eb"),
-            ("l3_hit_rate", "L3 read hit rate", "#f97316"),
+            ("l3_hit_rate", "KV Read (Lustre) hit rate", COLORS["orange"]),
         ),
         "Hit rate",
         "KV-cache Hit Rate by Turn",
@@ -515,11 +521,11 @@ def main() -> None:
         (
             ("total_logical_kv_gib", "Total KV", "#0f766e"),
             ("new_logical_kv_gib", "New KV", "#16a34a"),
-            ("prefill_l3_read_gib", "Prefill L3 read", "#d97706"),
-            ("decode_l3_read_gib", "Decode L3 read", "#2563eb"),
+            ("prefill_l3_read_gib", "Prefill KV Read (Lustre)", COLORS["orange"]),
+            ("decode_l3_read_gib", "Decode KV Read (Lustre)", COLORS["blue"]),
             ("pd_transfer_gib", "P→D transfer", "#dc2626"),
         ),
-        "GiB",
+        "Volume [GB]",
         "KV Cache Monitor",
         args.output_dir / "kv-cache-monitor.svg",
     )
@@ -581,7 +587,7 @@ def main() -> None:
             "prefill_l3_read_tokens",
             "prefill_engine_id",
             "prefill_l3_node",
-            "#d97706",
+            COLORS["orange"],
         ),
         (
             "decode",
@@ -589,7 +595,7 @@ def main() -> None:
             "decode_l3_read_tokens",
             "decode_engine_id",
             "decode_l3_node",
-            "#2563eb",
+            COLORS["blue"],
         ),
     ):
         scopes = sorted({(str(row[node_field]), str(row[engine_field])) for row in rows})
@@ -604,9 +610,9 @@ def main() -> None:
             safe_scope = re.sub(r"[^A-Za-z0-9_.-]+", "_", f"{node}-{engine}")
             plot(
                 scoped_rows,
-                ((field, f"{side.title()} L3 read", color),),
-                "GiB",
-                f"{side.title()} L3 Read: {node}/{engine}",
+                ((field, f"{side.title()} KV Read (Lustre)", color),),
+                "Volume [GB]",
+                f"{side.title()} KV Read (Lustre): {node}/{engine}",
                 args.output_dir / f"l3-read-data-{side}-{safe_scope}.svg",
             )
     plot(
@@ -627,37 +633,31 @@ def main() -> None:
         (
             (
                 "prefill_l3_effective_bandwidth_gbps",
-                "Prefill L3 read",
-                "#d97706",
+                "Prefill KV Read (Lustre)",
+                COLORS["orange"],
             ),
             (
                 "decode_l3_effective_bandwidth_gbps",
-                "Decode L3 read",
-                "#2563eb",
+                "Decode KV Read (Lustre)",
+                COLORS["blue"],
             ),
         ),
         "GB/s",
-        "L3 KV Load Bandwidth by Turn",
+        "KV Read (Lustre) Bandwidth by Turn",
         args.output_dir / "l3-bandwidth.svg",
     )
     rank_colors = (
-        "#2563eb",
-        "#f97316",
-        "#16a34a",
-        "#9333ea",
-        "#0891b2",
-        "#db2777",
-        "#65a30d",
-        "#7c2d12",
+        COLORS["blue"], COLORS["orange"], COLORS["green"], COLORS["red"],
+        COLORS["purple"], COLORS["cyan"], COLORS["brown"], COLORS["pink"],
     )
     plot(
         rows,
         (
-            ("prefill_l3_read_gib", "Prefill L3 read", "#d97706"),
-            ("decode_l3_read_gib", "Decode L3 read", "#2563eb"),
+            ("prefill_l3_read_gib", "Prefill KV Read (Lustre)", COLORS["orange"]),
+            ("decode_l3_read_gib", "Decode KV Read (Lustre)", COLORS["blue"]),
         ),
         "GiB",
-        "L3 Read Data by Turn",
+        "KV Read (Lustre) Data by Turn",
         args.output_dir / "l3-read-data.svg",
     )
     for side_engine, rank_rows in sorted(engine_rank_rows.items()):
@@ -704,7 +704,7 @@ def main() -> None:
             rank_rows,
             series,
             "Seconds",
-            f"{side.title()} Replica {engine}: L3 Read Time by TP Rank",
+            f"{side.title()} Replica {engine}: KV Read (Lustre) Time by TP Rank",
             args.output_dir
             / f"l3-read-time-{side}-{safe_engine}.svg",
         )

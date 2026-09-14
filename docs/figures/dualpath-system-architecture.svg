@@ -1,0 +1,193 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="2400" height="1000" viewBox="0 0 2400 1000">
+  <defs>
+    <style>
+      text { font-family: Arial, Helvetica, sans-serif; fill: #111827; letter-spacing: 0; }
+      .panel-title { font-size: 40px; font-weight: 700; }
+      .engine-title { font-size: 34px; font-weight: 600; }
+      .component { font-size: 30px; font-weight: 600; }
+      .memory { font-size: 27px; font-weight: 600; }
+      .label { font-size: 23px; font-weight: 600; }
+      .small { font-size: 20px; }
+      .caption { font-family: Georgia, 'Times New Roman', serif; font-size: 34px; font-weight: 700; }
+      .node { fill: #f7f9fb; stroke: #aeb9c2; stroke-width: 5; }
+      .engine-shadow { fill: #d9edf4; stroke: #aeb9c2; stroke-width: 4; }
+      .engine { fill: #bfeaf7; stroke: #7aaabd; stroke-width: 5; }
+      .gpu { fill: #a8df8e; stroke: #69ae60; stroke-width: 5; }
+      .cnic { fill: #9cc8e8; stroke: #609ac5; stroke-width: 5; }
+      .dram { fill: #ffc21a; stroke: #c99500; stroke-width: 5; }
+      .staging { fill: #ffd05b; stroke: #c99500; stroke-width: 5; }
+      .hbm-pages { fill: #bde8a8; stroke: #69ae60; stroke-width: 5; }
+      .snic { fill: #ffc2a8; stroke: #d58f72; stroke-width: 5; }
+      .storage { fill: #9bc9e9; stroke: #6098bd; stroke-width: 5; }
+      .note-box { fill: #f8fafc; stroke: #cbd5e1; stroke-width: 3; }
+      .path-a { fill: none; stroke: #c12aa5; stroke-width: 7; stroke-linecap: round; stroke-linejoin: round; }
+      .path-b { fill: none; stroke: #087ea4; stroke-width: 7; stroke-linecap: round; stroke-linejoin: round; }
+      .writeback { fill: none; stroke: #596675; stroke-width: 7; stroke-linecap: round; stroke-linejoin: round; }
+    </style>
+    <marker id="arrow-a" viewBox="0 0 12 12" refX="10" refY="6" markerWidth="10" markerHeight="10" orient="auto-start-reverse">
+      <path d="M 0 0 L 12 6 L 0 12 z" fill="#c12aa5"/>
+    </marker>
+    <marker id="arrow-b" viewBox="0 0 12 12" refX="10" refY="6" markerWidth="10" markerHeight="10" orient="auto-start-reverse">
+      <path d="M 0 0 L 12 6 L 0 12 z" fill="#087ea4"/>
+    </marker>
+    <marker id="arrow-gray" viewBox="0 0 12 12" refX="10" refY="6" markerWidth="10" markerHeight="10" orient="auto-start-reverse">
+      <path d="M 0 0 L 12 6 L 0 12 z" fill="#596675"/>
+    </marker>
+  </defs>
+
+  <rect width="2400" height="1000" fill="#ffffff"/>
+
+  <!-- Left panel: Prefill reads the durable prefix. -->
+  <g id="prefill-read-path">
+    <text x="35" y="58" class="panel-title">KV-Cache Data Path</text>
+    <line x1="420" y1="45" x2="505" y2="45" class="path-a" marker-end="url(#arrow-a)"/>
+    <polygon points="505,45 487,35 487,55" fill="#c12aa5"/>
+    <text x="530" y="58" class="component">Full KV Block</text>
+
+    <rect x="25" y="105" width="560" height="685" class="node"/>
+    <rect x="610" y="105" width="560" height="685" class="node"/>
+
+    <rect x="75" y="132" width="470" height="325" class="engine-shadow"/>
+    <rect x="58" y="150" width="470" height="325" class="engine-shadow"/>
+    <rect x="42" y="168" width="470" height="325" class="engine"/>
+    <text x="277" y="225" text-anchor="middle" class="engine-title">Prefill Engine</text>
+    <rect x="82" y="270" width="165" height="92" class="gpu"/>
+    <text x="164" y="328" text-anchor="middle" class="component">GPU / HBM</text>
+    <rect x="318" y="270" width="155" height="92" class="cnic"/>
+    <text x="395" y="328" text-anchor="middle" class="component">CNIC</text>
+
+    <rect x="660" y="132" width="470" height="325" class="engine-shadow"/>
+    <rect x="643" y="150" width="470" height="325" class="engine-shadow"/>
+    <rect x="627" y="168" width="470" height="325" class="engine"/>
+    <text x="862" y="225" text-anchor="middle" class="engine-title">Decode Engine</text>
+    <rect x="667" y="270" width="155" height="92" class="cnic"/>
+    <text x="744" y="328" text-anchor="middle" class="component">CNIC</text>
+    <rect x="893" y="270" width="165" height="92" class="gpu"/>
+    <text x="975" y="328" text-anchor="middle" class="component">GPU / HBM</text>
+
+    <rect x="92" y="535" width="425" height="72" class="dram"/>
+    <text x="304" y="567" text-anchor="middle" class="memory">Prefill HiCache Host Pool</text>
+    <text x="304" y="595" text-anchor="middle" class="small">pinned DRAM · layer_first</text>
+    <rect x="676" y="535" width="425" height="72" class="staging"/>
+    <text x="888" y="567" text-anchor="middle" class="memory">Decode PD Host Staging</text>
+    <text x="888" y="595" text-anchor="middle" class="small">pinned DRAM · layer_first</text>
+
+    <rect x="195" y="660" width="215" height="80" class="snic"/>
+    <text x="302" y="711" text-anchor="middle" class="component">SNIC</text>
+    <rect x="780" y="660" width="215" height="80" class="snic"/>
+    <text x="887" y="711" text-anchor="middle" class="component">SNIC</text>
+
+    <rect x="25" y="815" width="1145" height="78" class="storage"/>
+    <text x="598" y="866" text-anchor="middle" class="engine-title">Lustre</text>
+
+    <line x1="302" y1="815" x2="302" y2="747" class="path-a" marker-end="url(#arrow-a)"/>
+    <polygon points="302,747 292,765 312,765" fill="#c12aa5"/>
+    <line x1="302" y1="660" x2="302" y2="615" class="path-a" marker-end="url(#arrow-a)"/>
+    <polygon points="302,615 292,633 312,633" fill="#c12aa5"/>
+    <line x1="247" y1="535" x2="190" y2="370" class="path-a" marker-end="url(#arrow-a)"/>
+    <polygon points="0,0 -18,-10 -18,10" fill="#c12aa5" transform="translate(190 370) rotate(-109)"/>
+    <text x="55" y="450" class="label">CUDA H2D copy</text>
+    <text x="55" y="477" class="small">pinned DRAM → HBM</text>
+
+    <line x1="247" y1="316" x2="310" y2="316" class="path-a" marker-end="url(#arrow-a)"/>
+    <polygon points="310,316 292,306 292,326" fill="#c12aa5"/>
+    <line x1="481" y1="316" x2="659" y2="316" class="path-a" marker-end="url(#arrow-a)"/>
+    <polygon points="659,316 641,306 641,326" fill="#c12aa5"/>
+    <rect x="440" y="378" width="405" height="62" rx="4" class="note-box"/>
+    <text x="642" y="405" text-anchor="middle" class="label">Mooncake Transfer Engine</text>
+    <text x="642" y="430" text-anchor="middle" class="small">P→D RDMA over compute CNICs</text>
+
+    <line x1="744" y1="370" x2="820" y2="527" class="path-a" marker-end="url(#arrow-a)"/>
+    <polygon points="0,0 -18,-10 -18,10" fill="#c12aa5" transform="translate(820 527) rotate(64)"/>
+    <text x="709" y="470" class="small">RDMA into</text>
+    <text x="709" y="495" class="small">Host staging</text>
+    <line x1="950" y1="535" x2="975" y2="370" class="path-a" marker-end="url(#arrow-a)"/>
+    <polygon points="0,0 -18,-10 -18,10" fill="#c12aa5" transform="translate(975 370) rotate(-81)"/>
+    <text x="938" y="452" text-anchor="middle" class="label">CUDA H2D copy</text>
+
+    <text x="598" y="952" text-anchor="middle" class="caption">(a) Prefill L3 Read Path</text>
+  </g>
+
+  <!-- Right panel: Decode reads the durable prefix and reverse-sends it. -->
+  <g id="decode-read-path">
+    <text x="1230" y="58" class="panel-title">KV-Cache Data Path</text>
+    <line x1="1615" y1="45" x2="1700" y2="45" class="path-b" marker-end="url(#arrow-b)"/>
+    <polygon points="1700,45 1682,35 1682,55" fill="#087ea4"/>
+    <text x="1725" y="58" class="component">Full KV Block</text>
+
+    <rect x="1220" y="105" width="560" height="685" class="node"/>
+    <rect x="1805" y="105" width="560" height="685" class="node"/>
+
+    <rect x="1270" y="132" width="470" height="325" class="engine-shadow"/>
+    <rect x="1253" y="150" width="470" height="325" class="engine-shadow"/>
+    <rect x="1237" y="168" width="470" height="325" class="engine"/>
+    <text x="1472" y="225" text-anchor="middle" class="engine-title">Prefill Engine</text>
+    <rect x="1277" y="270" width="165" height="92" class="gpu"/>
+    <text x="1359" y="328" text-anchor="middle" class="component">GPU / HBM</text>
+    <rect x="1513" y="270" width="155" height="92" class="cnic"/>
+    <text x="1590" y="328" text-anchor="middle" class="component">CNIC</text>
+
+    <rect x="1855" y="132" width="470" height="325" class="engine-shadow"/>
+    <rect x="1838" y="150" width="470" height="325" class="engine-shadow"/>
+    <rect x="1822" y="168" width="470" height="325" class="engine"/>
+    <text x="2057" y="225" text-anchor="middle" class="engine-title">Decode Engine</text>
+    <rect x="1862" y="270" width="155" height="92" class="cnic"/>
+    <text x="1939" y="328" text-anchor="middle" class="component">CNIC</text>
+    <rect x="2088" y="270" width="165" height="92" class="gpu"/>
+    <text x="2170" y="328" text-anchor="middle" class="component">GPU / HBM</text>
+
+    <rect x="1287" y="535" width="425" height="72" class="hbm-pages"/>
+    <text x="1499" y="567" text-anchor="middle" class="memory">Prefill HBM KV Pages</text>
+    <text x="1499" y="595" text-anchor="middle" class="small">pre-allocated reverse-fetch destination</text>
+    <rect x="1871" y="535" width="425" height="72" class="staging"/>
+    <text x="2083" y="567" text-anchor="middle" class="memory">Decode PD Host Staging</text>
+    <text x="2083" y="595" text-anchor="middle" class="small">pinned DRAM · layer_first</text>
+
+    <rect x="1390" y="660" width="215" height="80" class="snic"/>
+    <text x="1497" y="711" text-anchor="middle" class="component">SNIC</text>
+    <rect x="1975" y="660" width="215" height="80" class="snic"/>
+    <text x="2082" y="711" text-anchor="middle" class="component">SNIC</text>
+
+    <rect x="1220" y="815" width="1145" height="78" class="storage"/>
+    <text x="1793" y="866" text-anchor="middle" class="engine-title">Lustre</text>
+
+    <line x1="2082" y1="815" x2="2082" y2="747" class="path-b" marker-end="url(#arrow-b)"/>
+    <polygon points="2082,747 2072,765 2092,765" fill="#087ea4"/>
+    <line x1="2082" y1="660" x2="2082" y2="615" class="path-b" marker-end="url(#arrow-b)"/>
+    <polygon points="2082,615 2072,633 2092,633" fill="#087ea4"/>
+    <line x1="2015" y1="535" x2="1940" y2="370" class="path-b" marker-end="url(#arrow-b)"/>
+    <polygon points="0,0 -18,-10 -18,10" fill="#087ea4" transform="translate(1940 370) rotate(-114)"/>
+    <text x="1850" y="468" class="small">L3 prefix into</text>
+    <text x="1850" y="493" class="small">Host staging</text>
+
+    <line x1="1931" y1="270" x2="1931" y2="252" class="path-b"/>
+    <path d="M 1931 252 L 1590 252" class="path-b" marker-end="url(#arrow-b)"/>
+    <polygon points="1590,252 1608,242 1608,262" fill="#087ea4"/>
+    <line x1="1513" y1="290" x2="1448" y2="290" class="path-b" marker-end="url(#arrow-b)"/>
+    <polygon points="1448,290 1466,280 1466,300" fill="#087ea4"/>
+    <rect x="1625" y="120" width="410" height="62" rx="4" class="note-box"/>
+    <text x="1830" y="147" text-anchor="middle" class="label">Mooncake Transfer Engine</text>
+    <text x="1830" y="172" text-anchor="middle" class="small">D→P reverse RDMA into Prefill HBM</text>
+
+    <line x1="1448" y1="342" x2="1505" y2="342" class="path-b" marker-end="url(#arrow-b)"/>
+    <polygon points="1505,342 1487,332 1487,352" fill="#087ea4"/>
+    <path d="M 1668 342 L 1854 342" class="path-b" marker-end="url(#arrow-b)"/>
+    <polygon points="1854,342 1836,332 1836,352" fill="#087ea4"/>
+    <rect x="1510" y="392" width="405" height="62" rx="4" class="note-box"/>
+    <text x="1712" y="419" text-anchor="middle" class="label">Mooncake Transfer Engine</text>
+    <text x="1712" y="444" text-anchor="middle" class="small">P→D RDMA after Prefill compute</text>
+    <line x1="1948" y1="370" x2="2020" y2="527" class="path-b" marker-end="url(#arrow-b)"/>
+    <polygon points="0,0 -18,-10 -18,10" fill="#087ea4" transform="translate(2020 527) rotate(65)"/>
+
+    <line x1="2205" y1="535" x2="2170" y2="370" class="path-b" marker-end="url(#arrow-b)"/>
+    <polygon points="0,0 -18,-10 -18,10" fill="#087ea4" transform="translate(2170 370) rotate(-102)"/>
+    <text x="2225" y="447" text-anchor="middle" class="label">CUDA H2D copy</text>
+    <text x="2225" y="474" text-anchor="middle" class="small">pinned DRAM → HBM</text>
+
+    <text x="1793" y="952" text-anchor="middle" class="caption">(b) Decode L3 Read Path</text>
+  </g>
+
+  <text x="1200" y="990" text-anchor="middle" class="small" fill="#475569">
+    Host↔GPU movement uses SGLang CUDA transfer kernels on pinned memory; CNICs are used only for Mooncake inter-node RDMA.
+  </text>
+</svg>

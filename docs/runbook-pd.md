@@ -2,6 +2,140 @@
 
 > 返回 [文档索引](README.md)
 
+当前正式入口为 `scripts/pd_benchmark.sh`。先用 `pd_alloc.sh` 申请 P+D+1 个节点，
+再 SSH 到每个节点：P/D 节点分别运行 `prefill`/`decode`，额外节点运行
+Router/replay `client`。
+不再提供正式 `sbatch` 入口，也不使用文件传递进程启停信号。完整参数和当前退出
+语义见 [benchmark.md](benchmark.md)。下文出现的旧 sbatch 名称仅用于标识历史
+Job，不能继续提交。
+
+## 当前手工启动流程
+
+以下以 1P2D 为例。`pd_alloc.sh` 只申请节点、镜像和拓扑，不保存 L3 read path：
+
+```bash
+scripts/pd_alloc.sh 1 2
+```
+
+默认是 Prefill L3 read 和当前默认镜像
+`sglang-file-l3-dual-staging-67876.sqsh`。dataset、agent、repetition 和
+本次 run 的日志/结果目录属于 client，可在每次 client 启动时设置：
+
+```bash
+DATASET=64K AGENTS=8 REPETITION=2 \
+  TASK_NAME=1p2d-64k-a8-r2 scripts/pd_benchmark.sh client
+```
+
+L3 read path 必须在 Prefill、Decode、client 三个角色启动时分别指定，并且三者相同：
+
+```bash
+DUALPATH_L3_READ_PATH=decode scripts/pd_benchmark.sh prefill
+DUALPATH_L3_READ_PATH=decode scripts/pd_benchmark.sh decode
+DATASET=32K AGENTS=1 REPETITION=1 \
+  DUALPATH_L3_READ_PATH=decode scripts/pd_benchmark.sh client
+```
+
+不能只修改后续 client 命令来切换路径。缺少参数或三端手工使用不同值时，脚本会
+拒绝对应角色启动；脚本不通过 allocation 文件保存该选择。
+
+`pd_alloc.sh` 内部执行等价的 4 节点 `salloc`，分配成功后按 `scontrol show
+hostnames` 的顺序输出：前 1 个节点为 `prefill-0`，接下来 2 个为
+`decode-0/1`，最后一个为 `client`。allocation shell 必须保持打开。
+提交节点不挂载 Lustre，因此 allocation 配置的创建和退出删除由 client 节点上
+各一个短 `srun --overlap` step 完成，不会长期占用 engine step。
+
+`pd_alloc.sh` 会为每个角色输出两步交互式命令。例如先登录 Prefill 节点：
+
+```bash
+ssh <prefill-host>
+cd /labhome/sezhou/dual-path && DUALPATH_L3_READ_PATH=prefill scripts/pd_benchmark.sh prefill
+```
+
+Decode 和 client 节点分别执行相同的 `ssh` 步骤，再运行带相同路径参数的
+`pd_benchmark.sh decode` 或 `pd_benchmark.sh client`。交互式 SSH 保证 `Ctrl-C`
+发送给远端 `srun`。不要写成字面上的 `ssh host && command`，因为后半段会在 SSH
+退出后回到提交节点执行。
+
+client 提示命令会显式展示本次默认 workload，例如：
+
+```bash
+DATASET=32K AGENTS=1 REPETITION=1 DUALPATH_L3_READ_PATH=prefill \
+  scripts/pd_benchmark.sh client
+```
+
+其中 L3 read path 来自 allocation 配置且必须与 server 一致；dataset、agents、
+repetition、`TASK_NAME`、`LOG_DIR` 和 `RESULT_DIR` 可在每次 client run 时修改。
+
+Prefill/Decode 的 SGLang stdout/stderr 会实时同时输出到当前终端和
+`$RUNTIME_HOME/test/<allocation-id>/pd-servers/`。launcher 使用 Python 无缓冲、
+`srun --unbuffered` 和 `tee -a`，终端输出与持久日志内容一致。
+
+launcher 根据本机唯一运行中的 allocation 自动读取
+`$RUNTIME_HOME/config/allocations/<job-id>.env`，再用 hostname 判断角色。因此
+不需要在 SSH 会话中重复 `export`。`prefill`、`decode`、`client` 参数会校验本机
+角色；无参数时仍自动识别，`server` 保留为 Prefill/Decode 的兼容别名。
+client 命令每次都会打印最终 workload 和输出路径；client replay 完成后仅退出
+本机 Router，不影响 Prefill/Decode server，因此可以在同一 allocation 上重复执行。
+进度以 turns 完成数/总数和 agents 完成数/总数显示。长期 server 的真实 L3 KV
+目录固定为：
+
+```text
+$RUNTIME_HOME/test/<allocation-id>/pd-servers/kv-cache/file/
+$RUNTIME_HOME/test/<allocation-id>/pd-servers/kv-cache/l3-sync/
+```
+
+`file/` 保存 KV，`l3-sync/` 只保存 TP-rank completion marker。多个 client run
+共享该 namespace；`TASK_NAME` 隔离日志、结果和 request ID，但不提供 cold start。
+client 启动前会检查端口和残留 replay/Router。检测到残留时会打印类似以下命令，
+需要人工确认 PID 后执行：
+
+```bash
+pgrep -u "$USER" -af 'replay_fake_agent_traces.py|sglang::router'
+pkill -TERM -u "$USER" -f 'replay_fake_agent_traces.py|sglang::router'
+pkill -KILL -u "$USER" -f 'replay_fake_agent_traces.py|sglang::router'
+```
+
+客户端等待所有 engine 健康，启动 Router，运行 replay，并在 replay 结束时清理
+本机 Router。client 运行中按 `Ctrl-C` 会显式清理 replay 进程组和 Router，不应
+留下后台 Python。全部 client run 完成后，先在 Decode 会话中按一次 Ctrl-C，确认单节点 `srun` 已
+退出，再停止 Prefill。launcher 使用 `--quit-on-interrupt`，无需连续发送多次
+Ctrl-C。不要直接关闭 SSH 或先释放 allocation。
+
+client 成功完成后会在终端额外打印 allocation 级 cold-cache 清理命令和独立绘图
+命令；client 失败或被 Ctrl-C 中断时只打印 cold-cache 清理命令，不提示绘图。
+
+如果下一次实验要求 cold start，停止 Prefill/Decode 后先确认 server 进程已退出，再
+释放 allocation，最后删除 allocation 级 HiCache 目录：
+
+```bash
+rm -rf /mnt/lustre/users/sezhou/dual-path/test/<allocation-id>/pd-servers/kv-cache
+```
+
+`pd_alloc.sh` 会在分配完成时打印带实际 allocation ID 的清理命令。client 不会自动
+删除该目录，因为长期 server 可能仍在使用 HiCache metadata 或完成异步 Decode
+backup。若不执行清理并在同一 allocation 上再次启动 client，测试会复用已有 L3 KV，
+属于 warm-cache，而不是 cold-start。
+
+原始 replay 结果保存在 Lustre 的 allocation 目录：
+
+```text
+$RUNTIME_HOME/test/<allocation-id>/<TASK_NAME>/logs/
+```
+
+图表由 `pd_plot.sh` 写入仓库主机的 `results/latency-benchmark/<TASK_NAME>/`，不会
+把原始 replay JSON 复制到仓库。
+
+最后独立后处理：
+
+```bash
+scripts/pd_plot.sh "$TASK_NAME"
+```
+
+`TASK_NAME` 不自动追加 Job ID。client 日志和原始结果按该名称隔离；KV 和同步
+marker 属于 allocation 并默认保留。新一轮 client 必须换新名称。allocation `.env`
+是静态配置文件，不是进程信号；allocation shell
+退出时删除。L3 marker 只用于 turn 间持久化完成同步，不控制进程退出。
+
 ## Phase 2：最小 1P1D
 
 目的：先以两个节点验证 SGLang PD 数据路径和 Mooncake/NIXL transfer engine，再扩到 1P2D。
@@ -66,19 +200,13 @@ Prefill 的 Mooncake endpoint 为 `10.230.196.72`、LID 165；Decode endpoint �
 可重复脚本：
 
 ```text
-scripts/pd_prefill_router.sh
-scripts/pd_decode.sh
-scripts/pd_1p1d_benchmark.sbatch
+scripts/tests/runtime/pd_decode.sh
+scripts/pd_benchmark.sh
+scripts/tests/runtime/pd_runtime.sh
 ```
 
-提交命令：
-
-```bash
-mkdir -p "$RUNTIME_HOME/logs/latency-benchmark"
-sbatch scripts/pd_1p1d_benchmark.sbatch
-```
-
-Slurm 总作业成功后，两个长期运行的 server step 会由脚本的 `trap` 终止，因此 `sacct` 中子 step 显示 `CANCELLED by <uid>` 是预期清理；判定结果应看 batch job 的 `COMPLETED/0:0` 和三个 smoke sentinel。
+当前手工方案让每个 engine 成为独立的单节点 `srun` step。客户端退出不会触发
+Slurm 批量杀其他节点；服务按上面的 Decode-first 顺序由操作者显式停止。
 
 本次使用 base checkpoint，返回的是有效 completion，但不保证遵循自然语言指令。它验证的是模型执行和跨节点 KV transfer；若要验证 instruction-following 或 SWE-bench 质量，应另行下载 Instruct checkpoint。
 
@@ -175,13 +303,13 @@ Slurm Job：64791，COMPLETED，ExitCode=0:0，耗时 1m41s
 Prefill：dgx-gaia-34，8 × H100，TP=8
 Decode-0：dgx-gaia-35，8 × H100，TP=8
 Decode-1：dgx-gaia-36，8 × H100，TP=8
-Router：Prefill 节点，端口 8000
+Router：当时与 Prefill 同节点，端口 8000
 模型：Qwen2.5-32B，bfloat16，context length 4096
 Transfer backend：Mooncake Transfer Engine
 RDMA device：mlx5_0
 请求：6 个确定性短 prompt，每个最多生成 24 token
 日志：/mnt/lustre/users/sezhou/dual-path/logs/pd-1p2d/64791/
-脚本：scripts/pd_1p2d_benchmark.sbatch（原 pd_1p2d_multinode.sbatch 已并入）
+旧脚本：pd_1p2d_multinode.sbatch（已移除；当前入口为 scripts/pd_benchmark.sh）
 ```
 
 验收结果：
@@ -210,19 +338,20 @@ Slurm Job：64980，COMPLETED，ExitCode=0:0，耗时 4m43s
 populate：584 个 .bin，1,224,736,768 bytes
 重启后 cached tokens：2,304 / 2,368
 prefetched_tokens_total 增量：37,376（TP8 rank 求和）
-脚本：scripts/pd_1p2d_benchmark.sbatch（原 pd_1p2d_lustre_l3.sbatch 已并入）
+旧脚本：pd_1p2d_lustre_l3.sbatch（已移除；当前入口为 scripts/pd_benchmark.sh）
 ```
 
 该测试证明两个独立前缀可由 Decode offload 到共享 namespace，并在三个服务
 角色全部重启后由 Prefill 从 L3 恢复；两个 Decode 均参与恢复请求。共享文件
 去重和 offload admission 可能使处理请求的 Decode 不产生新文件，因此不要求
-两个 Decode 每轮都分别新增 `.bin`。Job 结束后 KV 目录已自动删除。
+两个 Decode 每轮都分别新增 `.bin`。该历史 Job 结束时曾自动删除 KV 目录；
+当前手工流程不会自动删除。
 
-随后 Job `64984` 使用（现已并入）`scripts/pd_1p2d_benchmark.sbatch` 完成 4 agents ×
+随后 Job `64984` 使用已移除的旧 replay 脚本完成 4 agents ×
 4 turns 并发 fake trajectory。populate 生成 816 个 `.bin`、约 1.71 GB；
 全服务重启后的 16/16 轮全部命中 L3，cached tokens 为 320–1,600。两个
 Decode 在 populate/recover 阶段均处理请求并完成 backup。Job
-`COMPLETED (0:0)`，耗时 5m11s，KV 目录退出时自动删除。
+`COMPLETED (0:0)`，耗时 5m11s；这是旧脚本的自动删除行为。
 
 ### 扩展验证：跨节点 2P2D
 
@@ -261,13 +390,13 @@ Prefill-0：dgx-gaia-51，8 × H100，TP=8
 Prefill-1：dgx-gaia-52，8 × H100，TP=8
 Decode-0：dgx-gaia-53，8 × H100，TP=8
 Decode-1：dgx-gaia-54，8 × H100，TP=8
-Router：Prefill-0 节点，端口 8000
+Router：当时与 Prefill-0 同节点，端口 8000
 模型：Qwen2.5-32B，bfloat16，context length 4096
 Transfer backend：Mooncake Transfer Engine
 RDMA device：mlx5_0
 请求：8 个确定性短 prompt，每个最多生成 24 token
 日志：/mnt/lustre/users/sezhou/dual-path/logs/pd-2p2d/64860/
-脚本：scripts/pd_2p2d_benchmark.sbatch（原 pd_2p2d_multinode.sbatch 已并入）
+旧脚本：pd_2p2d_multinode.sbatch（已移除；当前入口为 scripts/pd_benchmark.sh）
 ```
 
 验收结果：
@@ -298,42 +427,34 @@ P/D 双侧 round-robin 分流和跨节点 RDMA 数据面已经通过最小验证
   Prefill bootstrap 超时）；
 - Job `65592`：仅排除 `53` 后又分到含 `30` 的节点组，已取消。
 
-提交示例：
+历史 Job 使用过 sbatch；当前应在 `salloc` 时应用排除列表：
 
 ```bash
-sbatch --exclude=dgx-gaia-12,dgx-gaia-18,dgx-gaia-30,dgx-gaia-46,dgx-gaia-53 --time=08:00:00 \
-  scripts/pd_1p2d_benchmark.sbatch
+salloc --partition=GAIA --nodes=<P+D+1> --ntasks=<P+D+1> --ntasks-per-node=1 \
+  --cpus-per-task=112 --gres=gpu:8 --exclusive --time=08:00:00 \
+  --exclude=dgx-gaia-12,dgx-gaia-18,dgx-gaia-30,dgx-gaia-35,dgx-gaia-38,dgx-gaia-46,dgx-gaia-53
 ```
 
 与 1P2D 一样，本次未启用 HiCache，Host DRAM 仅作为临时传输 staging，不构成
 可命中的 L2 cache、持久缓存或分布式存储层。
 
-Slurm/Enroot 启动模板：
+Slurm/Enroot 启动结构：
 
-```bash
-salloc --partition=GAIA --nodes=3 --gres=gpu:8 --time=04:00:00
-mapfile -t HOSTS < <(scontrol show hostnames "$SLURM_JOB_NODELIST")
-export PREFILL_HOST=${HOSTS[0]}
-export DECODE0_HOST=${HOSTS[1]}
-export DECODE1_HOST=${HOSTS[2]}
-
-# 对三个服务分别使用以下 srun 骨架；ROLE_CMD 替换为上面的 Prefill/Decode 命令。
-srun --nodes=1 --ntasks=1 --nodelist="<host>" --gres=gpu:8 \
-  --container-image="$IMAGE_DIR/sglang:26.01-py3-mooncake0.3.13.post1-file-l3-dual-staging-v1.sqsh" \
-  --container-mounts="/mnt/lustre:/mnt/lustre,$CODE_HOME:/workspace/dual-path" \
-  --container-workdir=/workspace/dual-path \
-  --no-container-mount-home \
-  bash -lc '<ROLE_CMD>'
+```text
+salloc allocation
+├── Prefill node 0..P-1: pd_benchmark.sh prefill -> one-node TP8 srun
+├── Decode node 0..D-1:  pd_benchmark.sh decode -> one-node TP8 srun
+└── Client node:         pd_benchmark.sh client -> Router + replay
 ```
 
-实际 sbatch 脚本应：
+`pd_benchmark.sh` 为每个 SSH 会话创建一个绑定本机的 `srun --jobid`：
 
-- 给三个 `srun` step 分配互不重叠的节点并放入后台；
-- 每个 step 单独写日志；
-- 等待三个 `/health` 成功后再启动 Router 和 benchmark；
-- 使用 `trap` 在任务结束时清理后台进程；
+- engine step 使用整节点 8 GPU；client step 使用 `--gres=none` 和少量 CPU；
+- 每个 engine 启动一个官方 TP8 launcher，并通过无缓冲 `tee` 同步输出到终端和日志；
+- client 等待全部 `/health` 成功后再启动 Router 和 replay；
+- client trap 清理本次 replay 进程组和本机 Router，不跨节点发送 kill；
 - 不使用 `--container-writable`，除非确认必须修改容器根文件系统；
-- 将模型、结果和缓存目录显式挂载，不依赖自动 home mount。
+- 显式挂载 Lustre 和仓库，不依赖容器 home mount。
 
 验收条件：
 
@@ -344,13 +465,13 @@ srun --nodes=1 --ntasks=1 --nodelist="<host>" --gres=gpu:8 \
 
 ## 平台资源布局补充
 
-推荐最初使用三个完整 DGX 节点：
+1P2D 推荐使用三个 engine 节点和一个独立客户端节点：
 
 ```text
 Prefill node: 8 × H100，TP=8
 Decode node 0: 8 × H100，TP=8
 Decode node 1: 8 × H100，TP=8
-Router: 与 Prefill 同节点，绑定少量 CPU
+Client node: Router + replay，不运行模型
 ```
 
 这样与论文的 Qwen SGLang 基线 `TP=8` 对齐，也避免在同一节点混放 P/D 导致 HBM、PCIe、NIC 和 CPU 资源互相干扰。
@@ -367,7 +488,9 @@ Router: 与 Prefill 同节点，绑定少量 CPU
   D2H→Lustre 使用另一套 HiCache Host pool；
 - Prefill 仅从 L3 读取，PD completion 后立即释放 L1/L2；Decode 根据
   `cached_tokens` 边界持久化 Prefill 新算 KV 与 Decode KV；
-- Router 不占 GPU；
+- Router/replay 不占 GPU；同构 `salloc` 最简单，但会在客户端节点保留未使用 GPU；
 - 指标采集进程限制 CPU，避免影响 SGLang。
 
-若三个并行 `srun` step 无法同时启动，检查 step 的 `--exclusive`、节点约束和 GPU TRES 分配。不要通过重复启动三个独立 allocation 代替同一 1P2D 作业，否则节点生命周期和失败清理更难控制。
+若各 SSH 会话的 `srun` 无法启动，检查 `ALLOC_JOB_ID`、本机是否属于 allocation、
+step 的 `--exclusive` 和 GPU TRES。不要用多个独立 allocation 拼接同一次 1P2D
+实验，否则节点生命周期和失败清理更难控制。

@@ -8,39 +8,27 @@ import html
 import json
 from pathlib import Path
 
+from plot_style import COLORS, add_title_suffix
+
 
 COMPONENTS = (
-    ("bootstrap_and_scheduling_seconds", "Prefill Bootstrap & Scheduling", "#64748b"),
-    ("prefill_l3_kv_read_seconds", "Prefill L3 KV Read (exclusive)", "#f59e0b"),
-    ("decode_l3_kv_read_seconds", "Decode L3 KV Read", "#2563eb"),
-    ("decode_prealloc_seconds", "Decode HBM Pre-allocation", "#7e22ce"),
     (
-        "decode_l3_bootstrap_handoff_seconds",
-        "Decode L3 Bootstrap Handoff",
-        "#0891b2",
+        "prefill_l3_kv_read_seconds",
+        "Prefill KV Read (Lustre) + Radix tree",
+        COLORS["orange"],
     ),
-    (
-        "decode_to_prefill_kv_transfer_seconds",
-        "Decode-to-Prefill KV Transfer",
-        "#0f766e",
-    ),
-    (
-        "prefill_host_to_device_seconds",
-        "Prefill HiCache Host-to-GPU",
-        "#be123c",
-    ),
-    (
-        "prefill_logits_sampling_seconds",
-        "Prefill Forward + Logits + Sampling",
-        "#22c55e",
-    ),
-    ("pd_transfer_seconds", "Prefill-to-Decode KV Transfer", "#f97316"),
-    ("decode_host_to_device_seconds", "Decode Host-to-GPU Copy", "#ef4444"),
-    ("decode_dispatch_seconds", "Decode Prebuilt-token Dispatch", "#8b5cf6"),
-    ("sse_egress_seconds", "SSE Serialization & Egress", "#06b6d4"),
-    ("server_runtime_residual_seconds", "Server Runtime Residual", "#94a3b8"),
-    ("router_client_runtime_seconds", "Router/Client Boundary", "#cbd5e1"),
+    ("decode_l3_kv_read_seconds", "Decode KV Read (Lustre)", COLORS["purple"]),
+    ("decode_prealloc_seconds", "Decode pre-allocation", COLORS["yellow"]),
+    ("decode_to_prefill_kv_transfer_seconds", "D->P transfer", COLORS["pink"]),
+    ("prefill_host_to_device_seconds", "Prefill HiCache Host->GPU", COLORS["blue"]),
+    ("prefill_logits_sampling_seconds", "Prefill + Sampling", COLORS["green"]),
+    ("pd_transfer_seconds", "P->D transfer", COLORS["red"]),
+    ("decode_host_to_device_seconds", "Decode Host->GPU", COLORS["cyan"]),
+    ("decode_dispatch_seconds", "Decode dispatch", COLORS["brown"]),
+    ("misc_seconds", "Misc", COLORS["gray"]),
 )
+
+LEGEND_COMPONENTS = COMPONENTS
 
 
 def text(x: float, y: float, value: str, size: int = 12, anchor: str = "middle") -> str:
@@ -55,6 +43,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--rounds", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--title-suffix", default="")
     args = parser.parse_args()
     rows = [json.loads(line) for line in args.rounds.read_text().splitlines()]
     if not rows:
@@ -69,22 +58,53 @@ def main() -> None:
         row.setdefault("decode_l3_bootstrap_handoff_seconds", 0.0)
         row.setdefault("decode_to_prefill_kv_transfer_seconds", 0.0)
         row.setdefault("prefill_host_to_device_seconds", 0.0)
+        row.setdefault("prefill_logits_sampling_seconds", 0.0)
+        row.setdefault("pd_transfer_seconds", 0.0)
+        row.setdefault("decode_host_to_device_seconds", 0.0)
+        row.setdefault("decode_dispatch_seconds", 0.0)
+        row.setdefault("bootstrap_and_scheduling_seconds", 0.0)
+        row.setdefault("sse_egress_seconds", 0.0)
+        row.setdefault("router_client_runtime_seconds", 0.0)
         row.setdefault("server_runtime_residual_seconds", 0.0)
+        row["misc_seconds"] = sum(
+            float(row[field])
+            for field in (
+                "bootstrap_and_scheduling_seconds",
+                "decode_l3_bootstrap_handoff_seconds",
+                "sse_egress_seconds",
+                "server_runtime_residual_seconds",
+                "router_client_runtime_seconds",
+            )
+        )
 
-    width, height = 1280, 520
-    plot_left, plot_right = 90.0, 820.0
-    plot_top, plot_bottom = 70.0, 440.0
+    width, height = 600, 470
+    plot_left, plot_right = 75.0, 540.0
+    plot_top, plot_bottom = 145.0, 390.0
     max_ttft = max(float(row["ttft_seconds"]) for row in rows) * 1.12
     elements = [
-        '<rect width="1280" height="520" fill="white"/>',
-        text(640, 26, "Per-turn TTFT Critical-path Breakdown", 17),
+        f'<rect width="{width}" height="{height}" fill="white"/>',
+        text(width / 2, 24, add_title_suffix("TTFT Breakdown", args.title_suffix), 15),
         text(
-            640,
-            48,
+            width / 2,
+            43,
             "First token is sampled on Prefill; Decode dispatches the prebuilt token",
             11,
         ),
     ]
+    # Keep the original component order and render the legend inside the
+    # figure, above the chart, as two horizontal rows.
+    legend_columns = 3
+    legend_x_positions = (40, 280, 450)
+    for index, (_, label, color) in enumerate(LEGEND_COMPONENTS):
+        column = index % legend_columns
+        row = index // legend_columns
+        legend_x = legend_x_positions[column]
+        legend_y = 54 + row * 21
+        elements.append(
+            f'<rect x="{legend_x}" y="{legend_y - 8:.1f}" width="10" height="10" '
+            f'fill="{color}"/>'
+        )
+        elements.append(text(legend_x + 14, legend_y + 1, label, 9, "start"))
     for tick in range(6):
         value = max_ttft * tick / 5
         y = plot_bottom - (plot_bottom - plot_top) * tick / 5
@@ -110,7 +130,7 @@ def main() -> None:
                 f'fill="{color}"/>'
             )
         if index % label_step == 0:
-            elements.append(text(x, 461, f"turn {row['turn_id']}", 10))
+            elements.append(text(x, 378, f"turn {row['turn_id']}", 9))
         if len(rows) <= 16:
             elements.append(
                 text(
@@ -121,25 +141,14 @@ def main() -> None:
                 )
             )
 
-    legend_x, legend_y = 850.0, 92.0
-    legend_rows = (len(COMPONENTS) + 1) // 2
-    for index, (_, label, color) in enumerate(COMPONENTS):
-        column, row = divmod(index, legend_rows)
-        item_x = legend_x + column * 210
-        y = legend_y + row * 45
-        elements.append(
-            f'<rect x="{item_x}" y="{y - 12:.1f}" width="16" height="16" '
-            f'fill="{color}"/>'
-        )
-        elements.append(text(item_x + 24, y + 1, label, 11, "start"))
     elements.append(
-        '<text x="22" y="260" font-family="sans-serif" font-size="12" '
-        'text-anchor="middle" transform="rotate(-90 22 260)">TTFT (ms)</text>'
+        '<text x="20" y="220" font-family="sans-serif" font-size="11" '
+        'text-anchor="middle" transform="rotate(-90 20 220)">Time [ms]</text>'
     )
     elements.append(
         text(
-            640,
-            502,
+            width / 2,
+            425,
             "Components are additive; cross-node overlap is reported separately in JSON.",
             10,
         )

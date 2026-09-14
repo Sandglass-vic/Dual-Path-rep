@@ -7,6 +7,7 @@ dualpath_export_common_env() {
   export HICACHE_STORAGE_BACKEND=file
   export MEM_FRACTION_STATIC=${MEM_FRACTION_STATIC:-0.55}
   export HICACHE_RATIO=${HICACHE_RATIO:-1.2}
+  export PREFILL_HICACHE_MEM_LAYOUT=${PREFILL_HICACHE_MEM_LAYOUT:-layer_first}
   export DECODE_HICACHE_RATIO=${DECODE_HICACHE_RATIO:-1.05}
   export CONTEXT_LENGTH=${CONTEXT_LENGTH:-65536}
   export MOONCAKE_PROTOCOL=${MOONCAKE_PROTOCOL:-rdma}
@@ -51,7 +52,7 @@ dualpath_export_common_env() {
   export DUALPATH_PREFILL_RELEASE_LOCAL_CACHE PREFILL_HICACHE_READ_ONLY
   export PREFILL_HICACHE_EVICT_UNLOCKED
   export DUALPATH_PREFILL_BACKUP_TIMEOUT
-  export PREFILL_HICACHE_WRITE_POLICY
+  export PREFILL_HICACHE_WRITE_POLICY PREFILL_HICACHE_MEM_LAYOUT
   export DUALPATH_DECODE_PD_HOST_STAGING
   export DUALPATH_DECODE_PD_HOST_STAGING_GB DECODE_HICACHE_RATIO
   export FLUSH_LOCAL_CACHE_BETWEEN_TURNS STORAGE_SETTLE_SECONDS
@@ -63,12 +64,15 @@ dualpath_export_common_env() {
 dualpath_wait_for_url() {
   local name=$1
   local url=$2
-  local step_pid=$3
+  local step_pid=${3:-}
   local deadline=$((SECONDS + SERVER_TIMEOUT))
-  until curl --fail --silent --max-time 2 "$url/health" >/dev/null; do
-    if ! kill -0 "$step_pid" 2>/dev/null; then
+  while true; do
+    if [[ -n $step_pid ]] && ! kill -0 "$step_pid" 2>/dev/null; then
       echo "$name exited before becoming healthy" >&2
       return 1
+    fi
+    if curl --fail --silent --max-time 2 "$url/health" >/dev/null; then
+      return 0
     fi
     if (( SECONDS >= deadline )); then
       echo "Timed out waiting for $name at $url" >&2
@@ -78,62 +82,64 @@ dualpath_wait_for_url() {
   done
 }
 
-dualpath_wait_for_url_down() {
-  local name=$1
-  local url=$2
-  local deadline=$((SECONDS + ${SERVER_SHUTDOWN_TIMEOUT:-120}))
-  while curl --fail --silent --max-time 2 "$url/health" >/dev/null; do
-    if (( SECONDS >= deadline )); then
-      echo "Timed out waiting for $name to stop at $url" >&2
-      return 1
-    fi
-    sleep 1
-  done
+dualpath_choose_router_port() {
+  local requested=${ROUTER_PORT:-8000}
+  if [[ ${ROUTER_PORT_AUTO:-1} != 1 ]]; then
+    printf '%s\n' "$requested"
+    return 0
+  fi
+  python - "$requested" <<'PY'
+import socket
+import sys
+
+requested = int(sys.argv[1])
+for port in range(requested, requested + 100):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.bind(("0.0.0.0", port))
+    except OSError:
+        sock.close()
+        continue
+    sock.close()
+    print(port)
+    break
+else:
+    raise SystemExit(f"No free Router port in {requested}-{requested + 99}")
+PY
 }
 
-dualpath_stop_steps() {
-  local pid
-  local host
-  for pid in "${step_pids[@]:-}"; do
-    kill "$pid" 2>/dev/null || true
-  done
-  for pid in "${step_pids[@]:-}"; do
-    wait "$pid" 2>/dev/null || true
-  done
-  step_pids=()
-
-  # srun can exit before the remote task has released its listening socket.
-  # Do not delete this run's cache or accept the next run as healthy until all
-  # prior services are unreachable.
-  if [[ -n ${PREFILL_HOSTS:-} ]]; then
-    for host in $PREFILL_HOSTS; do
-      dualpath_wait_for_url_down \
-        "Prefill on $host" "http://$host:$PREFILL_PORT"
-    done
-  elif [[ -n ${PREFILL_HOST:-} ]]; then
-    dualpath_wait_for_url_down \
-      "Prefill on $PREFILL_HOST" "http://$PREFILL_HOST:$PREFILL_PORT"
-  fi
-  if [[ -n ${PREFILL_HOST:-} ]]; then
-    dualpath_wait_for_url_down \
-      "router on $PREFILL_HOST" "http://$PREFILL_HOST:$ROUTER_PORT"
-  fi
-  for host in ${DECODE_HOSTS:-}; do
-    dualpath_wait_for_url_down \
-      "Decode on $host" "http://$host:$DECODE_PORT"
-  done
+dualpath_port_in_use() {
+  local port=$1
+  ss -H -ltn "sport = :$port" 2>/dev/null | grep -q .
 }
 
-dualpath_container_srun() {
-  local host=$1
-  shift
-  exec srun --nodes=1 --ntasks=1 --nodelist="$host" \
-    --gres=gpu:8 --exclusive --exact --mpi=none \
-    --container-image="$IMAGE" \
-    --container-mounts="/mnt/lustre:/mnt/lustre,$CODE_HOME:/workspace/dual-path" \
-    --container-workdir=/workspace/dual-path \
-    --no-container-mount-home \
-    "$@"
+dualpath_report_client_residue() {
+  local residue
+  residue=$(pgrep -u "${USER:-$(id -un)}" -af \
+    'replay_fake_agent_traces\.py|sglang::router' || true)
+  if [[ -n $residue ]]; then
+    echo "WARNING: residual client processes detected on $(hostname -s):" >&2
+    printf '%s\n' "$residue" >&2
+    echo "Cleanup commands (review PIDs before running):" >&2
+    echo "  pgrep -u \"$USER\" -af 'replay_fake_agent_traces.py|sglang::router'" >&2
+    echo "  pkill -TERM -u \"$USER\" -f 'replay_fake_agent_traces.py|sglang::router'" >&2
+    echo "  pkill -KILL -u \"$USER\" -f 'replay_fake_agent_traces.py|sglang::router'" >&2
+    return 1
+  fi
+  return 0
+}
+
+dualpath_report_router_port() {
+  local port=$1
+  local owner
+  owner=$(ss -H -ltnp "sport = :$port" 2>/dev/null || true)
+  if [[ -n $owner ]]; then
+    echo "WARNING: Router port $port is already occupied:" >&2
+    printf '%s\n' "$owner" >&2
+    echo "  ss -ltnp 'sport = :$port'" >&2
+    return 1
+  fi
+  return 0
 }
 
 dualpath_write_run_json() {
@@ -173,6 +179,12 @@ except json.JSONDecodeError:
     pd_ib_device_mapping = sys.argv[21]
 
 Path(sys.argv[1]).write_text(json.dumps({
+    "task_name": os.environ.get("TASK_NAME"),
+    "allocation_job_id": os.environ.get("ALLOC_JOB_ID"),
+    "image": os.environ.get("IMAGE"),
+    "prefill_hosts": os.environ.get("PREFILL_HOSTS", "").split(),
+    "decode_hosts": os.environ.get("DECODE_HOSTS", "").split(),
+    "client_host": os.environ.get("ROUTER_HOST"),
     "architecture": sys.argv[2],
     "max_len_k": int(sys.argv[3]),
     "agents": int(sys.argv[4]),
@@ -197,6 +209,9 @@ Path(sys.argv[1]).write_text(json.dumps({
     "mooncake_max_transfer_batch_indices": int(sys.argv[18]),
     "prefill_release_local_cache_after_pd_ack": bool(int(sys.argv[19])),
     "prefill_hicache_write_policy": sys.argv[20],
+    "prefill_hicache_mem_layout": os.environ.get(
+        "PREFILL_HICACHE_MEM_LAYOUT", "layer_first"
+    ),
     "pd_ib_device_mapping": pd_ib_device_mapping,
     "prefill_hicache_read_only": bool(int(sys.argv[22])),
     "prefill_hicache_evict_unlocked": bool(int(sys.argv[23])),
@@ -257,19 +272,6 @@ dualpath_resolve_dataset() {
   export DATASET_LABEL DATASET_PATH DATASET_MAX_LEN
 }
 
-dualpath_repetition_ids() {
-  if [[ -n ${REP_LIST:-} ]]; then
-    printf '%s\n' ${REP_LIST//,/ }
-  elif [[ "$REPETITIONS" == *" "* || "$REPETITIONS" == *","* ]]; then
-    printf '%s\n' ${REPETITIONS//,/ }
-  elif [[ "$REPETITIONS" =~ ^[0-9]+$ ]] && (( REPETITIONS > 0 )); then
-    seq 1 "$REPETITIONS"
-  else
-    echo "REPETITIONS must be a positive count or REP_LIST must list IDs" >&2
-    return 2
-  fi
-}
-
 dualpath_run_replay() {
   local dataset=$1
   local agents=$2
@@ -314,9 +316,9 @@ dualpath_run_replay() {
       --decode-l3-sync-timeout "${DUALPATH_DECODE_L3_SYNC_TIMEOUT:-600}"
     )
   fi
-  python scripts/benchmark/replay_fake_agent_traces.py \
+  exec setsid python scripts/benchmark/replay_fake_agent_traces.py \
     --dataset "$dataset" \
-    --base-url "http://$PREFILL_HOST:$ROUTER_PORT" \
+    --base-url "http://${ROUTER_HOST:-$PREFILL_HOST}:$ROUTER_PORT" \
     --output-dir "$output_dir" \
     --server-selection-timeout "${SERVER_SELECTION_TIMEOUT:-120}" \
     --trajectory-offset "$TRAJECTORY_OFFSET" \

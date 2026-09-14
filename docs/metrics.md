@@ -24,8 +24,7 @@
 
 ```text
 # Lustre runtime results：原始 rounds / trajectories / run.json（RESULT_DIR）
-/mnt/lustre/users/sezhou/dual-path/results/latency-benchmark/<TASK>/
-/mnt/lustre/users/sezhou/dual-path/logs/latency-benchmark/<TASK>/
+/mnt/lustre/users/sezhou/dual-path/test/<allocation-id>/<TASK>/logs/
 
 # Labhome 仓库侧产物：整理后的 data/csv/SVG（REPO_RESULT_DIR）
 /labhome/sezhou/dual-path/results/latency-benchmark/<TASK>/
@@ -443,20 +442,29 @@ turn 特写；本仓库 breakdown 图是 **离线全量 request 均值 × #Agent
 `scripts/benchmark/collect_benchmark_metrics.py` 对每个
 dataset/agents/rep 分别生成该 run 的全量 fullchain。
 
-## 7. 当前自动采集流水线
+## 7. 当前独立采集流水线
 
-正式提交入口（每种拓扑仅保留一份）：
+正式运行入口（所有拓扑共用一份）：
 
 ```text
-scripts/pd_1p1d_benchmark.sbatch
-scripts/pd_1p2d_benchmark.sbatch
-scripts/pd_2p2d_benchmark.sbatch
+scripts/pd_benchmark.sh
+scripts/tests/runtime/pd_runtime.sh
 ```
 
-Job 结束时统一调用 `scripts/benchmark/collect_benchmark_metrics.py`。
+`scripts/pd_alloc.sh P D` 负责建立 allocation、节点角色、镜像和长期 server 静态配置；
+dataset、agents、repetition、task/log/result 路径由每次 client invocation 配置。
 
-三个入口统一接受 `TASK_NAME`、`DATASETS`、`AGENT_COUNTS`、`REPETITIONS` /
-`REP_LIST`。新运行的目录固定为：
+运行与绘图彼此独立。客户端角色只生成 Lustre 原始结果；某个 client run 完成后即可通过
+`scripts/pd_plot.sh` 调用
+`scripts/benchmark/collect_benchmark_metrics.py`：
+
+```bash
+scripts/pd_plot.sh <TASK_NAME>
+```
+
+allocation 配置提供 `PREFILL_HOSTS`、`DECODE_HOSTS` 和固定 L3 read path；client
+接受 `TASK_NAME`、`DATASET`、`AGENTS`、`REPETITION`。P/D 数量由 host list 推导；
+TASK 目录不自动追加 Job ID，每个 client run 必须使用唯一名称：
 
 ```text
 <TASK>/<DATASET>/agents-<N>/rep-<R>/

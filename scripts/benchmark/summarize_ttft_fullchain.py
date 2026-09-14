@@ -544,7 +544,7 @@ def main() -> None:
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     rounds = [json.loads(line) for line in args.rounds.read_text().splitlines()]
-    logs = sorted(args.log_dir.glob(args.log_glob))
+    logs = sorted(args.log_dir.rglob(args.log_glob))
     (
         request,
         l3,

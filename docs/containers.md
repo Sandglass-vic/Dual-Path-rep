@@ -104,27 +104,26 @@ sbatch scripts/infra/build_benchmark_timing_image.sbatch
 新的 SGLang/Mooncake patch 不应直接覆盖正式镜像。推荐使用三阶段流程：
 
 1. 从最后一个稳定镜像或基础镜像创建 writable Enroot container，应用 patch；
-2. 导出到 Job/commit 专属的临时候选镜像，并用该镜像执行多节点 smoke；
-3. 仅在 smoke 成功后，原子重命名为正式镜像并更新 SHA-256、Job ID 和 benchmark
-   默认路径；失败时删除候选镜像，保留原正式版本。
+2. 直接在 `images/` 导出 Job/commit 专属的候选镜像，并用该镜像执行多节点 smoke；
+3. 仅在 smoke 成功后更新 SHA-256、Job ID 和 benchmark 默认路径；失败时删除该
+   Job 镜像，保留原默认版本。
 
 `build_benchmark_timing_image.sbatch` 支持通过 `OUTPUT_IMAGE` 指向候选路径：
 
 ```bash
-candidate="$RUNTIME_HOME/images/candidates/sglang-shared-host-${USER}-$(date +%s).sqsh"
+candidate="$RUNTIME_HOME/images/sglang-shared-host-${USER}-$(date +%s).sqsh"
 build_job=$(
   sbatch --parsable \
     --export=ALL,OUTPUT_IMAGE="$candidate" \
     scripts/infra/build_benchmark_timing_image.sbatch
 )
 
-# build 成功后，smoke 提交时显式覆盖 IMAGE="$candidate"。
-# smoke 验收通过后再执行同一 Lustre 文件系统内的原子 mv：
-mv -- "$candidate" "$RUNTIME_HOME/images/<正式镜像名>.sqsh"
-sha256sum "$RUNTIME_HOME/images/<正式镜像名>.sqsh"
+# build 成功后，smoke 启动时显式覆盖 IMAGE="$candidate"。
+# smoke 验收通过后记录校验值并更新 benchmark 默认 IMAGE：
+sha256sum "$candidate"
 ```
 
-候选镜像必须位于所有测试节点可见的 Lustre 路径。完全不导出 sqsh、直接修改
+候选镜像必须位于所有测试节点可见的 Lustre `images/` 路径。完全不导出 sqsh、直接修改
 每个 Pyxis runtime root 虽然可行，但多节点需要分别应用 patch，容易出现节点间
 源码不一致，因此不作为正式验证方式。候选镜像不是正式发布物，不得写入 benchmark
 默认值；测试失败或取消后应自动清理。
@@ -132,9 +131,8 @@ sha256sum "$RUNTIME_HOME/images/<正式镜像名>.sqsh"
 该脚本从未修改的 `sglang:26.01-py3.sqsh` 创建 writable Enroot container，
 安装固定 Mooncake Transfer Engine wheel 与 Router，运行
 `scripts/infra/patch_sglang_benchmark_timing.py`，执行 import/API/source compile
-断言后导出 Job 专属候选 sqsh。脚本不再注入 Mooncake Store DFS backport，且
-默认输出也位于 `images/candidates/`；正式实验必须经过 smoke、原子发布并记录
-SHA-256。
+断言后直接导出到 `images/` 下的 Job 专属候选 sqsh。脚本不再注入 Mooncake
+Store DFS backport；正式实验必须经过 smoke，并记录 SHA-256 后再更新默认路径。
 
 基础镜像执行 `pip check` 会报告 `triton-kernels` 缺少 `pytest`。这是基础镜像已有的开发/测试依赖缺口，不是 Mooncake 安装造成的运行依赖冲突，因此未为了消除该提示修改推理环境。
 

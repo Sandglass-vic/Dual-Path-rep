@@ -11,35 +11,30 @@ import statistics
 from collections import defaultdict
 from pathlib import Path
 
+from plot_style import COLORS, add_title_suffix
+
+
+TITLE_SUFFIX = ""
+
 
 FULLCHAIN_COMPONENTS = (
-    ("bootstrap_and_scheduling_seconds", "Bootstrap & scheduling", "#64748b"),
-    ("prefill_l3_kv_read_seconds", "Prefill L3 KV read", "#f59e0b"),
-    ("decode_l3_kv_read_seconds", "Decode L3 KV read", "#2563eb"),
-    ("decode_prealloc_seconds", "Decode HBM pre-allocation", "#7e22ce"),
     (
-        "decode_l3_bootstrap_handoff_seconds",
-        "Decode L3 bootstrap handoff",
-        "#0891b2",
+        "prefill_l3_kv_read_seconds",
+        "Prefill KV Read (Lustre) + Radix tree",
+        COLORS["orange"],
     ),
-    (
-        "decode_to_prefill_kv_transfer_seconds",
-        "D→P KV transfer",
-        "#0f766e",
-    ),
-    (
-        "prefill_host_to_device_seconds",
-        "Prefill HiCache Host→GPU",
-        "#be123c",
-    ),
-    ("prefill_logits_sampling_seconds", "Prefill + sampling", "#22c55e"),
-    ("pd_transfer_seconds", "P→D KV transfer", "#f97316"),
-    ("decode_host_to_device_seconds", "Decode Host→GPU", "#ef4444"),
-    ("decode_dispatch_seconds", "Decode dispatch", "#8b5cf6"),
-    ("sse_egress_seconds", "SSE egress", "#06b6d4"),
-    ("server_runtime_residual_seconds", "Server runtime residual", "#94a3b8"),
-    ("router_client_runtime_seconds", "Router/client boundary", "#cbd5e1"),
+    ("decode_l3_kv_read_seconds", "Decode KV Read (Lustre)", COLORS["purple"]),
+    ("decode_prealloc_seconds", "Decode pre-allocation", COLORS["yellow"]),
+    ("decode_to_prefill_kv_transfer_seconds", "D->P transfer", COLORS["pink"]),
+    ("prefill_host_to_device_seconds", "Prefill HiCache Host->GPU", COLORS["blue"]),
+    ("prefill_logits_sampling_seconds", "Prefill + Sampling", COLORS["green"]),
+    ("pd_transfer_seconds", "P->D transfer", COLORS["red"]),
+    ("decode_host_to_device_seconds", "Decode Host->GPU", COLORS["cyan"]),
+    ("decode_dispatch_seconds", "Decode dispatch", COLORS["brown"]),
+    ("misc_seconds", "Misc", COLORS["gray"]),
 )
+
+LEGEND_COMPONENTS = FULLCHAIN_COMPONENTS
 
 
 def text(
@@ -178,16 +173,11 @@ def draw_box_panel(
 def write_latency(
     rows: list[dict[str, float | str]], output: Path
 ) -> dict[str, dict[str, float | int]]:
-    width, height = 1280, 520
+    width, height = 1080, 430
     elements = [
         f'<rect width="{width}" height="{height}" fill="white"/>',
-        text(width / 2, 28, "All trajectories · per-agent distributions", 16, weight="bold"),
-        text(
-            width / 2,
-            48,
-            "Whiskers=min/max, box=Q1–Q3, line=median, blue dot=mean",
-            11,
-        ),
+        text(width / 2, 24, add_title_suffix("All trajectories · per-agent distributions", TITLE_SUFFIX), 14, weight="bold"),
+        text(width / 2, 43, "Whiskers=min/max, box=Q1-Q3, line=median, blue dot=mean", 10),
     ]
     fields = (
         ("jct_seconds", "JCT", "Seconds", 1.0),
@@ -196,14 +186,14 @@ def write_latency(
     )
     summaries = {}
     for index, (field, title, ylabel, scale) in enumerate(fields):
-        left = 80.0 + index * 410
+        left = 65.0 + index * 350
         summaries[field] = draw_box_panel(
             elements,
             [float(row[field]) for row in rows],
             left,
-            left + 350,
-            95,
-            430,
+            left + 300,
+            80,
+            350,
             title,
             ylabel,
             scale,
@@ -221,6 +211,7 @@ def write_breakdown(rounds_path: Path, output: Path) -> dict[str, float]:
     rows = [json.loads(line) for line in rounds_path.read_text().splitlines()]
     for row in rows:
         # Keep historical fullchain artifacts readable after the split.
+        row.setdefault("bootstrap_and_scheduling_seconds", 0.0)
         row.setdefault(
             "prefill_l3_kv_read_seconds",
             row.get("l3_kv_read_seconds", 0.0),
@@ -230,7 +221,23 @@ def write_breakdown(rounds_path: Path, output: Path) -> dict[str, float]:
         row.setdefault("decode_l3_bootstrap_handoff_seconds", 0.0)
         row.setdefault("decode_to_prefill_kv_transfer_seconds", 0.0)
         row.setdefault("prefill_host_to_device_seconds", 0.0)
+        row.setdefault("prefill_logits_sampling_seconds", 0.0)
+        row.setdefault("pd_transfer_seconds", 0.0)
+        row.setdefault("decode_host_to_device_seconds", 0.0)
+        row.setdefault("decode_dispatch_seconds", 0.0)
+        row.setdefault("sse_egress_seconds", 0.0)
+        row.setdefault("router_client_runtime_seconds", 0.0)
         row.setdefault("server_runtime_residual_seconds", 0.0)
+        row["misc_seconds"] = sum(
+            float(row[field])
+            for field in (
+                "bootstrap_and_scheduling_seconds",
+                "decode_l3_bootstrap_handoff_seconds",
+                "sse_egress_seconds",
+                "server_runtime_residual_seconds",
+                "router_client_runtime_seconds",
+            )
+        )
     means = {
         field: statistics.fmean(float(row[field]) for row in rows)
         for field, _, _ in FULLCHAIN_COMPONENTS
@@ -238,14 +245,28 @@ def write_breakdown(rounds_path: Path, output: Path) -> dict[str, float]:
     means["mean_ttft_seconds"] = statistics.fmean(
         float(row["ttft_seconds"]) for row in rows
     )
-    width, height = 980, 500
-    left, right, top, bottom = 100.0, 500.0, 75.0, 420.0
+    width, height = 600, 455
+    left, right, top, bottom = 70.0, 540.0, 145.0, 390.0
     y_max = means["mean_ttft_seconds"] * 1000 * 1.15 or 1.0
     elements = [
         f'<rect width="{width}" height="{height}" fill="white"/>',
-        text(width / 2, 28, "Mean TTFT full-chain breakdown", 16, weight="bold"),
-        text(width / 2, 48, f"Mean over all {len(rows)} requests", 11),
+        text(width / 2, 24, add_title_suffix("TTFT Breakdown", TITLE_SUFFIX), 14, weight="bold"),
+        text(width / 2, 43, f"Mean over all {len(rows)} requests", 10),
     ]
+    # Keep the original component order while placing the legend inside the
+    # figure, above the plot, in two compact horizontal rows.
+    legend_columns = 3
+    legend_x_positions = (40, 280, 450)
+    for index, (_, label, color) in enumerate(LEGEND_COMPONENTS):
+        column = index % legend_columns
+        row = index // legend_columns
+        legend_x = legend_x_positions[column]
+        legend_y = 54 + row * 21
+        elements.append(
+            f'<rect x="{legend_x}" y="{legend_y - 8}" width="10" height="10" '
+            f'fill="{color}"/>'
+        )
+        elements.append(text(legend_x + 14, legend_y + 1, label, 9, "start"))
     for tick in range(6):
         value = y_max * tick / 5
         y = bottom - value / y_max * (bottom - top)
@@ -264,16 +285,10 @@ def write_breakdown(rounds_path: Path, output: Path) -> dict[str, float]:
             f'fill="{color}"/>'
         )
     elements.append(text(x, cursor - 10, f"{means['mean_ttft_seconds'] * 1000:.1f} ms", 11))
-    legend_rows = (len(FULLCHAIN_COMPONENTS) + 1) // 2
-    for index, (_, label, color) in enumerate(FULLCHAIN_COMPONENTS):
-        column, row = divmod(index, legend_rows)
-        legend_x = 570 + column * 205
-        y = 100 + row * 45
-        elements.append(
-            f'<rect x="{legend_x}" y="{y - 12}" width="16" height="16" '
-            f'fill="{color}"/>'
-        )
-        elements.append(text(legend_x + 24, y + 1, label, 11, "start"))
+    elements.append(
+        '<text x="18" y="205" font-family="sans-serif" font-size="11" '
+        'text-anchor="middle" transform="rotate(-90 18 205)">Time [ms]</text>'
+    )
     output.write_text(
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" '
         f'height="{height}" viewBox="0 0 {width} {height}">\n'
@@ -290,7 +305,10 @@ def main() -> None:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--csv-output", type=Path, required=True)
     parser.add_argument("--json-output", type=Path, required=True)
+    parser.add_argument("--title-suffix", default="")
     args = parser.parse_args()
+    global TITLE_SUFFIX
+    TITLE_SUFFIX = args.title_suffix
     args.output_dir.mkdir(parents=True, exist_ok=True)
     args.csv_output.parent.mkdir(parents=True, exist_ok=True)
     args.json_output.parent.mkdir(parents=True, exist_ok=True)

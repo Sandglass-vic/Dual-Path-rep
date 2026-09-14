@@ -10,6 +10,8 @@ import math
 from collections import defaultdict
 from pathlib import Path
 
+from plot_style import add_title_suffix
+
 
 def text(
     x: float, y: float, value: str, size: int = 12, anchor: str = "middle"
@@ -53,19 +55,19 @@ def discover(result_dir: Path) -> dict[str, dict[int, dict[str, object]]]:
     return dict(output)
 
 
-def write_svg(data: dict[str, dict[int, dict[str, object]]], output: Path) -> None:
+def write_svg(data: dict[str, dict[int, dict[str, object]]], output: Path, title_suffix: str) -> None:
     datasets = sorted(data.items())
     columns = min(3, len(datasets))
     rows = math.ceil(len(datasets) / columns)
-    panel_width, panel_height = 390, 330
+    panel_width, panel_height = 330, 275
     width = 55 + columns * panel_width
     height = 80 + rows * panel_height
     elements = [
         f'<rect width="{width}" height="{height}" fill="white"/>',
-        text(width / 2, 26, "Worst-case trajectory JCT", 16),
+        text(width / 2, 22, add_title_suffix("Worst-case trajectory JCT", title_suffix), 14),
         text(
             width / 2,
-            47,
+            41,
             "For each dataset × agents: max agent JCT, then max across repetitions",
             11,
         ),
@@ -130,10 +132,11 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--result-dir", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--title-suffix", default="")
     args = parser.parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     data = discover(args.result_dir)
-    write_svg(data, args.output_dir / "JCT.svg")
+    write_svg(data, args.output_dir / "JCT.svg", args.title_suffix)
     (args.output_dir / "JCT.json").write_text(json.dumps(data, indent=2) + "\n")
 
 

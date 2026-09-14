@@ -84,13 +84,14 @@ page_size=64
 
 ## 一键消融配置
 
-入口：
+在申请 allocation 时设置 profile，生成的配置会由每个节点自动加载：
 
 ```bash
-ABLATION_PROFILE=<profile> sbatch scripts/pd_1p2d_benchmark.sbatch
+ABLATION_PROFILE=<profile> scripts/pd_alloc.sh 1 2
+# SSH 到输出的所有节点后执行：scripts/pd_benchmark.sh
 ```
 
-profile 定义在 `scripts/ablation_profiles.sh`：
+profile 定义在 `scripts/tests/runtime/ablation_profiles.sh`：
 
 - `full`：Prefill Store 读、Decode Store/DFS 写、8192-token chunk、overlap scheduler；
 - `no-prefill-l3`：关闭 Prefill Store 查询，Prefill 计算完整 prompt；
@@ -99,7 +100,7 @@ profile 定义在 `scripts/ablation_profiles.sh`：
 - `bulk-prefill`：在 `full` 基础上设置 `chunked_prefill_size=-1`；
 - `no-overlap`：在 `full` 基础上关闭 overlap scheduler。
 
-每个 Job 将解析后的配置写入：
+每个 run 将解析后的配置写入：
 
 ```text
 $RESULT_DIR/ablation-profile.env

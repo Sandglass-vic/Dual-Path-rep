@@ -3,32 +3,31 @@ set -euo pipefail
 
 : "${MODEL_DIR:?MODEL_DIR is required}"
 : "${LOG_DIR:?LOG_DIR is required}"
-: "${PREFILL_HOST:?PREFILL_HOST is required}"
+: "${DECODE_HOST:?DECODE_HOST is required}"
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-# shellcheck source=scripts/pd_network_config.sh
+# shellcheck source=scripts/tests/runtime/pd_network_config.sh
 source "$SCRIPT_DIR/pd_network_config.sh"
-export DUALPATH_HICACHE_READ_ONLY=${PREFILL_HICACHE_READ_ONLY:-0}
-export DUALPATH_HICACHE_EVICT_UNLOCKED=${PREFILL_HICACHE_EVICT_UNLOCKED:-0}
+unset DUALPATH_HICACHE_READ_ONLY
+unset DUALPATH_HICACHE_EVICT_UNLOCKED
+export DUALPATH_DECODE_PD_HOST_STAGING=${DUALPATH_DECODE_PD_HOST_STAGING:-1}
 
-PREFILL_PORT=${PREFILL_PORT:-30000}
-BOOTSTRAP_PORT=${BOOTSTRAP_PORT:-8998}
+DECODE_PORT=${DECODE_PORT:-30000}
 MEM_FRACTION_STATIC=${MEM_FRACTION_STATIC:-0.75}
 CONTEXT_LENGTH=${CONTEXT_LENGTH:-4096}
 PD_TRANSFER_BACKEND=${PD_TRANSFER_BACKEND:-mooncake}
 HICACHE_STORAGE_BACKEND=${HICACHE_STORAGE_BACKEND:-file}
-CHUNKED_PREFILL_SIZE=${CHUNKED_PREFILL_SIZE:-}
-DISABLE_OVERLAP_SCHEDULE=${DISABLE_OVERLAP_SCHEDULE:-0}
+DECODE_OFFLOAD_KVCACHE=${DECODE_OFFLOAD_KVCACHE:-${ENABLE_HICACHE_L3:-0}}
 if [[ "$PD_TRANSFER_BACKEND" == mooncake || "$HICACHE_STORAGE_BACKEND" == mooncake ]]; then
   dualpath_validate_ib_devices
 fi
-if [[ -n ${PREFILL_ID:-} ]]; then
-  PREFILL_LOG="$LOG_DIR/prefill-$PREFILL_ID.log"
+if [[ -n ${DECODE_ID:-} ]]; then
+  DECODE_LOG="$LOG_DIR/decode-$DECODE_ID.log"
 else
-  PREFILL_LOG="$LOG_DIR/prefill.log"
+  DECODE_LOG="$LOG_DIR/decode.log"
 fi
 if [[ -n ${RUN_ID:-} ]]; then
-  PREFILL_LOG="${PREFILL_LOG%.log}-$RUN_ID.log"
+  DECODE_LOG="${DECODE_LOG%.log}-$RUN_ID.log"
 fi
 
 hicache_args=()
@@ -49,7 +48,7 @@ import os
 print(json.dumps({
     "master_server_address": os.environ["MOONCAKE_MASTER"],
     "metadata_server": os.environ["MOONCAKE_TE_META_DATA_SERVER"],
-    "local_hostname": os.environ["PREFILL_HOST"],
+    "local_hostname": os.environ["DECODE_HOST"],
     "global_segment_size": os.environ.get(
         "MOONCAKE_GLOBAL_SEGMENT_SIZE", "32gb"
     ),
@@ -70,8 +69,7 @@ PY
   hicache_args=(
     --page-size 64
     --enable-metrics
-    --enable-hierarchical-cache
-    --hicache-ratio "${HICACHE_RATIO:-1.2}"
+    --hicache-ratio "${DECODE_HICACHE_RATIO:-1.05}"
     --hicache-size 0
     --hicache-mem-layout page_first_direct
     --hicache-io-backend direct
@@ -82,41 +80,43 @@ PY
     "$hicache_extra_config"
   )
 fi
+if [[ "$DECODE_OFFLOAD_KVCACHE" == 1 ]]; then
+  if [[ ${ENABLE_HICACHE_L3:-0} != 1 ]]; then
+    echo "DECODE_OFFLOAD_KVCACHE=1 requires ENABLE_HICACHE_L3=1" >&2
+    exit 2
+  fi
+  hicache_args+=(--disaggregation-decode-enable-offload-kvcache)
+elif [[ "$DECODE_OFFLOAD_KVCACHE" != 0 ]]; then
+  echo "DECODE_OFFLOAD_KVCACHE must be 0 or 1" >&2
+  exit 2
+fi
 
 timing_args=()
 if [[ ${ENABLE_BENCHMARK_TIMING:-0} == 1 ]]; then
   timing_args+=(--enable-request-time-stats-logging)
 fi
 
-schedule_args=()
-if [[ -n "$CHUNKED_PREFILL_SIZE" ]]; then
-  schedule_args+=(--chunked-prefill-size "$CHUNKED_PREFILL_SIZE")
-fi
-if [[ "$DISABLE_OVERLAP_SCHEDULE" == 1 ]]; then
-  schedule_args+=(--disable-overlap-schedule)
-elif [[ "$DISABLE_OVERLAP_SCHEDULE" != 0 ]]; then
-  echo "DISABLE_OVERLAP_SCHEDULE must be 0 or 1" >&2
-  exit 2
-fi
-
 mkdir -p "$LOG_DIR"
 
-echo "Starting TP8 prefill on $PREFILL_HOST"
-exec python -m sglang.launch_server \
+echo "Starting TP8 decode on $DECODE_HOST"
+echo "Streaming Decode output to console and $DECODE_LOG"
+set +e
+PYTHONUNBUFFERED=1 python -u -m sglang.launch_server \
   --model-path "$MODEL_DIR" \
   --served-model-name qwen2.5-32b \
   --host 0.0.0.0 \
-  --port "$PREFILL_PORT" \
+  --port "$DECODE_PORT" \
   --tp-size 8 \
   --dtype bfloat16 \
   --kv-cache-dtype auto \
   --context-length "$CONTEXT_LENGTH" \
   --mem-fraction-static "$MEM_FRACTION_STATIC" \
-  --disaggregation-mode prefill \
+  --disaggregation-mode decode \
   --disaggregation-transfer-backend "$PD_TRANSFER_BACKEND" \
-  --disaggregation-bootstrap-port "$BOOTSTRAP_PORT" \
   --disaggregation-ib-device "$IB_DEVICE" \
   "${timing_args[@]}" \
-  "${schedule_args[@]}" \
   "${hicache_args[@]}" \
-  >"$PREFILL_LOG" 2>&1
+  2>&1 | tee -a "$DECODE_LOG"
+server_status=${PIPESTATUS[0]}
+set -e
+exit "$server_status"

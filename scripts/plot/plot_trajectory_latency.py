@@ -8,6 +8,8 @@ import html
 import json
 from pathlib import Path
 
+from plot_style import add_title_suffix
+
 
 TURN_COMPONENTS = (
     ("latency_seconds", "Model request", "#2563eb"),
@@ -40,9 +42,10 @@ def plot_lines(
     title: str,
     ylabel: str,
     output: Path,
+    title_suffix: str = "",
 ) -> None:
-    width, height = 1280, 460
-    left, right, top, bottom = 85.0, 1240.0, 60.0, 390.0
+    width, height = 1100, 400
+    left, right, top, bottom = 70.0, 1060.0, 52.0, 335.0
     turns = [int(row["turn_id"]) for row in rows]
     y_max = max(
         float(row[field]) for row in rows for field, _, _ in series
@@ -58,8 +61,8 @@ def plot_lines(
         return bottom - value / y_max * (bottom - top)
 
     elements = [
-        '<rect width="1280" height="460" fill="white"/>',
-        text(640, 25, title, 16),
+        f'<rect width="{width}" height="{height}" fill="white"/>',
+        text(width / 2, 22, add_title_suffix(title, title_suffix), 14),
     ]
     for tick in range(6):
         value = y_max * tick / 5
@@ -79,21 +82,21 @@ def plot_lines(
             f'<polyline points="{points}" fill="none" stroke="{color}" '
             'stroke-width="2"/>'
         )
-        x = 130 + index * 300
+        x = 100 + index * 250
         elements.append(
-            f'<line x1="{x}" y1="44" x2="{x + 24}" y2="44" '
+            f'<line x1="{x}" y1="38" x2="{x + 24}" y2="38" '
             f'stroke="{color}" stroke-width="3"/>'
         )
-        elements.append(text(x + 31, 48, label, 11, "start"))
+        elements.append(text(x + 31, 42, label, 10, "start"))
     tick_step = max(1, len(turns) // 10)
     for index in range(0, len(turns), tick_step):
-        elements.append(text(x_pos(turns[index]), 410, str(turns[index]), 10))
+        elements.append(text(x_pos(turns[index]), 352, str(turns[index]), 9))
     elements.extend(
         [
-            text(640, 438, "Turn", 12),
+            text(width / 2, 378, "Turn", 11),
             (
-                '<text x="20" y="225" font-family="sans-serif" font-size="12" '
-                'text-anchor="middle" transform="rotate(-90 20 225)">'
+                '<text x="16" y="195" font-family="sans-serif" font-size="11" '
+                'text-anchor="middle" transform="rotate(-90 16 195)">'
                 f"{html.escape(ylabel)} (ms)</text>"
             ),
         ]
@@ -105,6 +108,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--rounds", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--title-suffix", default="")
     args = parser.parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     rows = [json.loads(line) for line in args.rounds.read_text().splitlines()]
@@ -134,6 +138,7 @@ def main() -> None:
         "Per-turn Wall and Request Latency",
         "Latency",
         args.output_dir / "turn.svg",
+        args.title_suffix,
     )
     for field, name, color in (
         ("ttft_seconds", "TTFT", "#f97316"),
@@ -146,6 +151,7 @@ def main() -> None:
             f"Per-turn {name}",
             name,
             args.output_dir / f"{name.lower()}.svg",
+            args.title_suffix,
         )
     print(f"Wrote per-turn latency plots for {len(rows)} turns")
 

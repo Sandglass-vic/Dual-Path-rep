@@ -128,8 +128,13 @@ Repetitions：3
 
 旧 file backend 的 `.bin` 发布不是原子的，因此下一 turn 不能只依赖固定 sleep。
 逐 request、逐 TP rank completion marker 保证同一 trajectory 不会在上一轮
-Decode L3 backup 完成前读取对应文件。每个 run 使用独立 Lustre 目录做实验间
-cold-start 隔离；Job 退出后仍删除该 Job 的临时 KV 目录。
+Decode L3 backup 完成前读取对应文件。长期 Prefill/Decode server 在启动时固定使用
+allocation 级目录 `$RUNTIME_HOME/test/<allocation-id>/pd-servers/kv-cache/file/`；
+marker 位于同一 allocation 的 `pd-servers/kv-cache/l3-sync/`。client 的 `TASK_NAME` 只隔离日志、结果和
+request ID，不会创建新的 file-backend namespace。因此同一 allocation 上重复 client
+run 会复用已有 L3，不能当作 cold-start 实验。严格 cold start 需要停止 server、清理
+`$RUNTIME_HOME/test/<allocation-id>/pd-servers/kv-cache/` 并重新启动 server。当前流程不会自动
+删除 KV。
 
 Job `65032` 是历史诊断矩阵：它使用 Populate/Measured、服务重启、cache flush
 和存储静默等待，只能用于早期正确性与趋势分析，不能作为论文性能结果，也不再
@@ -148,27 +153,113 @@ breakdown、字段和有效性阈值统一见 [指标规范](metrics.md)。本�
 - `scripts/benchmark/replay_fake_agent_traces.py`
 - `scripts/infra/patch_sglang_benchmark_timing.py`
 - `scripts/infra/build_benchmark_timing_image.sbatch`
-- `scripts/pd_1p1d_benchmark.sbatch` / `pd_1p2d_benchmark.sbatch` /
-  `pd_2p2d_benchmark.sbatch`
+- `scripts/pd_alloc.sh` / `scripts/pd_benchmark.sh`
+- `scripts/tests/runtime/`（内部 P/D/client launcher）
+- `scripts/pd_plot.sh`（独立后处理入口）
 - `scripts/benchmark/collect_benchmark_metrics.py`
 - `scripts/benchmark/summarize_latency_benchmark.py` /
   `scripts/benchmark/summarize_ttft_fullchain.py`
 - `scripts/plot/`（longest/all-trajectories 与 task 级 JCT 作图）
 
-三个正式 sbatch 都接受任意长度的 dataset、agent 和 repetition 配置。标准
-dataset 可写 `32`/`32K`；自定义文件写
-`32K=/absolute/path/to/file.jsonl`。`REPETITIONS=N` 表示运行 `1..N`，
-`REP_LIST="1 3 5"` 可显式选择 repetition ID：
+统一入口支持 NP/ND：每个 engine 独占一节点、TP8，另用一个节点运行 Router 和
+replay 客户端。`pd_alloc.sh` 只申请并配置 allocation；Prefill/Decode server
+启动后，可以在同一个 client 节点重复运行多个 workload。每个 client run 只跑一个
+dataset、agent 数和 repetition；矩阵通过多次 client 启动完成。标准 dataset
+可写 `32`/`32K`，自定义文件写 `32K=/absolute/path/to/file.jsonl`。
+正式路径不再支持 `sbatch`。`pd_alloc.sh P D` 申请 `P+D+1` 个节点，自动生成
+运行环境和角色映射。以 1P2D 为例：
 
 ```bash
-TASK_NAME=figure7-main \
-DATASETS="32K 64K 128K" \
-AGENT_COUNTS="200 400 800" \
-REP_LIST="1 2 3" \
-sbatch scripts/pd_1p2d_benchmark.sbatch
+scripts/pd_alloc.sh 1 2
 ```
 
-旧 `MAX_LENGTHS` 仍作为 `DATASETS` 未设置时的兼容入口。
+allocation 只申请节点、镜像和拓扑，不保存 L3 read path。Prefill、Decode 和 client
+启动时都必须显式传入相同的 `DUALPATH_L3_READ_PATH`。在 client 上运行时默认
+`DATASET=32K`、`AGENTS=1`、`REPETITION=1`，也可按 run 覆盖：
+
+```bash
+DATASET=64K AGENTS=8 REPETITION=2 \
+  TASK_NAME=1p2d-64k-a8-r2 \
+  scripts/pd_benchmark.sh client
+```
+
+`DUALPATH_L3_READ_PATH` 不属于 allocation 配置，必须在每个角色启动时指定：
+
+```bash
+DUALPATH_L3_READ_PATH=decode scripts/pd_benchmark.sh prefill
+DUALPATH_L3_READ_PATH=decode scripts/pd_benchmark.sh decode
+DATASET=32K AGENTS=1 REPETITION=1 \
+  DUALPATH_L3_READ_PATH=decode scripts/pd_benchmark.sh client
+```
+
+三个命令必须使用同一个值；缺少参数或值不是 `prefill`/`decode` 时会拒绝启动。
+`pd_alloc.sh` 只打印 `<prefill|decode>` 占位符，不负责选择路径。不能在 Prefill/Decode
+已启动后仅通过 client 命令切换路径。
+
+分配完成后输出每个节点的 `prefill-N`、`decode-N` 或 `client` 角色，并在
+`$RUNTIME_HOME/config/allocations/<job-id>.env` 写入上述环境。在每个节点 SSH
+会话中执行脚本打印的 `pd_benchmark.sh prefill|decode|client` 命令；launcher
+自动查找本机 allocation、加载配置并校验 hostname 对应的角色。无参数时仍支持
+自动识别，`server` 保留为 Prefill/Decode 的兼容别名。
+client 每次启动都会打印最终解析的 workload、日志目录、结果目录和 allocation 级
+server KV 目录，并显示 turns/agents 两条进度条。
+成功完成后会打印 cold-cache 清理命令和 `pd_plot.sh` 命令；失败或中断时只打印
+cold-cache 清理命令。
+完成后只停止本次 Router，Prefill/Decode server 继续运行，可以直接开始下一次
+client run。client 还会检查 Router 端口和本用户残留的 replay/Router；发现残留时
+默认拒绝启动并打印 PID、端口占用和清理命令。确认无误后再执行清理，或显式设置
+`PD_CLIENT_ALLOW_RESIDUAL=1` 绕过残留检查。默认 Router 从 `8000` 开始自动选择
+空闲端口；`ROUTER_PORT_AUTO=0` 时使用指定端口并在占用时失败。
+由于提交节点不挂载 Lustre，配置的创建和退出删除各由 client 节点上的一个短
+`srun --overlap` step 完成；allocation shell 本身仍运行在提交终端。
+
+旧拓扑和统一 sbatch 已移除。旧矩阵变量
+`DATASETS`、`AGENT_COUNTS`、`REP_LIST`、`REPETITIONS` 不再接受。
+默认 `PAPER_EXPAND_AGENTS=0`；`MAX_TURNS=0` 表示完整 trajectory。
+`DUALPATH_L3_READ_PATH=prefill|decode`、`IMAGE` 和双池参数保持可配置。
+
+客户端 replay 正常完成后会停止本机 Router，但不会远程杀 engine；`Ctrl-C` 会通过
+client trap 显式终止本次 replay 进程组和 Router。全部实验结束后，先在所有 Decode
+会话中按一次 Ctrl-C 并等待对应 `srun` 退出，再停止 Prefill。每个角色只有一个
+单节点 `srun` step，不存在 rank 0 退出后由 Slurm 批量终止其他节点的路径。
+launcher 使用 `srun --quit-on-interrupt --unbuffered`。Prefill/Decode stdout/stderr
+通过 `tee -a` 同时实时输出到终端和 allocation 级 server 日志。
+
+运行与绘图完全分离。某个 client run 完成后即可在任一可访问 Lustre 和仓库的节点
+执行，不要求先停止长期 server：
+
+```bash
+scripts/pd_plot.sh 1p2d-32k-a1-manual
+```
+
+`TASK_NAME` 是精确的 client run 名，不自动追加 Job ID。client 日志和原始结果按
+`TASK_NAME` 隔离；Lustre KV 与 L3 completion markers 属于 allocation 并默认保留。
+客户端若发现目标 run 已存在 `summary.json` 或
+`rounds.jsonl` 会拒绝覆盖。`pd_plot.sh` 只做采集与绘图，不参与运行清理。
+file backend 使用 P2PHANDSHAKE Transfer Engine，不启动 Store master。
+
+client 原始 replay 结果和本次画图输入位于当前 allocation 的 Lustre 目录：
+
+```text
+$RUNTIME_HOME/test/<allocation-id>/<TASK_NAME>/logs/
+```
+
+`pd_plot.sh` 从该目录和 `pd-servers/` 日志读取数据，把整理后的图表输出到
+`/labhome/sezhou/dual-path/results/latency-benchmark/<TASK_NAME>/`。原始结果不会复制
+到 `/labhome`。
+
+如果下一次实验必须从空的 L3 KV 开始，不能在 client 结束后直接删除 `file/`：
+Prefill 和 Decode 进程可能仍持有 HiCache metadata，且 Decode backup 可能仍在异步
+写入。应先停止所有 Prefill/Decode server，再释放 allocation，最后删除该 allocation
+目录并重新启动 server：
+
+```bash
+rm -rf /mnt/lustre/users/sezhou/dual-path/test/<allocation-id>/pd-servers/kv-cache
+```
+
+`pd_alloc.sh` 在 allocation 输出末尾会打印已经展开 allocation ID 的同一条清理命令。
+该命令只是提示，不会自动执行。若保留 server 并再次运行 client，同一 allocation
+的 `file/` 会被有意复用，属于 warm-cache 测试。
 
 历史 Job `65032` 为旧 file-backend / 隔离口径矩阵，不得与正式 Mooncake
 动态 rollout 混报。指标与产物口径见 [指标规范](metrics.md)；仓库侧图表在

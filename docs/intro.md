@@ -47,7 +47,8 @@
 - 独立正确性仍可通过服务重启排除 L1/L2；正式性能路径默认 per-request
   release + L3 reload。
 - 多节点作业提交前核对 [已知故障节点](platform.md#已知故障节点临时排除)。
-- 每个测试使用 Job 专属 KV 目录，验收和统计完成后自动删除，日志与结构化结果保留。
+- 每个 client run 使用 `TASK_NAME` 专属日志和结果目录；长期 server 使用
+  allocation 级共享 KV namespace。当前流程不自动删除这些目录。
 - 多轮 replay 必须把真实模型输出加入下一轮完整 context，不能将 trajectory 展开成无关请求。
 - 代码和文档在 `/labhome/sezhou/dual-path`；大型运行数据在计算节点可见的 `/mnt/lustre/users/sezhou/dual-path`。
 

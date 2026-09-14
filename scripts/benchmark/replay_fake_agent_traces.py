@@ -18,6 +18,44 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+try:
+    from tqdm import tqdm
+except ImportError:  # Keep the benchmark runnable in minimal client images.
+    class tqdm:  # type: ignore[no-redef]
+        def __init__(self, iterable=None, *, total=None, desc="", unit=""):
+            self.total = total
+            self.n = 0
+            self.desc = desc
+            self.unit = unit
+
+        def update(self, count=1):
+            self.n += count
+            total = self.total or "?"
+            print(f"{self.desc}: {self.n}/{total} {self.unit}", flush=True)
+
+        def close(self):
+            pass
+
+
+class ReplayProgress:
+    def __init__(self, total_turns: int, total_agents: int) -> None:
+        self.lock = threading.Lock()
+        self.turns = tqdm(total=total_turns, desc="turns", unit="turn")
+        self.agents = tqdm(total=total_agents, desc="agents", unit="agent")
+
+    def turn_completed(self) -> None:
+        with self.lock:
+            self.turns.update(1)
+
+    def agent_completed(self) -> None:
+        with self.lock:
+            self.agents.update(1)
+
+    def close(self) -> None:
+        with self.lock:
+            self.turns.close()
+            self.agents.close()
+
 
 class FlushCoordinator:
     """Drain active requests, flush once, then release the next request wave."""
@@ -99,6 +137,7 @@ class ReplayConfig:
     l3_sync_dir: Path | None
     l3_sync_ranks: int
     l3_sync_timeout: float
+    progress: ReplayProgress | None = None
 
 
 def wait_for_decode_l3(
@@ -429,6 +468,8 @@ def replay_trajectory(
         round_results[-1]["storage_settle_seconds"] = settle_seconds
         round_results[-1]["cache_sync_wait_seconds"] = cache_sync_wait_seconds
         round_results[-1]["decode_l3_sync_wait_seconds"] = l3_sync_wait_seconds
+        if config.progress is not None:
+            config.progress.turn_completed()
 
     elapsed_seconds = sum(
         float(item["turn_wall_seconds"]) for item in round_results
@@ -659,6 +700,13 @@ def main() -> None:
             )
     workers = args.max_workers or len(trajectories)
     workers = min(workers, len(trajectories))
+    total_turns = sum(
+        len(trajectory["turns"][: args.max_turns])
+        if args.max_turns is not None
+        else len(trajectory["turns"])
+        for trajectory in trajectories
+    )
+    progress = ReplayProgress(total_turns, len(trajectories))
     flush_urls = tuple(url.rstrip("/") for url in args.flush_cache_url)
     if args.flush_local_cache_between_turns:
         flush_urls = tuple(
@@ -691,6 +739,7 @@ def main() -> None:
         l3_sync_dir=args.decode_l3_sync_dir,
         l3_sync_ranks=args.decode_l3_sync_ranks,
         l3_sync_timeout=args.decode_l3_sync_timeout,
+        progress=progress,
     )
     start_event = threading.Event()
     all_rounds: list[dict[str, Any]] = []
@@ -717,6 +766,7 @@ def main() -> None:
                 rounds, summary = future.result()
                 all_rounds.extend(rounds)
                 summaries.append(summary)
+                progress.agent_completed()
             except Exception as error:  # Preserve all agent failures.
                 errors.append(
                     {
@@ -724,6 +774,8 @@ def main() -> None:
                         "error": f"{type(error).__name__}: {error}",
                     }
                 )
+
+    progress.close()
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     all_rounds.sort(key=lambda item: (item["trajectory_id"], item["turn_id"]))

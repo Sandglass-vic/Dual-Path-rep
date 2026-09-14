@@ -102,7 +102,7 @@ def parse_timing_logs(
     release_values: dict[str, dict[str, list[float]]] = defaultdict(
         lambda: defaultdict(list)
     )
-    for path in log_dir.glob("*.log"):
+    for path in log_dir.rglob("*.log"):
         for line in path.read_text(errors="replace").splitlines():
             match = REQUEST_PATTERN.search(line)
             if match and match.group("type").lower() == "prefill":

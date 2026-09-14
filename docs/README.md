@@ -40,13 +40,22 @@
 
 ```text
 scripts/
-  pd_*_benchmark.sbatch + pd_benchmark_lib.sh   # 正式矩阵
+  pd_alloc.sh                                    # salloc、默认值与角色配置
+  pd_benchmark.sh                                # 节点自动识别与启动入口
+  tests/runtime/                                 # P/D/client 运行实现细节
+  pd_plot.sh                                     # 独立后处理入口
   benchmark/                                    # generate/replay/collect/summarize
   smoke/                                        # Mooncake Store/DFS smoke
   plot/                                         # 画图
   infra/                                        # patch + 镜像构建
-  replay_*.py / generate_*.py / pd_{prefill,decode}*.sh
+  replay_*.py / generate_*.py
 ```
 
 仓库侧产物：`results/latency-benchmark/<TASK_NAME>/<DATASET>/agents-<N>/rep-<R>/`
 （gitignore）。
+
+当前运行方式：`scripts/pd_alloc.sh P D` 只申请节点并固定长期 server 配置；分别
+SSH 到 P/D 节点启动 `pd_benchmark.sh prefill|decode` 后，在 client 节点按 run
+设置 `DATASET`、`AGENTS`、`REPETITION` 和 `TASK_NAME`。长期 server 和 allocation
+级 L3 KV 可被多个 client run 复用；日志/结果按 `TASK_NAME` 隔离。完整流程见
+[PD 分离运行手册](runbook-pd.md#当前手工启动流程)。

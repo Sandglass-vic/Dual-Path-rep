@@ -92,8 +92,12 @@ def main() -> None:
     scripts = args.code_home / "scripts"
     benchmark_dir = scripts / "benchmark"
     plot_dir = scripts / "plot"
+    sys.path.insert(0, str(plot_dir))
+    from plot_style import metadata_title_suffix
     args.repo_result_dir.mkdir(parents=True, exist_ok=True)
-    summary_dir = args.result_dir / "summary"
+    # Keep all derived summaries and plots on the repository side. The Lustre
+    # result directory is the immutable source of replay output.
+    summary_dir = args.repo_result_dir / "summary"
     summary_dir.mkdir(parents=True, exist_ok=True)
 
     run(
@@ -115,6 +119,7 @@ def main() -> None:
 
     for run_dir in runs:
         metadata = json.loads((run_dir / "run.json").read_text())
+        title_suffix = metadata_title_suffix(metadata)
         dataset = str(
             metadata.get("dataset", f"{int(metadata['max_len_k'])}K")
         )
@@ -147,7 +152,7 @@ def main() -> None:
                 "--log-dir",
                 str(args.log_dir),
                 "--log-glob",
-                f"*{run_id}*",
+                "*.log",
                 "--output-dir",
                 str(fullchain_dir),
             ]
@@ -169,13 +174,14 @@ def main() -> None:
                 "--log-dir",
                 str(args.log_dir),
                 "--log-glob",
-                f"*{run_id}*",
+                "*.log",
                 "--output-dir",
                 str(longest_dir),
                 "--csv-output",
                 str(csv_dir / "longest-trajectory.csv"),
                 "--summary-output",
                 str(data_dir / "longest-trajectory-summary.json"),
+                f"--title-suffix={title_suffix}",
             ]
         )
         run(
@@ -186,6 +192,7 @@ def main() -> None:
                 str(rounds_one),
                 "--output-dir",
                 str(longest_dir),
+                f"--title-suffix={title_suffix}",
             ]
         )
         run(
@@ -202,6 +209,7 @@ def main() -> None:
                 str(csv_dir / "all-trajectories.csv"),
                 "--json-output",
                 str(data_dir / "all-trajectories-summary.json"),
+                f"--title-suffix={title_suffix}",
             ]
         )
 
@@ -213,6 +221,7 @@ def main() -> None:
             str(args.result_dir),
             "--output-dir",
             str(args.repo_result_dir),
+            f"--title-suffix={metadata_title_suffix(json.loads((runs[0] / 'run.json').read_text()))}",
         ]
     )
 

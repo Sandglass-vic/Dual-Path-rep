@@ -83,13 +83,13 @@ scontrol show hostnames "$SLURM_JOB_NODELIST"
 dgx-gaia-12,dgx-gaia-18,dgx-gaia-30,dgx-gaia-35,dgx-gaia-38,dgx-gaia-46,dgx-gaia-53
 ```
 
-正式 benchmark 脚本（`pd_1p1d_benchmark.sbatch` /
-`pd_1p2d_benchmark.sbatch` / `pd_2p2d_benchmark.sbatch`）已写入对应
-`#SBATCH --exclude=...`。临时覆盖提交时也应显式带上同一列表，例如：
+正式 benchmark 不再使用 `sbatch`；排除列表必须在 allocation 时显式传给
+`salloc`。节点数为 P+D+1，最后一个节点运行 Router/replay 客户端。例如 1P2D：
 
 ```bash
-sbatch --exclude=dgx-gaia-12,dgx-gaia-18,dgx-gaia-30,dgx-gaia-35,dgx-gaia-38,dgx-gaia-46,dgx-gaia-53 --time=08:00:00 \
-  scripts/pd_1p2d_benchmark.sbatch
+salloc --partition=GAIA --nodes=4 --ntasks=4 --ntasks-per-node=1 \
+  --cpus-per-task=112 --gres=gpu:8 --exclusive --time=08:00:00 \
+  --exclude=dgx-gaia-12,dgx-gaia-18,dgx-gaia-30,dgx-gaia-35,dgx-gaia-38,dgx-gaia-46,dgx-gaia-53
 ```
 
 自动化 smoke 若在模型加载前遇到同类节点错误：保存日志、取消剩余 server
@@ -252,6 +252,26 @@ nvidia-smi topo -m
 - IB VL/QoS 配置是否需要管理员操作。
 
 ### Lustre 单节点 Direct I/O 实测
+
+#### 当前实测（2026-09-07）
+
+Job `67340` 在 `dgx-gaia-09` 上完成。测试使用 8 个 fio job、每 job 16 GiB，
+4 MiB block、iodepth 16、`O_DIRECT`，目录 stripe count=8、stripe size=16 MiB；
+写入和读取各传输 128 GiB，临时文件在作业结束时删除。
+
+| 阶段 | 实测带宽 | 端口计数器归属 | 使用 NIC 数量 |
+|---|---:|---|---:|
+| 写入 | **23.046 GiB/s (24.75 GB/s)** | `mlx5_7` xmit 128.784 GiB | 1 |
+| 读取 | **22.980 GiB/s (24.68 GB/s)** | `mlx5_1` rcv 128.806 GiB | 1 |
+
+因此本轮观测到的 Lustre 峰值为写入 24.75 GB/s、读取 24.68 GB/s，均接近一条
+200 Gb/s NIC 的理论峰值 25 GB/s；没有观察到两条 storage rail 同时承载有效数据。
+`mlx5_1` 和 `mlx5_7` 是本轮计数器中实际有增量的候选 NIC，但每个阶段只有其中
+一条有实质流量。两条 200 Gb/s NIC 合计理论峰值为 50 GB/s（46.57 GiB/s），
+本轮没有达到双 rail 峰值。
+
+原始作业日志：`lustre-io-bandwidth-67340.out`；Slurm 节点记录为
+`dgx-gaia-09`。
 
 2026-09-05 在 `dgx-gaia-14` 使用
 `scripts/smoke/lustre_io_bandwidth.sbatch` 测试。每轮总数据量 128 GiB，

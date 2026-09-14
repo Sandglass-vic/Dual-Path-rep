@@ -158,11 +158,21 @@ assert host_pool.size > device_pool.size
 
 ### 测试 KV 数据清理
 
-所有 smoke/replay 使用包含 `$SLURM_JOB_ID` 的独立 `CACHE_DIR`。脚本创建专用
-marker，并在 `EXIT`、`INT`、`TERM` trap 中先停止服务，再检查 marker 和删除
-整个本 Job KV 目录。成功、验收失败或作业取消都会释放 `.bin` 空间；日志、
-response、metrics 和 replay JSON 保留。不得清理模型目录、数据集或没有本 Job
-marker 的用户自定义目录。
+历史 smoke/replay 脚本曾为每个 Job 创建独立 `CACHE_DIR`，并在退出 trap 中删除
+整个 Job KV 目录。当前正式手工流程不同：Prefill/Decode 是长期 server，使用
+`test/<allocation-id>/pd-servers/kv-cache/file/`，client 只负责一次 replay，不会在
+结束时删除共享 HiCache。
+
+需要 cold start 时，必须先停止 Prefill/Decode、释放 allocation，再执行：
+
+```bash
+rm -rf /mnt/lustre/users/sezhou/dual-path/test/<allocation-id>/pd-servers/kv-cache
+```
+
+`pd_alloc.sh` 会打印带实际 Job ID 的清理命令。不要在 server 仍运行或 Decode
+backup 尚未完成时删除 `file/`；否则可能与 HiCache metadata 和异步 Lustre 写入
+竞争。日志、response、metrics 和 replay JSON 与 KV 目录分开保存，可按 task/job
+单独清理。
 
 ### L3 backend 启动与配置
 
@@ -241,7 +251,7 @@ Slurm Job：64882，COMPLETED，ExitCode=0:0，耗时 3m29s
 page size：64
 write policy：write_through
 prefetch policy：wait_complete
-脚本：scripts/pd_1p2d_benchmark.sbatch（原 hicache/l3 smoke 已并入）
+当前复现入口：scripts/pd_benchmark.sh（原 hicache/l3 smoke 已移除）
 ```
 
 验证流程不是在同一进程内重复请求，而是：
@@ -287,7 +297,7 @@ Decode：dgx-gaia-10，8 × H100，TP=8
 PD transfer：Mooncake Transfer Engine / mlx5_0
 L3 backend：HiCache file / Lustre
 L3 目录：/mnt/lustre/users/sezhou/dual-path/kv-cache/pd-1p1d-file/64889/
-脚本：scripts/pd_1p1d_benchmark.sbatch（原 pd_1p1d_lustre_l3.sbatch 已并入）
+当前复现入口：scripts/pd_benchmark.sh（原 pd_1p1d_lustre_l3.sbatch 已移除）
 ```
 
 第一轮由 Prefill 计算 prompt KV 并通过 Mooncake RDMA 发给 Decode。Decode
@@ -334,7 +344,7 @@ Decode-0：dgx-gaia-52，8 × H100，TP=8
 Decode-1：dgx-gaia-53，8 × H100，TP=8
 Router policy：Prefill/Decode round_robin
 L3：HiCache file backend / 共享 Lustre
-脚本：scripts/pd_1p2d_benchmark.sbatch（原 pd_1p2d_lustre_l3.sbatch 已并入）
+当前复现入口：scripts/pd_benchmark.sh（原 pd_1p2d_lustre_l3.sbatch 已移除）
 ```
 
 populate 阶段向 1P2D 集群发送两个独立前缀并重复四轮，Decode offload 在共享
@@ -376,7 +386,7 @@ populate：16/16 turns，0 errors，wall 5.795s
 recover：16/16 turns，0 errors，wall 5.632s
 L3：816 个 .bin，1,711,276,032 bytes
 recover cached tokens：min 320，max 1,600
-脚本：scripts/pd_1p2d_benchmark.sbatch（原 pd_1p2d_l3_replay.sbatch 已并入）
+当前复现入口：scripts/pd_benchmark.sh（原 pd_1p2d_l3_replay.sbatch 已移除）
 ```
 
 恢复阶段全部 16 个请求的 `cached_tokens > 0`，且 generation token 数全部与
@@ -385,8 +395,8 @@ trajectory 目标一致。Decode-0 和 Decode-1 在 populate/recover 阶段各�
 请求覆盖两个 Decode，并且共享 L3 数据在全服务重启后可由 Prefill 恢复。
 
 该测试用于正确性，不是吞吐 benchmark：populate 与 recover 之间等待文件数
-稳定，且只执行每条 trajectory 的前 4 轮。退出时已自动删除
-`kv-cache/pd-1p2d-replay/64984/`。
+稳定，且只执行每条 trajectory 的前 4 轮。旧脚本退出时曾自动删除
+`kv-cache/pd-1p2d-replay/64984/`；当前手工流程不自动删除 KV。
 
 ### 历史诊断：1P1D + file L3 完整 32K trajectory
 
@@ -403,7 +413,7 @@ Slurm Job：64914
 总 wall time：1,740.5s
 L3 文件：3,088 个 .bin
 L3 字节：6,476,005,376 bytes
-脚本：scripts/pd_1p1d_benchmark.sbatch（原 pd_1p1d_l3_full_replay.sbatch 已并入）
+当前复现入口：scripts/pd_benchmark.sh（原 pd_1p1d_l3_full_replay.sbatch 已移除）
 结果：logs/pd-1p1d-l3-replay/64914/results/
 ```
 
@@ -422,7 +432,7 @@ wrapper 断言失败解释为推理或 L3 数据流失败。
 
 这个测试不是性能 benchmark：每轮主动 flush，并等待异步落盘增长，会人为增加
 wall time。该方案已经从 `scripts/benchmark/replay_fake_agent_traces.py` 和正式
-sbatch 中删除；
+旧 sbatch 中删除；
 Job `64914/65502` 仅保留为历史命中归因证据。
 
 ## Phase 6：DualPath 近似实现
