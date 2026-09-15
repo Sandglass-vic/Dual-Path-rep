@@ -362,12 +362,24 @@ def plot(
     title: str,
     output: Path,
     y_limit: float | None = None,
+    canvas_size: tuple[int, int] = (1120, 410),
+    legend_columns_override: int | None = None,
+    legend_row_gap: float = 16.0,
+    legend_x_start: float = 90.0,
+    legend_y_start: float = 38.0,
+    legend_column_gap: float | None = None,
+    reserve_legend_space: bool = True,
 ) -> None:
-    width, height = 1120, 410
-    legend_columns = min(4, len(series))
+    width, height = canvas_size
+    legend_columns = legend_columns_override or min(4, len(series))
     legend_rows = (len(series) + legend_columns - 1) // legend_columns
-    left, right = 70.0, 1080.0
-    top, bottom = 52.0 + max(0, legend_rows - 1) * 15, 345.0
+    left, right = 70.0, width - 40.0
+    top = (
+        52.0 + max(0, legend_rows - 1) * legend_row_gap
+        if reserve_legend_space
+        else 52.0
+    )
+    bottom = height - 65.0
     turns = [int(row["turn_id"]) for row in rows]
     values = [
         float(row[field])
@@ -397,7 +409,7 @@ def plot(
         elements.append(svg_text(left - 8, y + 4, f"{value:.2f}", 10, "end"))
     for tick in range(0, len(turns), max(1, len(turns) // 10)):
         turn = turns[tick]
-        elements.append(svg_text(x_pos(turn), 363, str(turn), 9))
+        elements.append(svg_text(x_pos(turn), bottom + 18, str(turn), 9))
     for index, (field, label, color) in enumerate(series):
         points = " ".join(
             f"{x_pos(int(row['turn_id'])):.1f},{y_pos(float(row[field])):.1f}"
@@ -410,8 +422,11 @@ def plot(
         )
         legend_column = index % legend_columns
         legend_row = index // legend_columns
-        legend_x = 90 + legend_column * 255
-        legend_y = 38 + legend_row * 16
+        column_gap = legend_column_gap or (
+            (width - 180) / max(1, legend_columns - 1)
+        )
+        legend_x = legend_x_start + legend_column * column_gap
+        legend_y = legend_y_start + legend_row * legend_row_gap
         elements.append(
             f'<line x1="{legend_x}" y1="{legend_y}" '
             f'x2="{legend_x + 24}" y2="{legend_y}" '
@@ -420,10 +435,10 @@ def plot(
         elements.append(
             svg_text(legend_x + 31, legend_y + 4, label, 11, "start")
         )
-    elements.append(svg_text(width / 2, 390, "Turn", 11))
+    elements.append(svg_text(width / 2, height - 20, "Turn", 11))
     elements.append(
-        f'<text x="15" y="195" font-family="sans-serif" font-size="11" '
-        f'text-anchor="middle" transform="rotate(-90 15 195)">'
+        f'<text x="15" y="{height / 2:.1f}" font-family="sans-serif" font-size="11" '
+        f'text-anchor="middle" transform="rotate(-90 15 {height / 2:.1f})">'
         f"{html.escape(ylabel)}</text>"
     )
     output.write_text(
@@ -501,6 +516,11 @@ def main() -> None:
         "KV-cache Hit Rate by Turn",
         args.output_dir / "cache-hit.svg",
         y_limit=1.0,
+        canvas_size=(600, 600),
+        legend_x_start=60.0,
+        legend_y_start=72.0,
+        legend_column_gap=270.0,
+        reserve_legend_space=False,
     )
     plot(
         rows,
@@ -528,6 +548,12 @@ def main() -> None:
         "Volume [GB]",
         "KV Cache Monitor",
         args.output_dir / "kv-cache-monitor.svg",
+        canvas_size=(400, 600),
+        legend_columns_override=1,
+        legend_row_gap=14.0,
+        legend_x_start=80.0,
+        legend_y_start=78.0,
+        reserve_legend_space=False,
     )
 
     def scoped_totals(

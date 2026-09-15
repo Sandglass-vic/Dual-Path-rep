@@ -212,7 +212,7 @@ for name in "${optional_vars[@]}"; do
 done
 
 command=(
-  salloc --partition="$PARTITION" --nodes="$nodes" --ntasks="$nodes"
+  salloc -w dgx-gaia-21,dgx-gaia-22,dgx-gaia-23 --partition="$PARTITION" --nodes="$nodes" --ntasks="$nodes"
   --ntasks-per-node=1 --cpus-per-task="$ENGINE_CPUS" --gres=gpu:8
   --exclusive --time="$TIME_LIMIT" --job-name="dualpath-$ALLOC_NAME"
 )
