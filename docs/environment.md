@@ -2,7 +2,36 @@
 
 > 返回 [文档索引](README.md)
 
-## 目录划分
+## pza100 当前目录
+
+```text
+/data/home/yongxiao/dual-path/       Git 根目录
+├── docs/
+├── scripts/
+└── results/                         仓库侧图表/汇总（gitignore）
+
+/data/home/yongxiao/mydata/          g5 本地、g6 经 IPoIB NFS 共享
+├── images/
+├── models/
+├── test/<allocation-id>/
+├── traces/
+└── test/dataset/
+```
+
+```bash
+export CODE_HOME=/data/home/yongxiao/dual-path
+export RUNTIME_HOME=/data/home/yongxiao/mydata
+export IMAGE_DIR=$RUNTIME_HOME/images
+export MODEL_DIR=$RUNTIME_HOME/models/Qwen2.5-32B
+export DATASET_DIR=$RUNTIME_HOME/test/dataset
+export TRACE_DIR=$RUNTIME_HOME/traces
+export REPO_RESULT_DIR=$CODE_HOME/results
+```
+
+g5 是 NFS 源和登录/计算节点；g6 的共享目录依赖 g5 与 `ibs3`。不要把 GAIA
+Lustre 的带宽、stripe 或失效隔离假设套用到该 NFS 路径。
+
+## GAIA 历史目录划分
 
 项目分为“随时可见的 Git 代码仓库”和“仅计算节点可见的运行数据目录”：
 
@@ -64,7 +93,7 @@ Prefill/Decode 日志位于 `test/<allocation-id>/pd-servers/`，不会复制到
 
 所有代码和小型配置必须放在 `/labhome/sezhou/dual-path` 的子目录并由 Git 管理，确保登录节点随时可读。镜像、模型权重、SWE-bench checkout/sandbox、KV-cache、大型 trace 和原始结果放在 Lustre，不提交 Git。登录节点不能依赖 `/mnt/lustre` 或 `/labhome/sezhou/lustre` 可见；访问和生成运行数据时必须进入计算节点。
 
-## 推荐环境变量
+## GAIA 历史环境变量
 
 ```bash
 export CODE_HOME=/labhome/sezhou/dual-path

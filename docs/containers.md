@@ -2,6 +2,32 @@
 
 > 返回 [文档索引](README.md)
 
+## pza100 当前镜像
+
+g5/g6 使用 Enroot 4.2.0 + Pyxis。镜像统一位于
+`/data/home/yongxiao/mydata/images`：
+
+```text
+sglang:26.01-py3.sqsh
+  SHA-256: 4c5b0508cd3142148f7f6ab000cf29bc1ee957ee862013561f05185c2aae4486
+
+sglang:26.01-py3-mooncake0.3.13.post1.sqsh
+  SHA-256: d10e4933d6ce7b7c6adf6022dc64907dcb46f6e7f93a433edc8e83c0c6e62acc
+
+sglang:26.01-py3-mooncake0.3.13.post1-dualpath-patched.sqsh
+  SHA-256: 5033cf94cc036a18da35f53f0f24c050eec0c0310fb7cf9a6415b69ec8f763d5
+```
+
+两个派生镜像通过 `srun`、`--container-writable` 和 `--container-save` 分阶段
+构建；pip 安装与 patch 均发生在容器内。Mooncake 版本为
+`mooncake-transfer-engine-cuda13==0.3.13.post1`，Router 为
+`sglang-router==0.3.1`。patched 镜像已通过构建期 import、compile 和 marker
+检查，但尚未完成 pza100 TP4 双节点 GPU smoke。
+
+## GAIA 历史镜像与验证
+
+以下路径、SHA、Job ID、H100 和 Lustre 结论均来自迁移前 GAIA 环境。
+
 计算节点已实测 Enroot 3.2.0，Pyxis 已集成到 `srun`。正式作业使用 Lustre 上 `.sqsh` 的绝对路径，显式挂载代码和运行目录，默认不启用 writable root，也不自动挂载 home。
 
 当前镜像已经导入：
