@@ -4,9 +4,25 @@
 
 dualpath_export_common_env() {
   export ENABLE_BENCHMARK_TIMING=1
+  export DUALPATH_TTFT_TIMING=${DUALPATH_TTFT_TIMING:-1}
+  export DUALPATH_TTFT_TIMING_DETAIL=${DUALPATH_TTFT_TIMING_DETAIL:-0}
+  if [[ "$DUALPATH_TTFT_TIMING" != 0 && "$DUALPATH_TTFT_TIMING" != 1 ]]; then
+    echo "DUALPATH_TTFT_TIMING must be 0 or 1" >&2
+    return 2
+  fi
+  if [[ "$DUALPATH_TTFT_TIMING_DETAIL" != 0 && \
+        "$DUALPATH_TTFT_TIMING_DETAIL" != 1 ]]; then
+    echo "DUALPATH_TTFT_TIMING_DETAIL must be 0 or 1" >&2
+    return 2
+  fi
   export HICACHE_STORAGE_BACKEND=file
+  export DUAL_PATH_O_DIRECT_READ=${DUAL_PATH_O_DIRECT_READ:-0}
+  if [[ "$DUAL_PATH_O_DIRECT_READ" != 0 && "$DUAL_PATH_O_DIRECT_READ" != 1 ]]; then
+    echo "DUAL_PATH_O_DIRECT_READ must be 0 or 1" >&2
+    return 2
+  fi
   export MEM_FRACTION_STATIC=${MEM_FRACTION_STATIC:-0.55}
-  export HICACHE_RATIO=${HICACHE_RATIO:-1.2}
+  export HICACHE_RATIO=${HICACHE_RATIO:-1.35}
   export PREFILL_HICACHE_MEM_LAYOUT=${PREFILL_HICACHE_MEM_LAYOUT:-layer_first}
   export DECODE_HICACHE_RATIO=${DECODE_HICACHE_RATIO:-1.05}
   export CONTEXT_LENGTH=${CONTEXT_LENGTH:-65536}
@@ -42,6 +58,14 @@ dualpath_export_common_env() {
   export DUALPATH_DECODE_L3_SYNC_RANKS=${DUALPATH_DECODE_L3_SYNC_RANKS:-8}
   export DUALPATH_DECODE_L3_SYNC_TIMEOUT=${DUALPATH_DECODE_L3_SYNC_TIMEOUT:-600}
   export DUALPATH_L3_READ_PATH=${DUALPATH_L3_READ_PATH:-prefill}
+  # Give every request/turn its own local radix namespace. Lustre page hashes
+  # remain token-based, so cross-turn reuse is forced through Lustre instead.
+  export DUALPATH_NO_CROSS_TURN_KV_REUSE=${DUALPATH_NO_CROSS_TURN_KV_REUSE:-1}
+  if [[ "$DUALPATH_NO_CROSS_TURN_KV_REUSE" != 0 && \
+        "$DUALPATH_NO_CROSS_TURN_KV_REUSE" != 1 ]]; then
+    echo "DUALPATH_NO_CROSS_TURN_KV_REUSE must be 0 or 1" >&2
+    return 2
+  fi
   if [[ "$DUALPATH_L3_READ_PATH" != prefill && "$DUALPATH_L3_READ_PATH" != decode ]]; then
     echo "DUALPATH_L3_READ_PATH must be prefill or decode" >&2
     return 2
@@ -58,6 +82,9 @@ dualpath_export_common_env() {
   export FLUSH_LOCAL_CACHE_BETWEEN_TURNS STORAGE_SETTLE_SECONDS
   export DUALPATH_DECODE_L3_SYNC_RANKS DUALPATH_DECODE_L3_SYNC_TIMEOUT
   export DUALPATH_L3_READ_PATH
+  export DUALPATH_NO_CROSS_TURN_KV_REUSE
+  export DUAL_PATH_O_DIRECT_READ
+  export DUALPATH_TTFT_TIMING DUALPATH_TTFT_TIMING_DETAIL
   export MOONCAKE_DEVICE
 }
 
@@ -230,6 +257,13 @@ Path(sys.argv[1]).write_text(json.dumps({
         os.environ.get("DUALPATH_DECODE_L3_SYNC_TIMEOUT", "600")
     ),
     "l3_read_path": os.environ.get("DUALPATH_L3_READ_PATH", "prefill"),
+    "ttft_timing_v3": bool(int(os.environ.get("DUALPATH_TTFT_TIMING", "1"))),
+    "ttft_timing_detail": bool(
+        int(os.environ.get("DUALPATH_TTFT_TIMING_DETAIL", "0"))
+    ),
+    "dual_path_o_direct_read": bool(
+        int(os.environ.get("DUAL_PATH_O_DIRECT_READ", "0"))
+    ),
     "kv_buffer_semantics": (
         "DualPath paper: staging/GPU buffers released after each request; "
         "cross-turn reuse via L3 only. SGLang approximation: after successful "

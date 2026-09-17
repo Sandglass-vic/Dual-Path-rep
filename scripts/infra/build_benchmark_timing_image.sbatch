@@ -4,8 +4,8 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --time=00:30:00
-#SBATCH --exclude=dgx-gaia-12,dgx-gaia-18,dgx-gaia-30,dgx-gaia-35,dgx-gaia-38,dgx-gaia-46,dgx-gaia-53
-#SBATCH --output=/mnt/lustre/users/sezhou/dual-path/logs/timing-image-%j.out
+#SBATCH --exclude=dgx-gaia-10,dgx-gaia-12,dgx-gaia-18,dgx-gaia-30,dgx-gaia-35,dgx-gaia-38,dgx-gaia-46,dgx-gaia-53
+#SBATCH --output=/labhome/sezhou/dual-path/timing-image-%j.out
 
 set -euo pipefail
 
@@ -44,8 +44,11 @@ enroot start --root --rw \
 
 enroot start "$CONTAINER_NAME" python - <<'PY'
 from importlib.metadata import version
+import os
 from pathlib import Path
+from types import SimpleNamespace
 from mooncake.engine import TransferEngine
+from sglang.srt.mem_cache.hicache_storage import HiCacheFile
 
 root = Path("/usr/local/lib/python3.12/dist-packages/sglang/srt")
 hiradix = (root / "mem_cache/hiradix_cache.py").read_text()
@@ -60,6 +63,8 @@ decode = (root / "disaggregation/decode.py").read_text()
 decode_offload = (
     root / "disaggregation/decode_kvcache_offload_manager.py"
 ).read_text()
+hicache_storage = (root / "mem_cache/hicache_storage.py").read_text()
+cache_controller = (root / "managers/cache_controller.py").read_text()
 mooncake_conn = (root / "disaggregation/mooncake/conn.py").read_text()
 memory_pool_host = (root / "mem_cache/memory_pool_host.py").read_text()
 allocator = (root / "mem_cache/allocator.py").read_text()
@@ -67,22 +72,20 @@ output_processor = (
     root / "managers/scheduler_output_processor_mixin.py"
 ).read_text()
 http_server = (root / "entrypoints/http_server.py").read_text()
+ttft_v3 = (root / "utils/dualpath_ttft.py").read_text()
 assert version("mooncake-transfer-engine-cuda13") == "0.3.13.post1"
 assert "DUALPATH_L3_TIMING" in hiradix
 assert "prefill_engine=%s" in hiradix
 assert "DUALPATH_HICACHE_READ_ONLY" in hiradix
 assert "DUALPATH_HICACHE_EVICT_UNLOCKED" in hiradix
 assert "DUALPATH_PREFILL_DEFERRED_CACHE_RELEASE" in hiradix
-local_l3_end = hiradix.index(
-    "self.dualpath_prefetch_local_end[operation.request_id]"
-)
-assert local_l3_end < hiradix.index(
-    "torch.distributed.all_reduce(", local_l3_end
-)
+assert "self.dualpath_prefetch_local_end[operation.request_id]" in hiradix
+assert "shared_prefetch_can_terminate" in hiradix
+assert "shared_prefetch_finish" in hiradix
 assert "DUALPATH_REQ_TIMING" in schedule_batch
-assert "dualpath_prepare_input_tensors_end" in schedule_batch
-assert "DUALPATH_PREFILL_PREP_BREAKDOWN" in scheduler
-assert "hicache_consumer=%d" in scheduler
+assert "DETAIL as DUALPATH_TTFT_DETAIL" in schedule_batch
+assert '"DUALPATH_NO_CROSS_TURN_KV_REUSE", "1"' in schedule_batch
+assert 'self.extra_key = f"dualpath:{self.rid}:{extra_key or \'\'}"' in schedule_batch
 assert '"DUALPATH_TTFT_P_TRANSFER_V2 rid=%s ' in prefill
 assert "DUALPATH_PREFILL_CACHE_RELEASE" in prefill
 assert "DUALPATH_PREFILL_DECODE_L3_PREFIX" in prefill
@@ -99,13 +102,48 @@ assert "ongoing_write_through" not in prefill[
 assert "dualpath_transfer_page_count" in prefill
 assert "page_aligned_tokens=%d" in prefill
 assert "DUALPATH_TTFT_D_RECEIVE" in decode
-assert "DUALPATH_DECODE_HANDOFF_BREAKDOWN" in decode
-assert "DUALPATH_DECODE_PREALLOC_INNER" in decode
-assert "DUALPATH_DECODE_ALLOCATOR_MERGE" in decode
 assert "DUALPATH_DECODE_PD_HOST_STAGING" in decode
 assert "DUALPATH_DECODE_STAGING_BACKPRESSURE" in decode
 assert '"bounded_dedicated_pool"' in decode
+assert "DUALPATH_DECODE_SCHEDULER_PREFETCH" in decode
+assert "_dualpath_progress_l3_prefetch" in decode
+assert "drain_decode_l3_prefetch_cancellations" in decode
+assert "dualpath_l3_prefetch_operation" in decode
+assert '"dualpath_scheduler_prefetch_supported"' in decode
+assert 'hasattr(self.kv_manager, "start_decode_l3_prefetch"):\n            decode_req.kv_receiver.init' not in decode
+assert "kv_args.dualpath_decode_tp_group = self.gloo_group" in decode
+assert "kv_args.dualpath_decode_tp_group = self.attn_tp_cpu_group" not in decode
 assert "DUALPATH_DECODE_OFFLOAD_START" in decode_offload
+assert "DUAL_PATH_O_DIRECT_READ" in hicache_storage
+assert "dual_path_o_direct_read" in hicache_storage
+assert "__import__(\"os\").O_DIRECT" in hicache_storage
+assert "DUALPATH_O_DIRECT_REUSABLE_PAGE" in cache_controller
+assert "DUALPATH_SHARED_PREFETCH_PROGRESS" in cache_controller
+assert "shared_prefetch_cancel" in cache_controller
+assert "retain_host_indices" in cache_controller
+assert "DUALPATH_DECODE_L3_READ" in cache_controller
+assert "_dualpath_o_direct_page_buffer" in cache_controller
+direct_reuse = cache_controller.index("DUALPATH_O_DIRECT_REUSABLE_PAGE")
+direct_get = cache_controller.index(
+    "self.storage_backend.get(hash_value, data_page)", direct_reuse
+)
+direct_scatter = cache_controller.index(
+    "self.mem_pool_host.set_from_flat_data_page(", direct_get
+)
+direct_increment = cache_controller.index(
+    "operation.increment(self.page_size)", direct_scatter
+)
+assert direct_get < direct_scatter < direct_increment
+os.environ["SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR"] = "/tmp/dualpath-odirect-config-check"
+file_backend = HiCacheFile(SimpleNamespace(
+    tp_rank=0,
+    tp_size=8,
+    model_name="dualpath-config-check",
+    is_mla_model=False,
+    extra_config='{"dual_path_o_direct_read":true,"dual_path_o_direct_alignment":4096}',
+))
+assert file_backend.dualpath_o_direct_read is True
+assert file_backend.dualpath_o_direct_alignment == 4096
 assert "DUALPATH_DECODE_OFFLOAD_BACKUP_COMPLETE" in decode_offload
 assert "DUALPATH_DECODE_L3_SYNC_COMPLETE" in decode_offload
 assert "DUALPATH_DECODE_L3_SYNC_DIR" in decode_offload
@@ -114,16 +152,21 @@ assert decode_offload.index('getattr(storage_backend, "file_path", None)') < (
 )
 assert "cached_tokens // self.page_size" in decode_offload
 assert "DUALPATH_BOUNDED_DECODE_HOST_STAGING" in memory_pool_host
-assert "DUALPATH_ALLOC_EXTEND_DETAIL" in allocator
-assert "import time" in allocator
-assert "import logging" in allocator
-assert "logger = logging.getLogger(__name__)" in allocator
 assert "SGLANG_MOONCAKE_MAX_TRANSFER_BATCH_INDICES" in mooncake_conn
 assert "prefill_data_indices.size <= max_batch_indices" in mooncake_conn
 assert "DUALPATH_DECODE_HOST_STAGING_COPY" in mooncake_conn
-assert "DUALPATH_DECODE_L3_READ" in mooncake_conn
 assert "DUALPATH_DECODE_L3_REVERSE" in mooncake_conn
-assert "dualpath_host_alloc_start" in mooncake_conn
+assert "start_decode_l3_prefetch" in mooncake_conn
+assert "shared_prefetch_can_terminate" in mooncake_conn
+assert "shared_prefetch_finish" in mooncake_conn
+assert "retain_host_indices=True" in mooncake_conn
+assert "decode_l3_cancelled_prefetch" in mooncake_conn
+receiver_source = mooncake_conn[mooncake_conn.index("class MooncakeKVReceiver"):]
+assert "decode_l3_prefetch_operation" not in receiver_source
+assert "self.dualpath_scheduler_prefetch_supported = True" in receiver_source
+assert "Decode scheduler did not provide Host staging" in receiver_source
+assert "load_decode_l3_prefix" not in mooncake_conn
+assert "dualpath_host_alloc_start" in decode
 assert "DUALPATH_D2P_REVERSE" in prefill
 assert "decode_l3_hit_tokens" in mooncake_conn
 assert "DUALPATH_DECODE_L3_READ_PATH" in scheduler
@@ -134,8 +177,28 @@ assert mooncake_conn.index(
     "stage_received_kv_to_device"
 ) < mooncake_conn.index("self.conclude_state = status")
 assert "DUALPATH_TTFT_D_DISPATCH" in output_processor
-assert "DUALPATH_TTFT_HTTP_YIELD" in http_server
+assert "SCHEMA_VERSION = 3" in ttft_v3
+assert "DUALPATH_TTFT_V3_CACHE_CONTROLLER" in cache_controller
+assert "dualpath_before_read_start_ns" in cache_controller
+assert "dualpath_lustre_read_ns" in cache_controller
+assert "dualpath_scatter_ns" in cache_controller
+assert "DUALPATH_TTFT_V3_HIRADIX" in hiradix
+assert "dualpath_completed_prefetch_timing" in hiradix
+assert "DUALPATH_TTFT_V3_SCHEDULER" in scheduler
+assert "dualpath_compute_start_event" in scheduler
+assert "DUALPATH_TTFT_V3_PREFILL" in prefill
+assert "dualpath_ttft_emit" in prefill
+assert "DUALPATH_TTFT_V3_DECODE" in decode
+assert "dualpath_preallocation_ns" in decode
+assert "DUALPATH_TTFT_V3_MOONCAKE" in mooncake_conn
+assert "dualpath_d2p_ns" in mooncake_conn
+assert "DUALPATH_TTFT_V3_DISPATCH" in output_processor
+assert "side=\"decode\"" in output_processor
+assert "if DUALPATH_TTFT_DETAIL:" in cache_controller
+assert "if DUALPATH_TTFT_DETAIL:" in schedule_batch
 compile(hiradix, str(root / "mem_cache/hiradix_cache.py"), "exec")
+compile(hicache_storage, str(root / "mem_cache/hicache_storage.py"), "exec")
+compile(cache_controller, str(root / "managers/cache_controller.py"), "exec")
 compile(schedule_batch, str(root / "managers/schedule_batch.py"), "exec")
 compile(scheduler, str(root / "managers/scheduler.py"), "exec")
 compile(schedule_policy, str(root / "managers/schedule_policy.py"), "exec")
@@ -168,6 +231,7 @@ compile(
     "exec",
 )
 compile(http_server, str(root / "entrypoints/http_server.py"), "exec")
+compile(ttft_v3, str(root / "utils/dualpath_ttft.py"), "exec")
 print("MOONCAKE_VERSION=0.3.13.post1")
 print("SGLANG_BENCHMARK_TIMING_PATCH_OK")
 PY

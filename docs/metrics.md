@@ -3,6 +3,10 @@
 > 返回 [文档索引](README.md)。本文是本项目所有 metric 定义的唯一来源。
 > workload 和运行方法见 [Benchmark 规范](benchmark.md)，具体 Job 数值见各结果页。
 
+> **正式 TTFT breakdown 口径为 [Timing V3](ttft-timing-v3.md)。**
+> `DUALPATH_TTFT_V3` JSON 是新结果的唯一阶段数据源；下文旧 marker 定义只用于
+> 历史结果 fallback，不得与 V3 分桶混合。
+
 ## 1. 口径分层
 
 阅读结果时先区分以下三类：
@@ -228,6 +232,15 @@ rounds、CSV、summary 和图均不再包含 snapshot/allocated-block 字段。
 
 ## 4. 服务端 timing marker
 
+### Timing V3 正式 marker
+
+`DUALPATH_TTFT_TIMING=1` 时，每个 request、每个 Prefill/Decode TP rank 各输出
+一条 `DUALPATH_TTFT_V3 {json}`。默认 `DUALPATH_TTFT_TIMING_DETAIL=0`，不会输出
+下面的逐阶段 legacy marker。V3 字段、路径时间线、raw/critical/overlap 语义和
+TP=8 聚合规则见 [TTFT Timing V3](ttft-timing-v3.md)。
+
+以下 marker 均为 legacy/detail 口径。
+
 timing 镜像由 `scripts/infra/patch_sglang_benchmark_timing.py` 注入以下
 request-scoped 日志，以 request ID 与客户端 `rounds.jsonl` 关联。
 
@@ -241,11 +254,18 @@ request-scoped 日志，以 request ID 与客户端 `rounds.jsonl` 关联。
   - 字段：Prefill engine、node、TP rank、read start/end/duration、tokens。
   - `read_end` 在该 rank 首次观察到本地 storage IO 完成时、TP 完成共识
     `all_reduce` 之前记录，因此每个 rank 的 duration 不包含等待慢 rank 的时间。
-  - 用途：L3 read latency、L3 timing coverage、有效加载带宽。
+  - 用途：Prefill storage prefetch 的端到端总窗口，包括 worker 排队和
+    scheduler 观察完成延迟；不再作为 Lustre 读取带宽分母。
+- `DUALPATH_PREFILL_KV_READ_BREAKDOWN`
+  - 来源：Prefill cache-controller storage worker。
+  - `lustre_read_s` 只累计 `storage_backend.get()` / `batch_get()`；
+    `scatter_s` 只累计 `set_from_flat_data_page()` 写入 HiCache Host pool。
+  - 同一 request/rank 可能有多个 storage batch，汇总时按 rank 求和。
 - `DUALPATH_DECODE_L3_READ`
   - 来源：被 Router 选中的 Decode engine，在反向传输前将 file-backend page
     直接读入独立 PD Host staging。
-  - 字段：Decode engine、node、TP rank、read start/end/duration、tokens。
+  - 字段：Decode engine、node、TP rank、read start/end/duration、
+    `lustre_read_s`、`scatter_s`、tokens。
   - 用途：Decode 侧 L3 数据量、时间和有效带宽；每个 request 必须只有一个
     Decode engine，并有 8/8 TP rank timing。
 - `DUALPATH_D2P_REVERSE`
@@ -306,10 +326,10 @@ coverage 严格为零。启用 L3 时不设置 coverage 下限。
 ### TP=8 L3 聚合
 
 同一 request 必须取得一个 Prefill 或 Decode engine 的 8 个 TP rank timing。请求的
-`read_seconds` 使用 `max(rank read duration)`，即最慢 rank 的本地 L3 IO
-耗时；另保留
+`read_seconds` 使用 TP union 总窗口；另保留
 `tp_union_read_seconds = max(read_end) - min(read_start)` 作为 rank 启动偏斜
-诊断，但它不作为有效带宽分母。不能只使用 rank 0。
+诊断。纯 Lustre 带宽使用总窗口最慢 TP rank 对应的 `lustre_read_s`，scatter
+单独报告；不能只使用 rank 0。
 
 逻辑读量使用 8 个 TP rank 报告的最小 `tokens`，避免把 TP=8 的同一份 KV
 重复计算。汇总器同时保留 `node/engine` 归属，在
@@ -350,16 +370,32 @@ HCA；该值仍是应用层逻辑有效带宽，不能用 `8 × 400 Gb/s` 直接
 ```text
 prefill_l3_effective_bandwidth_gbps
   = l3_logical_tokens × 262144
-    / (max(tp_rank_read_end) - min(tp_rank_read_start)) / 1e9
+    / slowest_tp_rank_lustre_read_s / 1e9
 ```
 
-这里分子是一个 Prefill engine 的 TP=8 合计逻辑 payload，分母是该 request
-最慢 rank 的本地 L3 IO duration，所以结果是**单 Prefill engine 的 TP 聚合
+这里分子是一个 Prefill engine 的 TP=8 合计逻辑 payload，分母是总 Prefetch
+窗口最慢 rank 在 `storage_backend.get()` 中累计的时间，所以结果是**单 Prefill engine 的 TP 聚合
 有效带宽**，不是每 rank 平均，也不是跨 engine 平均。该逻辑有效带宽不能直接
 解释为 Lustre NIC wire bandwidth。带宽统一使用十进制 GB/s；KV 容量使用
 二进制 GiB。
 
 ## 6. TTFT breakdown
+
+### 正式 V3 口径
+
+Prefill path 的堆叠顺序为：Prefill before Lustre Read、Prefill KV Read
+(Lustre)、Prefill Scatter、Prefill Host→GPU、Prefill Computation、P→D、
+Decode Host→GPU、Decode dispatch、Misc。
+
+Decode path 的堆叠顺序为：Decode pre-allocation、Decode before Lustre Read、
+Decode KV Read (Lustre)、Decode Scatter、D→P、Prefill Computation、P→D、
+Decode Host→GPU、Decode dispatch、Misc。
+
+V3 不跨节点相减绝对时间戳。`misc_seconds = client TTFT - sum(critical stages)`；
+闭合容差为 `max(2ms, 0.5% TTFT)`，超限写入 error flag。三个 TTFT 绘图入口
+共同读取 `scripts/plot/ttft_components.py` 的 path-aware registry。
+
+### Legacy full-chain（仅历史结果 fallback）
 
 项目存在两套 breakdown，必须明确标注，不能混用。
 

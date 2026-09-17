@@ -8,27 +8,8 @@ import html
 import json
 from pathlib import Path
 
-from plot_style import COLORS, add_title_suffix
-
-
-COMPONENTS = (
-    (
-        "prefill_l3_kv_read_seconds",
-        "Prefill KV Read (Lustre) + Radix tree",
-        COLORS["orange"],
-    ),
-    ("decode_l3_kv_read_seconds", "Decode KV Read (Lustre)", COLORS["purple"]),
-    ("decode_prealloc_seconds", "Decode pre-allocation", COLORS["yellow"]),
-    ("decode_to_prefill_kv_transfer_seconds", "D->P transfer", COLORS["pink"]),
-    ("prefill_host_to_device_seconds", "Prefill HiCache Host->GPU", COLORS["blue"]),
-    ("prefill_logits_sampling_seconds", "Prefill + Sampling", COLORS["green"]),
-    ("pd_transfer_seconds", "P->D transfer", COLORS["red"]),
-    ("decode_host_to_device_seconds", "Decode Host->GPU", COLORS["cyan"]),
-    ("decode_dispatch_seconds", "Decode dispatch", COLORS["brown"]),
-    ("misc_seconds", "Misc", COLORS["gray"]),
-)
-
-LEGEND_COMPONENTS = COMPONENTS
+from plot_style import add_title_suffix
+from ttft_components import components_for_path, normalize_ttft_row, path_from_row
 
 
 def text(x: float, y: float, value: str, size: int = 12, anchor: str = "middle") -> str:
@@ -49,33 +30,20 @@ def main() -> None:
     if not rows:
         raise RuntimeError("No full-chain rounds to plot")
     for row in rows:
-        row.setdefault(
-            "prefill_l3_kv_read_seconds",
-            row.get("l3_kv_read_seconds", 0.0),
-        )
-        row.setdefault("decode_l3_kv_read_seconds", 0.0)
-        row.setdefault("decode_prealloc_seconds", 0.0)
-        row.setdefault("decode_l3_bootstrap_handoff_seconds", 0.0)
-        row.setdefault("decode_to_prefill_kv_transfer_seconds", 0.0)
-        row.setdefault("prefill_host_to_device_seconds", 0.0)
-        row.setdefault("prefill_logits_sampling_seconds", 0.0)
-        row.setdefault("pd_transfer_seconds", 0.0)
-        row.setdefault("decode_host_to_device_seconds", 0.0)
-        row.setdefault("decode_dispatch_seconds", 0.0)
-        row.setdefault("bootstrap_and_scheduling_seconds", 0.0)
-        row.setdefault("sse_egress_seconds", 0.0)
-        row.setdefault("router_client_runtime_seconds", 0.0)
-        row.setdefault("server_runtime_residual_seconds", 0.0)
-        row["misc_seconds"] = sum(
-            float(row[field])
-            for field in (
-                "bootstrap_and_scheduling_seconds",
-                "decode_l3_bootstrap_handoff_seconds",
-                "sse_egress_seconds",
-                "server_runtime_residual_seconds",
-                "router_client_runtime_seconds",
+        normalize_ttft_row(row)
+        if int(row.get("ttft_timing_schema_version", 0)) < 3:
+            row["misc_seconds"] = sum(
+                float(row.get(field, 0.0))
+                for field in (
+                    "bootstrap_and_scheduling_seconds",
+                    "decode_l3_bootstrap_handoff_seconds",
+                    "sse_egress_seconds",
+                    "server_runtime_residual_seconds",
+                    "router_client_runtime_seconds",
+                    "kv_read_overhead_seconds",
+                )
             )
-        )
+    components = components_for_path(path_from_row(rows[0]))
 
     width, height = 600, 470
     plot_left, plot_right = 75.0, 540.0
@@ -95,7 +63,7 @@ def main() -> None:
     # figure, above the chart, as two horizontal rows.
     legend_columns = 3
     legend_x_positions = (40, 280, 450)
-    for index, (_, label, color) in enumerate(LEGEND_COMPONENTS):
+    for index, (_, label, color) in enumerate(components):
         column = index % legend_columns
         row = index // legend_columns
         legend_x = legend_x_positions[column]
@@ -120,7 +88,7 @@ def main() -> None:
     for index, row in enumerate(rows):
         x = plot_left + spacing * (index + 0.5)
         bottom = plot_bottom
-        for field, _, color in COMPONENTS:
+        for field, _, color in components:
             value = float(row[field])
             segment_height = value / max_ttft * (plot_bottom - plot_top)
             bottom -= segment_height

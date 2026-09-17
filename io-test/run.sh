@@ -4,7 +4,7 @@ set -euo pipefail
 
 CODE_HOME=${CODE_HOME:-/labhome/sezhou/dual-path}
 RUNTIME_HOME=${RUNTIME_HOME:-/mnt/lustre/users/sezhou/dual-path}
-IMAGE=${IMAGE:-$RUNTIME_HOME/images/sglang-file-l3-dual-staging-67876.sqsh}
+IMAGE=${IMAGE:-$RUNTIME_HOME/images/sglang-file-l3-dual-staging-69054.sqsh}
 TP_RANKS=${TP_RANKS:-8}
 PAGES_PER_RANK=${PAGES_PER_RANK:-512}
 PAGE_BYTES=${PAGE_BYTES:-2097152}

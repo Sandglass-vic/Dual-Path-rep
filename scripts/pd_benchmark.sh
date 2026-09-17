@@ -81,7 +81,7 @@ done
   exit 2
 }
 export ALLOC_JOB_ID=$allocation_id
-IMAGE=${IMAGE:-$RUNTIME_HOME/images/sglang-file-l3-dual-staging-67876.sqsh}
+IMAGE=${IMAGE:-$RUNTIME_HOME/images/sglang-file-l3-dual-staging-69302.sqsh}
 : "${PREFILL_HOSTS:?PREFILL_HOSTS is required}"
 : "${DECODE_HOSTS:?DECODE_HOSTS is required}"
 if [[ -n ${TASK_NAME:-} && ! $TASK_NAME =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]]; then

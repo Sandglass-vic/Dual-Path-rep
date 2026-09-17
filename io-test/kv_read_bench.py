@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import json
+import mmap
 import multiprocessing as mp
 import os
 import queue
@@ -18,6 +20,7 @@ from typing import Any
 
 
 RESULT_PREFIX = "KVIO_RESULT "
+CACHE_PROBE_PREFIX = "KVIO_CACHE_PROBE "
 
 
 def page_path(root: Path, rank: int, page: int) -> Path:
@@ -150,6 +153,111 @@ def advise_drop(paths: list[Path]) -> None:
             os.close(fd)
 
 
+def buffer_address(target: memoryview) -> int:
+    return ctypes.addressof(ctypes.c_char.from_buffer(target))
+
+
+def read_page(path: Path, target: memoryview, io_mode: str, alignment: int) -> None:
+    flags = os.O_RDONLY
+    if io_mode == "direct":
+        if not hasattr(os, "O_DIRECT"):
+            raise RuntimeError("Python/os does not expose O_DIRECT on this platform")
+        address = buffer_address(target)
+        if address % alignment:
+            raise RuntimeError(
+                f"O_DIRECT target address 0x{address:x} is not {alignment}-byte aligned"
+            )
+        if len(target) % alignment:
+            raise RuntimeError(
+                f"O_DIRECT read length {len(target)} is not {alignment}-byte aligned"
+            )
+        flags |= os.O_DIRECT
+
+    fd = os.open(path, flags)
+    try:
+        offset = 0
+        while offset < len(target):
+            count = os.readv(fd, [target[offset:]])
+            if count == 0:
+                raise RuntimeError(
+                    f"short read: {path} returned {offset}/{len(target)} bytes"
+                )
+            offset += count
+    finally:
+        os.close(fd)
+
+
+def resident_pages(path: Path) -> tuple[int, int]:
+    size = path.stat().st_size
+    system_page = mmap.PAGESIZE
+    page_count = (size + system_page - 1) // system_page
+    libc = ctypes.CDLL(None, use_errno=True)
+    vector = (ctypes.c_ubyte * page_count)()
+    with path.open("rb", buffering=0) as source:
+        with mmap.mmap(source.fileno(), size, access=mmap.ACCESS_COPY) as mapping:
+            address = ctypes.addressof(ctypes.c_char.from_buffer(mapping))
+            result = libc.mincore(
+                ctypes.c_void_p(address), ctypes.c_size_t(size), vector
+            )
+            if result != 0:
+                error = ctypes.get_errno()
+                raise OSError(error, os.strerror(error))
+    return sum(1 for value in vector if value & 1), page_count
+
+
+def cache_probe(args: argparse.Namespace) -> None:
+    path = page_path(Path(args.data_dir), args.rank, args.page)
+    if not path.is_file():
+        raise RuntimeError(f"cache probe page does not exist: {path}")
+    owner, target = allocate_buffer(args.page_bytes, args.buffer_type)
+    address = buffer_address(target)
+    if address % args.direct_alignment:
+        raise RuntimeError(
+            f"probe buffer 0x{address:x} is not {args.direct_alignment}-byte aligned"
+        )
+
+    os.sync()
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        if hasattr(os, "posix_fadvise") and hasattr(os, "POSIX_FADV_DONTNEED"):
+            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+    finally:
+        os.close(fd)
+    before, total = resident_pages(path)
+
+    read_page(path, target, "direct", args.direct_alignment)
+    after_direct, _ = resident_pages(path)
+
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        if hasattr(os, "posix_fadvise") and hasattr(os, "POSIX_FADV_DONTNEED"):
+            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+    finally:
+        os.close(fd)
+    before_buffered, _ = resident_pages(path)
+    read_page(path, target, "buffered", args.direct_alignment)
+    after_buffered, _ = resident_pages(path)
+
+    result = {
+        "host": socket.gethostname().split(".")[0],
+        "path": str(path),
+        "page_bytes": args.page_bytes,
+        "system_page_bytes": mmap.PAGESIZE,
+        "buffer_type": args.buffer_type,
+        "buffer_address": address,
+        "direct_alignment": args.direct_alignment,
+        "resident_before": before,
+        "resident_after_direct": after_direct,
+        "resident_before_buffered": before_buffered,
+        "resident_after_buffered": after_buffered,
+        "resident_pages_total": total,
+        "direct_populated_cache": after_direct > before,
+        "buffered_populated_cache": after_buffered > before_buffered,
+    }
+    print(CACHE_PROBE_PREFIX + json.dumps(result, sort_keys=True), flush=True)
+    del owner
+
+
 def reader_worker(
     rank: int,
     data_dir: str,
@@ -164,6 +272,8 @@ def reader_worker(
     layers: int,
     page_tokens: int,
     head_dim: int,
+    io_mode: str,
+    direct_alignment: int,
     start_epoch_ns: Any,
     start_event: Any,
     output: mp.Queue,
@@ -171,6 +281,7 @@ def reader_worker(
     try:
         paths = [page_path(Path(data_dir), rank, page) for page in range(pages_per_rank)]
         exact_torch = copy_implementation == "torch"
+        target_backing_owner = None
         if exact_torch:
             import torch
 
@@ -184,11 +295,23 @@ def reader_worker(
                     f"2*layers*page_tokens*head_dim*bfloat16={denominator}"
                 )
             head_num = page_bytes // denominator
-            target_owner = torch.zeros(
-                (2, layers, page_tokens, head_num, head_dim),
-                dtype=torch.bfloat16,
-                pin_memory=buffer_type == "pinned",
-            ).flatten()
+            if io_mode == "direct":
+                target_backing_owner = torch.empty(
+                    page_bytes + direct_alignment,
+                    dtype=torch.uint8,
+                    pin_memory=buffer_type == "pinned",
+                )
+                base = target_backing_owner.data_ptr()
+                aligned_offset = (-base) % direct_alignment
+                target_owner = target_backing_owner[
+                    aligned_offset : aligned_offset + page_bytes
+                ].view(torch.bfloat16)
+            else:
+                target_owner = torch.zeros(
+                    (2, layers, page_tokens, head_num, head_dim),
+                    dtype=torch.bfloat16,
+                    pin_memory=buffer_type == "pinned",
+                ).flatten()
             target = memoryview(target_owner.view(torch.uint8).contiguous().numpy())
         else:
             target_owner, target = allocate_buffer(page_bytes, buffer_type)
@@ -225,21 +348,13 @@ def reader_worker(
         layer_bytes = page_bytes // layers
         for _ in range(passes):
             for page, path in enumerate(paths):
-                with path.open("rb", buffering=0) as source:
-                    if exact_torch:
-                        # Match HiCacheFile.get(), which constructs this view for
-                        # every file read rather than caching a Python buffer.
-                        target = memoryview(
-                            target_owner.view(torch.uint8).contiguous().numpy()
-                        )
-                    offset = 0
-                    while offset < page_bytes:
-                        count = source.readinto(target[offset:])
-                        if count == 0:
-                            raise RuntimeError(
-                                f"short read: {path} returned {offset}/{page_bytes} bytes"
-                            )
-                        offset += count
+                if exact_torch:
+                    # Match HiCacheFile.get(), which constructs this view for
+                    # every file read rather than caching a Python buffer.
+                    target = memoryview(
+                        target_owner.view(torch.uint8).contiguous().numpy()
+                    )
+                read_page(path, target, io_mode, direct_alignment)
                 if exact_torch and staging_owner is not None:
                     index = page * page_tokens
                     staging_owner[:, :, index : index + page_tokens, :, :] = (
@@ -274,7 +389,7 @@ def reader_worker(
             }
         )
         # Keep both backing allocations live through the timed region.
-        del target_owner, staging_owner
+        del target_owner, target_backing_owner, staging_owner
     except BaseException as exc:
         output.put({"rank": rank, "error": f"{type(exc).__name__}: {exc}"})
 
@@ -354,6 +469,8 @@ def read(args: argparse.Namespace) -> None:
                 args.layers,
                 args.page_tokens,
                 args.head_dim,
+                args.io_mode,
+                args.direct_alignment,
                 start_epoch_ns,
                 start_event,
                 output,
@@ -414,6 +531,8 @@ def read(args: argparse.Namespace) -> None:
         "layers": args.layers,
         "page_tokens": args.page_tokens,
         "head_dim": args.head_dim,
+        "io_mode": args.io_mode,
+        "direct_alignment": args.direct_alignment,
         "bytes": total_bytes,
         "gib": total_bytes / 2**30,
         "seconds": elapsed,
@@ -445,6 +564,15 @@ def parse_args() -> argparse.Namespace:
     cleanup_parser = subparsers.add_parser("cleanup")
     cleanup_parser.add_argument("--data-dir", required=True)
 
+    probe_parser = subparsers.add_parser("cache-probe")
+    add_layout_arguments(probe_parser)
+    probe_parser.add_argument("--rank", type=int, default=0)
+    probe_parser.add_argument("--page", type=int, default=0)
+    probe_parser.add_argument(
+        "--buffer-type", choices=("pinned", "pageable"), default="pinned"
+    )
+    probe_parser.add_argument("--direct-alignment", type=int, default=4096)
+
     read_parser = subparsers.add_parser("read")
     add_layout_arguments(read_parser)
     read_parser.add_argument("--passes", type=int, default=1)
@@ -463,6 +591,8 @@ def parse_args() -> argparse.Namespace:
     read_parser.add_argument("--phase", required=True)
     read_parser.add_argument("--repetition", type=int, required=True)
     read_parser.add_argument("--nodes", type=int, required=True)
+    read_parser.add_argument("--io-mode", choices=("buffered", "direct"), default="buffered")
+    read_parser.add_argument("--direct-alignment", type=int, default=4096)
 
     args = parser.parse_args()
     for name in ("tp_ranks", "pages_per_rank", "page_bytes"):
@@ -482,6 +612,8 @@ def main() -> None:
         prepare(args)
     elif args.command == "cleanup":
         cleanup(args)
+    elif args.command == "cache-probe":
+        cache_probe(args)
     else:
         read(args)
 

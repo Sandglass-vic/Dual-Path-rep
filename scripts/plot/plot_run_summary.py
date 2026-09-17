@@ -11,30 +11,11 @@ import statistics
 from collections import defaultdict
 from pathlib import Path
 
-from plot_style import COLORS, add_title_suffix
+from plot_style import add_title_suffix
+from ttft_components import components_for_path, normalize_ttft_row, path_from_row
 
 
 TITLE_SUFFIX = ""
-
-
-FULLCHAIN_COMPONENTS = (
-    (
-        "prefill_l3_kv_read_seconds",
-        "Prefill KV Read (Lustre) + Radix tree",
-        COLORS["orange"],
-    ),
-    ("decode_l3_kv_read_seconds", "Decode KV Read (Lustre)", COLORS["purple"]),
-    ("decode_prealloc_seconds", "Decode pre-allocation", COLORS["yellow"]),
-    ("decode_to_prefill_kv_transfer_seconds", "D->P transfer", COLORS["pink"]),
-    ("prefill_host_to_device_seconds", "Prefill HiCache Host->GPU", COLORS["blue"]),
-    ("prefill_logits_sampling_seconds", "Prefill + Sampling", COLORS["green"]),
-    ("pd_transfer_seconds", "P->D transfer", COLORS["red"]),
-    ("decode_host_to_device_seconds", "Decode Host->GPU", COLORS["cyan"]),
-    ("decode_dispatch_seconds", "Decode dispatch", COLORS["brown"]),
-    ("misc_seconds", "Misc", COLORS["gray"]),
-)
-
-LEGEND_COMPONENTS = FULLCHAIN_COMPONENTS
 
 
 def text(
@@ -210,37 +191,23 @@ def write_latency(
 def write_breakdown(rounds_path: Path, output: Path) -> dict[str, float]:
     rows = [json.loads(line) for line in rounds_path.read_text().splitlines()]
     for row in rows:
-        # Keep historical fullchain artifacts readable after the split.
-        row.setdefault("bootstrap_and_scheduling_seconds", 0.0)
-        row.setdefault(
-            "prefill_l3_kv_read_seconds",
-            row.get("l3_kv_read_seconds", 0.0),
-        )
-        row.setdefault("decode_l3_kv_read_seconds", 0.0)
-        row.setdefault("decode_prealloc_seconds", 0.0)
-        row.setdefault("decode_l3_bootstrap_handoff_seconds", 0.0)
-        row.setdefault("decode_to_prefill_kv_transfer_seconds", 0.0)
-        row.setdefault("prefill_host_to_device_seconds", 0.0)
-        row.setdefault("prefill_logits_sampling_seconds", 0.0)
-        row.setdefault("pd_transfer_seconds", 0.0)
-        row.setdefault("decode_host_to_device_seconds", 0.0)
-        row.setdefault("decode_dispatch_seconds", 0.0)
-        row.setdefault("sse_egress_seconds", 0.0)
-        row.setdefault("router_client_runtime_seconds", 0.0)
-        row.setdefault("server_runtime_residual_seconds", 0.0)
-        row["misc_seconds"] = sum(
-            float(row[field])
-            for field in (
-                "bootstrap_and_scheduling_seconds",
-                "decode_l3_bootstrap_handoff_seconds",
-                "sse_egress_seconds",
-                "server_runtime_residual_seconds",
-                "router_client_runtime_seconds",
+        normalize_ttft_row(row)
+        if int(row.get("ttft_timing_schema_version", 0)) < 3:
+            row["misc_seconds"] = sum(
+                float(row.get(field, 0.0))
+                for field in (
+                    "bootstrap_and_scheduling_seconds",
+                    "decode_l3_bootstrap_handoff_seconds",
+                    "sse_egress_seconds",
+                    "server_runtime_residual_seconds",
+                    "router_client_runtime_seconds",
+                    "kv_read_overhead_seconds",
+                )
             )
-        )
+    components = components_for_path(path_from_row(rows[0]))
     means = {
         field: statistics.fmean(float(row[field]) for row in rows)
-        for field, _, _ in FULLCHAIN_COMPONENTS
+        for field, _, _ in components
     }
     means["mean_ttft_seconds"] = statistics.fmean(
         float(row["ttft_seconds"]) for row in rows
@@ -257,7 +224,7 @@ def write_breakdown(rounds_path: Path, output: Path) -> dict[str, float]:
     # figure, above the plot, in two compact horizontal rows.
     legend_columns = 3
     legend_x_positions = (40, 280, 450)
-    for index, (_, label, color) in enumerate(LEGEND_COMPONENTS):
+    for index, (_, label, color) in enumerate(components):
         column = index % legend_columns
         row = index // legend_columns
         legend_x = legend_x_positions[column]
@@ -276,7 +243,7 @@ def write_breakdown(rounds_path: Path, output: Path) -> dict[str, float]:
         )
         elements.append(text(left - 8, y + 4, f"{value:.0f}", 10, "end"))
     x, bar_width, cursor = 300.0, 120.0, bottom
-    for field, _, color in FULLCHAIN_COMPONENTS:
+    for field, _, color in components:
         segment = means[field] * 1000 / y_max * (bottom - top)
         cursor -= segment
         elements.append(

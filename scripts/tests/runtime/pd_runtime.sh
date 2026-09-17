@@ -100,6 +100,9 @@ if [[ $role == client ]]; then
   printf '  task=%s dataset=%s agents=%s repetition=%s l3_read=%s\n' \
     "$TASK_NAME" "$DATASET" "$AGENTS" "$REPETITION" \
     "$DUALPATH_L3_READ_PATH"
+  printf '  dual_path_o_direct_read=%s\n' "$DUAL_PATH_O_DIRECT_READ"
+  printf '  ttft_timing_v3=%s detail=%s\n' \
+    "$DUALPATH_TTFT_TIMING" "$DUALPATH_TTFT_TIMING_DETAIL"
   printf '  log_dir=%s\n  result_dir=%s\n  server_kv_cache_dir=%s\n' \
     "$LOG_DIR" "$RESULT_DIR" "$CACHE_DIR"
 fi
@@ -108,6 +111,9 @@ if [[ $role == prefill || $role == decode ]]; then
   mkdir -p "$LOG_DIR"
   printf 'Server configuration: role=%s l3_read=%s log_dir=%s cache_dir=%s\n' \
     "$role" "$DUALPATH_L3_READ_PATH" "$LOG_DIR" "$CACHE_DIR"
+  printf '  dual_path_o_direct_read=%s\n' "$DUAL_PATH_O_DIRECT_READ"
+  printf '  ttft_timing_v3=%s detail=%s\n' \
+    "$DUALPATH_TTFT_TIMING" "$DUALPATH_TTFT_TIMING_DETAIL"
 fi
 
 if [[ $role == prefill || $role == decode ]]; then

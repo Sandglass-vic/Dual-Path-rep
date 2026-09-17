@@ -7,6 +7,7 @@ common=(
   PREFILL_HOSTS="p0 p1"
   DECODE_HOSTS="d0 d1"
   ALLOC_JOB_ID=12345
+  DUALPATH_L3_READ_PATH=prefill
   DUALPATH_SKIP_ALLOCATION_CHECK=1
   PD_DRY_RUN=1
 )
@@ -65,11 +66,11 @@ grep -q 'd0 .*decode-0' <<<"$output"
 grep -q 'd1 .*decode-1' <<<"$output"
 grep -q 'c0 .*client' <<<"$output"
 grep -q '^  ssh p0$' <<<"$output"
-grep -q '^  cd .*pd_benchmark.sh prefill$' <<<"$output"
+grep -q '^  cd .*DUALPATH_L3_READ_PATH=<prefill|decode> scripts/pd_benchmark.sh prefill$' <<<"$output"
 grep -q '^  ssh d0$' <<<"$output"
-grep -q '^  cd .*pd_benchmark.sh decode$' <<<"$output"
+grep -q '^  cd .*DUALPATH_L3_READ_PATH=<prefill|decode> scripts/pd_benchmark.sh decode$' <<<"$output"
 grep -q '^  ssh c0$' <<<"$output"
-grep -q '^  cd .*DATASET=32K AGENTS=1 REPETITION=1 DUALPATH_L3_READ_PATH=decode scripts/pd_benchmark.sh client$' <<<"$output"
+grep -q '^  cd .*DATASET=32K AGENTS=1 REPETITION=1 DUALPATH_L3_READ_PATH=<prefill|decode> scripts/pd_benchmark.sh client$' <<<"$output"
 grep -q 'export PREFILL_HOSTS=p0' "$allocation_root/config/allocations/24680.env"
 grep -q 'export DECODE_HOSTS=d0\\ d1' "$allocation_root/config/allocations/24680.env"
 

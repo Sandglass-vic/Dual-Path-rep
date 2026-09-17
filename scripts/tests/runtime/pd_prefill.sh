@@ -37,7 +37,19 @@ if [[ ${ENABLE_HICACHE_L3:-0} == 1 ]]; then
   : "${CACHE_DIR:?CACHE_DIR is required when ENABLE_HICACHE_L3=1}"
   if [[ "$HICACHE_STORAGE_BACKEND" == file ]]; then
     export SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR=$CACHE_DIR
-    hicache_extra_config='{"prefetch_threshold":64,"prefetch_timeout_base":10,"prefetch_timeout_per_ki_token":2}'
+    hicache_extra_config=$(python - "$DUAL_PATH_O_DIRECT_READ" <<'PY'
+import json
+import sys
+
+print(json.dumps({
+    "prefetch_threshold": 64,
+    "prefetch_timeout_base": 10,
+    "prefetch_timeout_per_ki_token": 2,
+    "dual_path_o_direct_read": bool(int(sys.argv[1])),
+    "dual_path_o_direct_alignment": 4096,
+}))
+PY
+)
   elif [[ "$HICACHE_STORAGE_BACKEND" == mooncake ]]; then
     : "${MOONCAKE_MASTER:?MOONCAKE_MASTER is required for Mooncake HiCache}"
     : "${MOONCAKE_TE_META_DATA_SERVER:?MOONCAKE_TE_META_DATA_SERVER is required}"

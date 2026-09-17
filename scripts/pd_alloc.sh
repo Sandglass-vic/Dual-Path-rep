@@ -6,7 +6,7 @@ set -euo pipefail
 # NAME=value scripts/pd_alloc.sh P D.
 DEFAULT_RUNTIME_HOME=/mnt/lustre/users/sezhou/dual-path
 DEFAULT_ABLATION_PROFILE=full
-DEFAULT_IMAGE_NAME=images/sglang-file-l3-dual-staging-67876.sqsh
+DEFAULT_IMAGE_NAME=images/sglang-file-l3-dual-staging-69302.sqsh
 DEFAULT_PARTITION=GAIA
 DEFAULT_TIME_LIMIT=02:00:00
 DEFAULT_ENGINE_CPUS=112
@@ -24,6 +24,7 @@ optional_vars=(
   DUALPATH_DECODE_L3_SYNC_TIMEOUT MC_TRANSFER_TIMEOUT
   SGLANG_MOONCAKE_MAX_TRANSFER_BATCH_INDICES SERVER_TIMEOUT
   PREFILL_PORT DECODE_PORT BOOTSTRAP_PORT ROUTER_PORT IB_DEVICE
+  DUALPATH_TTFT_TIMING DUALPATH_TTFT_TIMING_DETAIL
 )
 
 write_allocation_config() {
@@ -212,7 +213,7 @@ for name in "${optional_vars[@]}"; do
 done
 
 command=(
-  salloc -w dgx-gaia-21,dgx-gaia-22,dgx-gaia-23 --partition="$PARTITION" --nodes="$nodes" --ntasks="$nodes"
+  salloc --partition="$PARTITION" --nodes="$nodes" --ntasks="$nodes"
   --ntasks-per-node=1 --cpus-per-task="$ENGINE_CPUS" --gres=gpu:8
   --exclusive --time="$TIME_LIMIT" --job-name="dualpath-$ALLOC_NAME"
 )

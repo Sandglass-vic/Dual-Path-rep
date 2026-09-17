@@ -49,6 +49,29 @@ COPY_TO_STAGING=0 io-test/run.sh
 COPY_IMPLEMENTATION=python io-test/run.sh
 ```
 
+## O_DIRECT 验证
+
+申请一个 GPU 节点后运行：
+
+```bash
+cd /labhome/sezhou/dual-path
+io-test/run_direct.sh
+```
+
+该测试使用同一批 2 MiB KV page、8 个 TP reader 和 pinned DRAM，交替执行 cold
+buffered read 与 `O_DIRECT` read。两种模式都包含相同的 Torch
+`page_first -> layer_first` staging copy。
+
+开始带宽测试前，脚本还会对一个 page 执行 `mincore` 驻留检查：
+
+1. `posix_fadvise(DONTNEED)` 后记录初始 resident page 数；
+2. 执行一次 `O_DIRECT` read，再次记录 resident page 数；
+3. 再次清理并执行 buffered read，记录最终 resident page 数。
+
+只有 Direct read 不增加 resident page、而 buffered read 增加 resident page 时，
+`summary.json` 中的 `direct_bypassed_page_cache` 才会为 `true`。Direct buffer
+显式按 4096 bytes 对齐；文件 offset 和默认 2 MiB I/O 长度也满足该对齐要求。
+
 结果默认位于：
 
 ```text
@@ -64,6 +87,7 @@ COPY_IMPLEMENTATION=python io-test/run.sh
 
 `run.sh` 不会在 login 节点直接访问 Lustre；数据目录由 compute-node `srun`
 创建，并在成功生成 summary 后自动删除。设置 `KEEP_DATA=1` 可保留 page 文件。
+`run_direct.sh` 使用相同的清理规则，结果目录后缀为 `<jobid>-direct`。
 
 ## 判断标准
 

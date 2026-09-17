@@ -14,6 +14,807 @@ def replace_once(source: str, old: str, new: str, label: str) -> str:
     return source.replace(old, new, 1)
 
 
+def replace_function(source: str, signature: str, body: str, label: str) -> str:
+    start = source.find(signature)
+    if start < 0:
+        raise RuntimeError(f"{label}: function signature not found")
+    indent = signature[: len(signature) - len(signature.lstrip())]
+    end = source.find(f"\n{indent}def ", start + len(signature))
+    if end < 0:
+        end = len(source)
+    return source[:start] + body.rstrip() + "\n" + source[end:]
+
+
+def write_ttft_v3_helper(path: Path) -> None:
+    path.write_text(
+        '''"""Low-overhead request-scoped DualPath TTFT timing helpers."""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import socket
+import time
+from typing import Any
+
+
+SCHEMA_VERSION = 3
+ENABLED = os.environ.get("DUALPATH_TTFT_TIMING", "0").lower() in (
+    "1", "true", "yes", "on"
+)
+DETAIL = os.environ.get("DUALPATH_TTFT_TIMING_DETAIL", "0").lower() in (
+    "1", "true", "yes", "on"
+)
+READ_PATH = os.environ.get("DUALPATH_L3_READ_PATH", "prefill")
+NODE = socket.gethostname().split(".", 1)[0]
+PREFILL_ENGINE = os.environ.get("PREFILL_ID", "0")
+DECODE_ENGINE = os.environ.get("DECODE_ID", "0")
+PREFILL_NODE = os.environ.get("PREFILL_HOST", NODE)
+DECODE_NODE = os.environ.get("DECODE_HOST", NODE)
+
+STAGES = (
+    "prefill_before_lustre_read",
+    "prefill_lustre_read",
+    "prefill_scatter",
+    "prefill_host_to_device",
+    "prefill_computation",
+    "p_to_d_transfer",
+    "decode_preallocation",
+    "decode_before_lustre_read",
+    "decode_lustre_read",
+    "decode_scatter",
+    "d_to_p_transfer",
+    "decode_host_to_device",
+    "decode_dispatch",
+)
+
+
+def now_ns() -> int:
+    return time.perf_counter_ns()
+
+
+def ns_seconds(value: int | float | None) -> float:
+    return max(0.0, float(value or 0) / 1_000_000_000.0)
+
+
+def new_cuda_event(device_module):
+    if not ENABLED:
+        return None
+    return device_module.Event(enable_timing=True)
+
+
+def event_seconds(start, end) -> float:
+    if start is None or end is None or not end.query():
+        return 0.0
+    return max(0.0, float(start.elapsed_time(end)) / 1000.0)
+
+
+def event_overlap_seconds(first_start, first_end, second_start, second_end) -> float:
+    if any(item is None for item in (first_start, first_end, second_start, second_end)):
+        return 0.0
+    if not first_end.query() or not second_end.query():
+        return 0.0
+    first_duration = event_seconds(first_start, first_end)
+    second_duration = event_seconds(second_start, second_end)
+    if first_duration <= 0 or second_duration <= 0:
+        return 0.0
+    second_offset = float(first_start.elapsed_time(second_start)) / 1000.0
+    return max(
+        0.0,
+        min(first_duration, second_offset + second_duration)
+        - max(0.0, second_offset),
+    )
+
+
+def emit(
+    logger: logging.Logger,
+    *,
+    rid: str,
+    side: str,
+    tp_rank: int,
+    values: dict[str, Any] | None = None,
+) -> None:
+    if not ENABLED:
+        return
+    values = dict(values or {})
+    payload: dict[str, Any] = {
+        "schema_version": SCHEMA_VERSION,
+        "rid": rid,
+        "path": READ_PATH,
+        "side": side,
+        "engine": PREFILL_ENGINE if side == "prefill" else DECODE_ENGINE,
+        "node": PREFILL_NODE if side == "prefill" else DECODE_NODE,
+        "tp_rank": int(tp_rank),
+        "clock_scope": "process_monotonic",
+    }
+    for stage in STAGES:
+        raw = max(0.0, float(values.pop(f"{stage}_raw_seconds", 0.0)))
+        critical = max(0.0, float(values.pop(f"{stage}_seconds", raw)))
+        payload[f"{stage}_raw_seconds"] = raw
+        payload[f"{stage}_seconds"] = critical
+        payload[f"{stage}_overlap_removed_seconds"] = max(
+            0.0,
+            float(values.pop(f"{stage}_overlap_removed_seconds", raw - critical)),
+        )
+    payload.update(values)
+    logger.info("DUALPATH_TTFT_V3 %s", json.dumps(payload, sort_keys=True))
+'''
+    )
+    print(f"Wrote: {path}")
+
+
+def gate_logger_call(source: str, marker: str) -> str:
+    """Gate the logger call containing marker behind the cached detail flag."""
+    search_from = 0
+    while True:
+        marker_pos = source.find(marker, search_from)
+        if marker_pos < 0:
+            return source
+        logger_pos = source.rfind("logger.", 0, marker_pos)
+        if logger_pos < 0:
+            raise RuntimeError(f"Cannot locate logger call for {marker}")
+        line_start = source.rfind("\n", 0, logger_pos) + 1
+        indent = source[line_start:logger_pos]
+        close = source.find(f"\n{indent})\n", marker_pos)
+        if close < 0:
+            raise RuntimeError(f"Cannot locate logger call end for {marker}")
+        call_end = close + len(f"\n{indent})\n")
+        block = source[line_start:call_end]
+        if source[max(0, line_start - len(indent) - 40):line_start].endswith(
+            f"{indent}if DUALPATH_TTFT_DETAIL:\n"
+        ):
+            search_from = call_end
+            continue
+        gated = (
+            f"{indent}if DUALPATH_TTFT_DETAIL:\n"
+            + "".join(
+                f"    {line}" if line.strip() else line
+                for line in block.splitlines(keepends=True)
+            )
+        )
+        source = source[:line_start] + gated + source[call_end:]
+        search_from = line_start + len(gated)
+
+
+def patch_hicache_file_o_direct_read(path: Path) -> None:
+    source = path.read_text()
+    marker = "DUAL_PATH_O_DIRECT_READ"
+    if marker in source:
+        print(f"Already patched: {path}")
+        return
+
+    init_anchor = (
+        "        self.file_path = envs.SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR.get() or file_path\n"
+        if "self.file_path = envs.SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR.get() or file_path\n"
+        in source
+        else "        self.file_path = os.getenv(\"SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR\", file_path)\n"
+    )
+    source = replace_once(
+        source,
+        init_anchor,
+        init_anchor +
+        "        extra_config = storage_config.extra_config or {}\n"
+        "        if isinstance(extra_config, str):\n"
+        "            extra_config = __import__(\"json\").loads(extra_config)\n"
+        "        if not isinstance(extra_config, dict):\n"
+        "            raise TypeError(\"HiCache extra_config must be a dict or JSON object\")\n"
+        "        direct_read_raw = extra_config.get(\"dual_path_o_direct_read\")\n"
+        "        if direct_read_raw is None:\n"
+        "            direct_read_raw = __import__(\"os\").environ.get(\n"
+        "                \"DUAL_PATH_O_DIRECT_READ\", \"0\"\n"
+        "            )\n"
+        "        self.dualpath_o_direct_read = str(direct_read_raw).lower() in (\n"
+        "            \"1\", \"true\", \"yes\", \"on\"\n"
+        "        )\n"
+        "        self.dualpath_o_direct_alignment = int(\n"
+        "            extra_config.get(\"dual_path_o_direct_alignment\", 4096)\n"
+        "        )\n"
+        "        if self.dualpath_o_direct_alignment <= 0 or (\n"
+        "            self.dualpath_o_direct_alignment\n"
+        "            & (self.dualpath_o_direct_alignment - 1)\n"
+        "        ):\n"
+        "            raise ValueError(\n"
+        "                \"dual_path_o_direct_alignment must be a positive power of two\"\n"
+        "            )\n",
+        "configure optional DualPath O_DIRECT file reads",
+    )
+    key_name = "suffixed" if "f\"{suffixed}.bin\"" in source else "key"
+    old_get = (
+        "            expected = target_location.numel() * target_location.element_size()\n"
+        "            with open(tensor_path, \"rb\", buffering=0) as f:\n"
+        "                buf = memoryview(target_location.view(torch.uint8).contiguous().numpy())\n"
+        "                if f.readinto(buf) != expected:\n"
+        f"                    raise IOError(f\"Short read for {{{key_name}}}\")\n"
+    )
+    direct_error_key = key_name
+    new_get = (
+        "            expected = target_location.numel() * target_location.element_size()\n"
+        "            if self.dualpath_o_direct_read:\n"
+        "                if not target_location.is_contiguous():\n"
+        "                    raise ValueError(\n"
+        "                        \"O_DIRECT HiCache target must be contiguous\"\n"
+        "                    )\n"
+        "                ctypes = __import__(\"ctypes\")\n"
+        "                mmap = __import__(\"mmap\")\n"
+        "                alignment = self.dualpath_o_direct_alignment\n"
+        "                if expected % alignment:\n"
+        "                    raise ValueError(\n"
+        "                        f\"O_DIRECT read length {expected} is not aligned to {alignment}\"\n"
+        "                    )\n"
+        "                buf = memoryview(target_location.view(torch.uint8).numpy())\n"
+        "                address = ctypes.addressof(ctypes.c_char.from_buffer(buf))\n"
+        "                scratch = None\n"
+        "                if address % alignment:\n"
+        "                    scratch = mmap.mmap(-1, expected + alignment)\n"
+        "                    scratch_address = ctypes.addressof(\n"
+        "                        ctypes.c_char.from_buffer(scratch)\n"
+        "                    )\n"
+        "                    offset = (-scratch_address) % alignment\n"
+        "                    io_buf = memoryview(scratch)[offset : offset + expected]\n"
+        "                else:\n"
+        "                    io_buf = buf\n"
+        "                try:\n"
+        "                    flags = __import__(\"os\").O_RDONLY | __import__(\"os\").O_DIRECT\n"
+        "                    fd = __import__(\"os\").open(tensor_path, flags)\n"
+        "                    try:\n"
+        "                        offset = 0\n"
+        "                        while offset < expected:\n"
+        f"                            count = __import__(\"os\").readv(fd, [io_buf[offset:]])\n"
+        "                            if count == 0:\n"
+        f"                                raise IOError(f\"Short read for {{{direct_error_key}}}\")\n"
+        "                            offset += count\n"
+        "                    finally:\n"
+        "                        __import__(\"os\").close(fd)\n"
+        "                    if scratch is not None:\n"
+        "                        buf[:] = io_buf\n"
+        "                finally:\n"
+        "                    if scratch is not None:\n"
+        "                        io_buf.release()\n"
+        "                        scratch.close()\n"
+        "            else:\n"
+        "                with open(tensor_path, \"rb\", buffering=0) as f:\n"
+        "                    buf = memoryview(target_location.view(torch.uint8).contiguous().numpy())\n"
+        f"                    if f.readinto(buf) != expected:\n"
+        f"                        raise IOError(f\"Short read for {{{direct_error_key}}}\")\n"
+    )
+    source = replace_once(
+        source,
+        old_get,
+        new_get,
+        "add optional O_DIRECT read while preserving buffered default",
+    )
+    source = source.replace(
+        "class HiCacheFile(HiCacheStorage):\n",
+        "class HiCacheFile(HiCacheStorage):\n"
+        "    # DUAL_PATH_O_DIRECT_READ: optional Lustre client page-cache bypass.\n",
+        1,
+    )
+    path.write_text(source)
+    print(f"Patched: {path}")
+
+
+def patch_prefill_o_direct_reusable_buffer(path: Path) -> None:
+    source = path.read_text()
+    marker = "DUALPATH_O_DIRECT_REUSABLE_PAGE"
+    if marker in source:
+        print(f"Already patched: {path}")
+        return
+
+    old = (
+        "    def _generic_page_get(self, operation, hash_values, host_indices, extra_info=None):\n"
+        "        dummy_page_dst = [\n"
+        "            self.mem_pool_host.get_dummy_flat_data_page() for _ in hash_values\n"
+        "        ]\n"
+        "        page_data = self.storage_backend.batch_get(hash_values, dummy_page_dst)\n"
+        "        if page_data is None:\n"
+        "            return\n"
+        "        for i in range(len(hash_values)):\n"
+    )
+    new = (
+        "    def _generic_page_get(self, operation, hash_values, host_indices, extra_info=None):\n"
+        "        # DUALPATH_O_DIRECT_REUSABLE_PAGE: file O_DIRECT reads are\n"
+        "        # synchronous, so one aligned pinned page can be scattered to\n"
+        "        # the Host pool and reused immediately. This avoids allocating\n"
+        "        # and zeroing up to storage_batch_size temporary pages.\n"
+        "        dualpath_lustre_read_s = 0.0\n"
+        "        dualpath_scatter_s = 0.0\n"
+        "        dualpath_pages = 0\n"
+        "        if operation.dualpath_read_start is None:\n"
+        "            operation.dualpath_read_start = __import__(\"time\").perf_counter()\n"
+        "        dualpath_log_prefix = (\n"
+        "            \"DUALPATH_DECODE_KV_READ_BREAKDOWN\"\n"
+        "            if operation.retain_host_indices\n"
+        "            else \"DUALPATH_PREFILL_KV_READ_BREAKDOWN\"\n"
+        "        )\n"
+        "        if getattr(self.storage_backend, \"dualpath_o_direct_read\", False):\n"
+        "            data_page = getattr(\n"
+        "                self, \"_dualpath_o_direct_page_buffer\", None\n"
+        "            )\n"
+        "            if data_page is None:\n"
+        "                data_page = self.mem_pool_host.get_dummy_flat_data_page()\n"
+        "                alignment = getattr(\n"
+        "                    self.storage_backend,\n"
+        "                    \"dualpath_o_direct_alignment\",\n"
+        "                    4096,\n"
+        "                )\n"
+        "                if data_page.data_ptr() % alignment:\n"
+        "                    element_size = data_page.element_size()\n"
+        "                    extra_elements = (\n"
+        "                        alignment + element_size - 1\n"
+        "                    ) // element_size\n"
+        "                    owner = torch.empty(\n"
+        "                        data_page.numel() + extra_elements,\n"
+        "                        dtype=data_page.dtype,\n"
+        "                        device=data_page.device,\n"
+        "                        pin_memory=data_page.is_pinned(),\n"
+        "                    )\n"
+        "                    offset_bytes = (-owner.data_ptr()) % alignment\n"
+        "                    if offset_bytes % element_size:\n"
+        "                        raise RuntimeError(\n"
+        "                            \"Cannot align O_DIRECT Prefill page buffer\"\n"
+        "                        )\n"
+        "                    offset = offset_bytes // element_size\n"
+        "                    data_page = owner[\n"
+        "                        offset : offset + data_page.numel()\n"
+        "                    ]\n"
+        "                    self._dualpath_o_direct_page_buffer_owner = owner\n"
+        "                self._dualpath_o_direct_page_buffer = data_page\n"
+        "\n"
+        "            for i, hash_value in enumerate(hash_values):\n"
+        "                dualpath_io_start = __import__(\"time\").perf_counter()\n"
+        "                page_data = self.storage_backend.get(hash_value, data_page)\n"
+        "                dualpath_lustre_read_s += (\n"
+        "                    __import__(\"time\").perf_counter() - dualpath_io_start\n"
+        "                )\n"
+        "                if page_data is None:\n"
+        "                    logger.warning(\n"
+        "                        f\"Prefetch operation {operation.request_id} failed \"\n"
+        "                        f\"to retrieve page {hash_value}.\"\n"
+        "                    )\n"
+        "                    break\n"
+        "                dualpath_scatter_start = __import__(\"time\").perf_counter()\n"
+        "                self.mem_pool_host.set_from_flat_data_page(\n"
+        "                    host_indices[i * self.page_size],\n"
+        "                    page_data,\n"
+        "                )\n"
+        "                dualpath_scatter_s += (\n"
+        "                    __import__(\"time\").perf_counter()\n"
+        "                    - dualpath_scatter_start\n"
+        "                )\n"
+        "                dualpath_pages += 1\n"
+        "                if not operation.increment(self.page_size):\n"
+        "                    break\n"
+        "            operation.dualpath_lustre_read_s += dualpath_lustre_read_s\n"
+        "            operation.dualpath_scatter_s += dualpath_scatter_s\n"
+        "            operation.dualpath_read_end = __import__(\"time\").perf_counter()\n"
+        "            logger.info(\n"
+        "                \"%s rid=%s \"\n"
+        "                \"prefill_engine=%s node=%s tp_rank=%d \"\n"
+        "                \"lustre_read_s=%.9f scatter_s=%.9f pages=%d\",\n"
+        "                dualpath_log_prefix,\n"
+        "                operation.request_id,\n"
+        "                __import__(\"os\").environ.get(\"PREFILL_ID\", \"0\"),\n"
+        "                __import__(\"os\").environ.get(\n"
+        "                    \"PREFILL_HOST\",\n"
+        "                    __import__(\"os\").environ.get(\"HOSTNAME\", \"unknown\"),\n"
+        "                ),\n"
+        "                self.tp_rank,\n"
+        "                dualpath_lustre_read_s,\n"
+        "                dualpath_scatter_s,\n"
+        "                dualpath_pages,\n"
+        "            )\n"
+        "            return\n"
+        "\n"
+        "        dummy_page_dst = [\n"
+        "            self.mem_pool_host.get_dummy_flat_data_page() for _ in hash_values\n"
+        "        ]\n"
+        "        dualpath_io_start = __import__(\"time\").perf_counter()\n"
+        "        page_data = self.storage_backend.batch_get(hash_values, dummy_page_dst)\n"
+        "        dualpath_lustre_read_s = (\n"
+        "            __import__(\"time\").perf_counter() - dualpath_io_start\n"
+        "        )\n"
+        "        if page_data is None:\n"
+        "            operation.dualpath_lustre_read_s += dualpath_lustre_read_s\n"
+        "            operation.dualpath_read_end = __import__(\"time\").perf_counter()\n"
+        "            logger.info(\n"
+        "                \"%s rid=%s \"\n"
+        "                \"prefill_engine=%s node=%s tp_rank=%d \"\n"
+        "                \"lustre_read_s=%.9f scatter_s=0.000000000 pages=0\",\n"
+        "                dualpath_log_prefix,\n"
+        "                operation.request_id,\n"
+        "                __import__(\"os\").environ.get(\"PREFILL_ID\", \"0\"),\n"
+        "                __import__(\"os\").environ.get(\n"
+        "                    \"PREFILL_HOST\",\n"
+        "                    __import__(\"os\").environ.get(\"HOSTNAME\", \"unknown\"),\n"
+        "                ),\n"
+        "                self.tp_rank,\n"
+        "                dualpath_lustre_read_s,\n"
+        "            )\n"
+        "            return\n"
+        "        for i in range(len(hash_values)):\n"
+    )
+    source = replace_once(
+        source,
+        old,
+        new,
+        "reuse one aligned Prefill page for O_DIRECT reads",
+    )
+    function_start = source.index(
+        "    def _generic_page_get(self, operation, hash_values, host_indices, extra_info=None):\n"
+    )
+    function_end = source.find("\n    def ", function_start + 1)
+    if function_end < 0:
+        function_end = len(source)
+    batch_get = source.index(
+        "self.storage_backend.batch_get(hash_values, dummy_page_dst)",
+        function_start,
+        function_end,
+    )
+    scatter_start = source.index(
+        "self.mem_pool_host.set_from_flat_data_page(",
+        batch_get,
+        function_end,
+    )
+    scatter_line_start = source.rfind("\n", function_start, scatter_start) + 1
+    scatter_indent = source[scatter_line_start:scatter_start]
+    open_paren = source.index("(", scatter_start, function_end)
+    depth = 0
+    scatter_end = None
+    for position in range(open_paren, function_end):
+        character = source[position]
+        if character == "(":
+            depth += 1
+        elif character == ")":
+            depth -= 1
+            if depth == 0:
+                scatter_end = position + 1
+                break
+    if scatter_end is None:
+        raise RuntimeError("Cannot locate buffered Prefill scatter call end")
+    if scatter_end < len(source) and source[scatter_end] == "\n":
+        scatter_end += 1
+    source = (
+        source[:scatter_line_start]
+        + scatter_indent
+        + "dualpath_scatter_start = __import__(\"time\").perf_counter()\n"
+        + source[scatter_line_start:scatter_end]
+        + scatter_indent
+        + "dualpath_scatter_s += (\n"
+        + scatter_indent
+        + "    __import__(\"time\").perf_counter() - dualpath_scatter_start\n"
+        + scatter_indent
+        + ")\n"
+        + scatter_indent
+        + "dualpath_pages += 1\n"
+        + source[scatter_end:]
+    )
+    function_end = source.find("\n    def ", function_start + 1)
+    if function_end < 0:
+        function_end = len(source)
+    # The buffered implementation in the base SGLang version has no log
+    # statement after the page loop. Add the aggregate timing immediately
+    # before the function ends, after all pages have been scattered.
+    source = (
+        source[:function_end]
+        + "\n        operation.dualpath_lustre_read_s += dualpath_lustre_read_s\n"
+        + "        operation.dualpath_scatter_s += dualpath_scatter_s\n"
+        + "        operation.dualpath_read_end = __import__(\"time\").perf_counter()\n"
+        + source[function_end:]
+    )
+    function_end = source.find("\n    def ", function_start + 1)
+    if function_end < 0:
+        function_end = len(source)
+    buffered_log = (
+        "        logger.info(\n"
+        "            \"%s rid=%s \"\n"
+        "            \"prefill_engine=%s node=%s tp_rank=%d \"\n"
+        "            \"lustre_read_s=%.9f scatter_s=%.9f pages=%d\",\n"
+        "            dualpath_log_prefix,\n"
+        "            operation.request_id,\n"
+        "            __import__(\"os\").environ.get(\"PREFILL_ID\", \"0\"),\n"
+        "            __import__(\"os\").environ.get(\n"
+        "                \"PREFILL_HOST\",\n"
+        "                __import__(\"os\").environ.get(\"HOSTNAME\", \"unknown\"),\n"
+        "            ),\n"
+        "            self.tp_rank,\n"
+        "            dualpath_lustre_read_s,\n"
+        "            dualpath_scatter_s,\n"
+        "            dualpath_pages,\n"
+        "        )\n"
+    )
+    source = source[:function_end] + "\n" + buffered_log + source[function_end:]
+    path.write_text(source)
+    print(f"Patched: {path}")
+
+
+def patch_shared_prefetch_progress(path: Path) -> None:
+    """Expose the same async prefetch completion protocol to Decode.
+
+    Prefill owns the radix-tree bookkeeping around HiCacheController. Decode
+    intentionally has no radix tree for the L3 staging pages, but it must use
+    the exact same storage query/read worker and TP consensus. These helpers
+    keep that protocol in the shared controller instead of reimplementing it
+    in the Mooncake receiver.
+    """
+    source = path.read_text()
+    marker = "DUALPATH_SHARED_PREFETCH_PROGRESS"
+    if marker in source:
+        print(f"Already patched: {path}")
+        return
+
+    source = replace_once(
+        source,
+        "        self._terminated_flag = False\n"
+        "        self.start_time = time.monotonic()\n",
+        "        self._terminated_flag = False\n"
+        "        self.start_time = time.monotonic()\n"
+        "        # DUALPATH_SHARED_PREFETCH_PROGRESS: set by the shared\n"
+        "        # prefetch worker after prefix hash lookup and TP hit\n"
+        "        # consensus complete.\n"
+        "        self.query_complete = False\n"
+        "        self.revoked = False\n"
+        "        # Set after the auxiliary I/O worker has stopped using the\n"
+        "        # operation's Host buffer.\n"
+        "        self.io_complete = threading.Event()\n",
+        "track shared prefetch query completion",
+    )
+    source = replace_once(
+        source,
+        "        self.io_complete = threading.Event()\n",
+        "        self.io_complete = threading.Event()\n"
+        "        # Decode retains every page in this allocation because\n"
+        "        # Lustre misses remain P->D destinations.\n"
+        "        self.retain_host_indices = False\n",
+        "retain Decode staging pages through shared prefetch",
+    )
+    source = replace_once(
+        source,
+        "        self.retain_host_indices = False\n",
+        "        self.retain_host_indices = False\n"
+        "        self.dualpath_read_start = None\n"
+        "        self.dualpath_read_end = None\n"
+        "        self.dualpath_lustre_read_s = 0.0\n"
+        "        self.dualpath_scatter_s = 0.0\n",
+        "track aggregate shared prefetch read timing",
+    )
+    source = replace_once(
+        source,
+        "        prefix_keys: Optional[List[str]] = None,\n"
+        "    ) -> PrefetchOperation:\n",
+        "        prefix_keys: Optional[List[str]] = None,\n"
+        "        retain_host_indices: bool = False,\n"
+        "    ) -> PrefetchOperation:\n",
+        "allow Decode to retain shared prefetch allocation",
+    )
+    source = replace_once(
+        source,
+        "        operation = PrefetchOperation(\n"
+        "            request_id, host_indices, new_input_tokens, last_hash, prefix_keys\n"
+        "        )\n"
+        "        self.prefetch_queue.put(operation)\n",
+        "        operation = PrefetchOperation(\n"
+        "            request_id, host_indices, new_input_tokens, last_hash, prefix_keys\n"
+        "        )\n"
+        "        operation.retain_host_indices = retain_host_indices\n"
+        "        self.prefetch_queue.put(operation)\n",
+        "set shared prefetch allocation ownership before queueing",
+    )
+
+    source = replace_once(
+        source,
+        "    def terminate_prefetch(self, operation):\n"
+        "        operation.mark_terminate()\n"
+        "        return operation.completed_tokens, operation.hash_value\n",
+        "    def terminate_prefetch(self, operation):\n"
+        "        operation.mark_terminate()\n"
+        "        return operation.completed_tokens, operation.hash_value\n"
+        "\n"
+        "    def shared_prefetch_can_terminate(\n"
+        "        self, operation, stop_policy=\"wait_complete\",\n"
+        "        timeout_base=None, timeout_per_page=0.0\n"
+        "    ) -> bool:\n"
+        "        \"\"\"Use Prefill's async prefetch completion consensus.\"\"\"\n"
+        "        if operation.host_indices is None:\n"
+        "            return True\n"
+        "        if not operation.query_complete:\n"
+        "            return False\n"
+        "        if operation.revoked:\n"
+        "            return True\n"
+        "        if len(operation.hash_value) == 0:\n"
+        "            completed = False\n"
+        "        else:\n"
+        "            completed = (\n"
+        "                operation.completed_tokens\n"
+        "                == len(operation.hash_value) * self.page_size\n"
+        "            )\n"
+        "        if stop_policy == \"best_effort\":\n"
+        "            can_terminate = True\n"
+        "        elif stop_policy == \"wait_complete\":\n"
+        "            can_terminate = completed\n"
+        "        elif stop_policy == \"timeout\":\n"
+        "            can_terminate = completed or (\n"
+        "                timeout_base is not None\n"
+        "                and time.monotonic() - operation.start_time\n"
+        "                > timeout_base + len(operation.hash_value) * timeout_per_page\n"
+        "            )\n"
+        "        else:\n"
+        "            can_terminate = True\n"
+        "        operation_terminated = operation.is_terminated()\n"
+        "        if self.tp_world_size > 1:\n"
+        "            states = torch.tensor(\n"
+        "                [1 - int(can_terminate), int(operation_terminated)],\n"
+        "                dtype=torch.int,\n"
+        "            )\n"
+        "            torch.distributed.all_reduce(\n"
+        "                states,\n"
+        "                op=torch.distributed.ReduceOp.MAX,\n"
+        "                group=self.prefetch_tp_group,\n"
+        "            )\n"
+        "            can_terminate = states[0].item() == 0\n"
+        "            operation_terminated = states[1].item() == 1\n"
+        "        return can_terminate or operation_terminated\n"
+        "\n"
+        "    def shared_prefetch_finish(self, operation):\n"
+        "        \"\"\"Finish a shared prefetch with Prefill's MIN consensus.\"\"\"\n"
+        "        completed_tokens, hash_value = self.terminate_prefetch(operation)\n"
+        "        if self.tp_world_size > 1:\n"
+        "            completed_tensor = torch.tensor(\n"
+        "                completed_tokens, dtype=torch.int\n"
+        "            )\n"
+        "            torch.distributed.all_reduce(\n"
+        "                completed_tensor,\n"
+        "                op=torch.distributed.ReduceOp.MIN,\n"
+        "                group=self.prefetch_tp_group,\n"
+        "            )\n"
+        "            completed_tokens = int(completed_tensor.item())\n"
+        "        return completed_tokens, hash_value\n"
+        "\n"
+        "    def shared_prefetch_cancel(self, operation, timeout=60.0) -> bool:\n"
+        "        \"\"\"Cancel without freeing a buffer used by async I/O.\"\"\"\n"
+        "        if operation is None:\n"
+        "            return True\n"
+        "        operation.mark_terminate()\n"
+        "        completed = operation.io_complete.wait(timeout=timeout)\n"
+        "        if completed:\n"
+        "            self.drain_shared_prefetch_releases()\n"
+        "        else:\n"
+        "            logger.error(\n"
+        "                \"Timed out waiting for shared prefetch cancellation: %s\",\n"
+        "                operation.request_id,\n"
+        "            )\n"
+        "        return completed\n"
+        "\n"
+        "    def drain_shared_prefetch_releases(self):\n"
+        "        \"\"\"Release pages revoked by the shared prefetch worker.\"\"\"\n"
+        "        while True:\n"
+        "            try:\n"
+        "                indices = self.host_mem_release_queue.get_nowait()\n"
+        "            except Empty:\n"
+        "                return\n"
+        "            self.mem_pool_host.free(indices)\n",
+        "share Prefill prefetch completion and cleanup protocol",
+    )
+
+    source = replace_once(
+        source,
+        "                hash_value, storage_hit_count = self._storage_hit_query(operation)\n"
+        "                if self.tp_world_size > 1:\n",
+        "                hash_value, storage_hit_count = self._storage_hit_query(operation)\n"
+        "                if self.tp_world_size > 1:\n",
+        "record completion of shared hash query",
+    )
+    source = replace_once(
+        source,
+        "                    storage_hit_count = storage_hit_count_tensor.item()\n"
+        "\n"
+        "                if storage_hit_count < self.prefetch_threshold:\n",
+        "                    storage_hit_count = storage_hit_count_tensor.item()\n"
+        "                operation.query_complete = True\n"
+        "\n"
+        "                if storage_hit_count < self.prefetch_threshold:\n",
+        "publish shared hash query completion after TP consensus",
+    )
+    source = replace_once(
+        source,
+        "                if storage_hit_count < self.prefetch_threshold:\n"
+        "                    # not to prefetch if not enough benefits\n"
+        "                    self.prefetch_revoke_queue.put(operation.request_id)\n"
+        "                    self.append_host_mem_release(operation.host_indices)\n",
+        "                if storage_hit_count < self.prefetch_threshold:\n"
+        "                    # not to prefetch if not enough benefits\n"
+        "                    operation.revoked = True\n"
+        "                    operation.mark_terminate()\n"
+        "                    self.prefetch_revoke_queue.put(operation.request_id)\n"
+        "                    if not operation.retain_host_indices:\n"
+        "                        self.append_host_mem_release(operation.host_indices)\n"
+        "                    operation.io_complete.set()\n",
+        "mark shared prefetch revocation for non-hit requests",
+    )
+    source = replace_once(
+        source,
+        "                else:\n"
+        "                    operation.hash_value = hash_value[\n"
+        "                        : (storage_hit_count // self.page_size)\n"
+        "                    ]\n"
+        "                    # free the pre-allocated memory for pages that are not hit\n"
+        "                    self.append_host_mem_release(\n"
+        "                        operation.host_indices[storage_hit_count:]\n"
+        "                    )\n"
+        "                    operation.host_indices = operation.host_indices[:storage_hit_count]\n",
+        "                else:\n"
+        "                    operation.hash_value = hash_value[\n"
+        "                        : (storage_hit_count // self.page_size)\n"
+        "                    ]\n"
+        "                    if not operation.retain_host_indices:\n"
+        "                        # free the pre-allocated memory for pages that are not hit\n"
+        "                        self.append_host_mem_release(\n"
+        "                            operation.host_indices[storage_hit_count:]\n"
+        "                        )\n"
+        "                        operation.host_indices = operation.host_indices[:storage_hit_count]\n",
+        "retain Decode staging pages after shared hit query",
+    )
+    source = replace_once(
+        source,
+        "                self._page_transfer(operation)\n"
+        "                # operation terminated by controller, release pre-allocated memory\n"
+        "                self.append_host_mem_release(\n"
+        "                    operation.host_indices[operation.completed_tokens :]\n"
+        "                )\n",
+        "                try:\n"
+        "                    self._page_transfer(operation)\n"
+        "                except Exception:\n"
+        "                    operation.mark_terminate()\n"
+        "                    logger.exception(\n"
+        "                        \"Shared prefetch I/O failed for %s\",\n"
+        "                        operation.request_id,\n"
+        "                    )\n"
+        "                finally:\n"
+        "                    # operation terminated by controller, release\n"
+        "                    # pre-allocated memory and publish safe cleanup.\n"
+        "                    if operation.retain_host_indices:\n"
+        "                        decode_read_end = (\n"
+        "                            operation.dualpath_read_end\n"
+        "                            or __import__(\"time\").perf_counter()\n"
+        "                        )\n"
+        "                        decode_read_start = (\n"
+        "                            operation.dualpath_read_start\n"
+        "                            or decode_read_end\n"
+        "                        )\n"
+        "                        logger.info(\n"
+        "                            \"DUALPATH_DECODE_L3_READ rid=%s \"\n"
+        "                            \"decode_engine=%s node=%s tp_rank=%d \"\n"
+        "                            \"read_start=%.9f read_end=%.9f read_s=%.9f \"\n"
+        "                            \"lustre_read_s=%.9f scatter_s=%.9f tokens=%d\",\n"
+        "                            operation.request_id,\n"
+        "                            __import__(\"os\").environ.get(\n"
+        "                                \"DECODE_ID\", \"0\"\n"
+        "                            ),\n"
+        "                            __import__(\"os\").environ.get(\n"
+        "                                \"DECODE_HOST\",\n"
+        "                                __import__(\"os\").environ.get(\n"
+        "                                    \"HOSTNAME\", \"unknown\"\n"
+        "                                ),\n"
+        "                            ),\n"
+        "                            self.tp_rank,\n"
+        "                            decode_read_start,\n"
+        "                            decode_read_end,\n"
+        "                            decode_read_end - decode_read_start,\n"
+        "                            operation.dualpath_lustre_read_s,\n"
+        "                            operation.dualpath_scatter_s,\n"
+        "                            operation.completed_tokens,\n"
+        "                        )\n"
+        "                    if not operation.retain_host_indices:\n"
+        "                        self.append_host_mem_release(\n"
+        "                            operation.host_indices[operation.completed_tokens :]\n"
+        "                        )\n"
+        "                    operation.io_complete.set()\n",
+        "make shared prefetch I/O cancellation-safe",
+    )
+    path.write_text(source)
+    print(f"Patched: {path}")
+
+
 def patch_hiradix(path: Path) -> None:
     source = path.read_text()
     marker = "DUALPATH_L3_TIMING"
@@ -146,6 +947,98 @@ def patch_hiradix(path: Path) -> None:
         "            info = self.ongoing_prefetch.pop(req_id, None)\n",
         "discard revoked prefetch timing",
     )
+    can_terminate_start = source.index(
+        "    def can_terminate_prefetch(", source.index("class HiRadixCache")
+    )
+    check_progress_start = source.index(
+        "    def check_prefetch_progress(", can_terminate_start
+    )
+    shared_can_terminate = (
+        "    def can_terminate_prefetch(self, operation: PrefetchOperation):\n"
+        "        if (\n"
+        "            operation.completed_tokens == len(operation.hash_value) * self.page_size\n"
+        "            and operation.request_id not in self.dualpath_prefetch_local_end\n"
+        "        ):\n"
+        "            # Capture this rank's storage IO completion before the\n"
+        "            # shared TP completion-consensus all_reduce.\n"
+        "            self.dualpath_prefetch_local_end[operation.request_id] = (\n"
+        "                time.perf_counter()\n"
+        "            )\n"
+        "        return self.cache_controller.shared_prefetch_can_terminate(\n"
+        "            operation,\n"
+        "            stop_policy=self.prefetch_stop_policy,\n"
+        "            timeout_base=self.prefetch_timeout_base,\n"
+        "            timeout_per_page=self.prefetch_timeout_per_page,\n"
+        "        )\n\n"
+    )
+    source = source[:can_terminate_start] + shared_can_terminate + source[check_progress_start:]
+    source = replace_once(
+        source,
+        "        completed_tokens, hash_value = self.cache_controller.terminate_prefetch(\n"
+        "            operation\n"
+        "        )\n",
+        "        completed_tokens, hash_value = self.cache_controller.shared_prefetch_finish(\n"
+        "            operation\n"
+        "        )\n",
+        "reuse shared Prefill prefetch completion consensus",
+    )
+    source = replace_once(
+        source,
+        "        min_completed_tokens = completed_tokens\n"
+        "        if self.tp_world_size > 1:\n"
+        "            # synchrnoize TP workers to make the same update to hiradix cache\n"
+        "            completed_tokens_tensor = torch.tensor(\n"
+        "                min_completed_tokens, dtype=torch.int\n"
+        "            )\n"
+        "            torch.distributed.all_reduce(\n"
+        "                completed_tokens_tensor,\n"
+        "                op=torch.distributed.ReduceOp.MIN,\n"
+        "                group=self.tp_group,\n"
+        "            )\n"
+        "            min_completed_tokens = completed_tokens_tensor.item()\n",
+        "        # shared_prefetch_finish already reduced this count across TP.\n"
+        "        min_completed_tokens = completed_tokens\n",
+        "remove duplicate Prefill prefetch completion reduction",
+    )
+    source = replace_once(
+        source,
+        "    def load_back(\n"
+        "        self, node: TreeNode, mem_quota: Optional[int] = None\n"
+        "    ) -> Optional[torch.Tensor]:\n",
+        "    def dualpath_drop_request_cache(self, last_node) -> int:\n"
+        "        \"\"\"Drop one request's radix metadata after durable backup.\"\"\"\n"
+        "        if last_node is None:\n"
+        "            return 0\n"
+        "        removed_tokens = 0\n"
+        "        if last_node.lock_ref > 0:\n"
+        "            # dec_lock_ref already walks to the root; calling it again\n"
+        "            # for each ancestor would consume locks owned by other\n"
+        "            # concurrent requests that share the same prefix.\n"
+        "            self.dec_lock_ref(last_node)\n"
+        "        node = last_node\n"
+        "        while node is not self.root_node:\n"
+        "            parent = node.parent\n"
+        "            if (\n"
+        "                node.lock_ref != 0\n"
+        "                or node.host_ref_counter != 0\n"
+        "                or node.children\n"
+        "            ):\n"
+        "                break\n"
+        "            if node.value is not None:\n"
+        "                removed_tokens += len(node.value)\n"
+        "                node.value = None\n"
+        "            if node.host_value is not None:\n"
+        "                self.cache_controller.evict_host(node.host_value)\n"
+        "                node.host_value = None\n"
+        "            self._delete_leaf(node)\n"
+        "            node = parent\n"
+        "        return removed_tokens\n"
+        "\n"
+        "    def load_back(\n"
+        "        self, node: TreeNode, mem_quota: Optional[int] = None\n"
+        "    ) -> Optional[torch.Tensor]:\n",
+        "drop request radix metadata after Decode backup",
+    )
     path.write_text(source)
     print(f"Patched: {path}")
 
@@ -259,30 +1152,47 @@ def patch_schedule_batch(path: Path) -> None:
         "        logger.info(f\"{prefix}: {self.time_stats.convert_to_duration()}\")\n"
         "        self.has_log_time_stats = True\n",
         "        logger.info(f\"{prefix}: {self.time_stats.convert_to_duration()}\")\n"
-        "        stats = self.time_stats\n"
-        "        prefill_s = stats.get_prefill_launch_latency()\n"
-        "        logger.info(\n"
-        "            \"DUALPATH_REQ_TIMING rid=%s type=%s queue_s=%.9f \"\n"
-        "            \"alloc_s=%.9f prefill_s=%.9f forward_s=%.9f \"\n"
-        "            \"queue_start=%.9f queue_end=%.9f prefill_start=%.9f \"\n"
-        "            \"prefill_end=%.9f prefill_bootstrap_start=%.9f \"\n"
-        "            \"decode_prealloc_start=%.9f decode_receive_start=%.9f\",\n"
-        "            self.rid,\n"
-        "            stats.disagg_mode_str(),\n"
-        "            max(0.0, stats.get_queueing_time()),\n"
-        "            max(0.0, stats.alloc_waiting_duration),\n"
-        "            max(0.0, prefill_s or 0.0),\n"
-        "            max(0.0, stats.completion_time - stats.forward_entry_time),\n"
-        "            stats.wait_queue_entry_time,\n"
-        "            stats.forward_entry_time,\n"
-        "            stats.prefill_start_time_host,\n"
-        "            stats.prefill_end_time_host,\n"
-        "            stats.prefill_bootstrap_queue_entry_time,\n"
-        "            stats.decode_prealloc_queue_entry_time,\n"
-        "            stats.decode_transfer_queue_entry_time,\n"
-        "        )\n"
+        "        if DUALPATH_TTFT_DETAIL:\n"
+        "            stats = self.time_stats\n"
+        "            prefill_s = stats.get_prefill_launch_latency()\n"
+        "            logger.info(\n"
+        "                \"DUALPATH_REQ_TIMING rid=%s type=%s queue_s=%.9f \"\n"
+        "                \"alloc_s=%.9f prefill_s=%.9f forward_s=%.9f \"\n"
+        "                \"queue_start=%.9f queue_end=%.9f prefill_start=%.9f \"\n"
+        "                \"prefill_end=%.9f prefill_bootstrap_start=%.9f \"\n"
+        "                \"decode_prealloc_start=%.9f decode_receive_start=%.9f\",\n"
+        "                self.rid,\n"
+        "                stats.disagg_mode_str(),\n"
+        "                max(0.0, stats.get_queueing_time()),\n"
+        "                max(0.0, stats.alloc_waiting_duration),\n"
+        "                max(0.0, prefill_s or 0.0),\n"
+        "                max(0.0, stats.completion_time - stats.forward_entry_time),\n"
+        "                stats.wait_queue_entry_time,\n"
+        "                stats.forward_entry_time,\n"
+        "                stats.prefill_start_time_host,\n"
+        "                stats.prefill_end_time_host,\n"
+        "                stats.prefill_bootstrap_queue_entry_time,\n"
+        "                stats.decode_prealloc_queue_entry_time,\n"
+        "                stats.decode_transfer_queue_entry_time,\n"
+        "            )\n"
         "        self.has_log_time_stats = True\n",
         "record request stage durations",
+    )
+    source = replace_once(
+        source,
+        "        self.extra_key = extra_key\n"
+        "        self.lora_id = lora_id\n",
+        "        # DUALPATH_NO_CROSS_TURN_KV_REUSE: each replay turn has a\n"
+        "        # distinct request id. Isolate completed turns from L1/L2\n"
+        "        # radix reuse while preserving reuse within one request.\n"
+        "        if __import__(\"os\").environ.get(\n"
+        "            \"DUALPATH_NO_CROSS_TURN_KV_REUSE\", \"1\"\n"
+        "        ) == \"1\":\n"
+        "            self.extra_key = f\"dualpath:{self.rid}:{extra_key or ''}\"\n"
+        "        else:\n"
+        "            self.extra_key = extra_key\n"
+        "        self.lora_id = lora_id\n",
+        "isolate each DualPath request from cross-turn radix reuse",
     )
     path.write_text(source)
     print(f"Patched: {path}")
@@ -717,7 +1627,9 @@ def patch_prefill_decode_l3_reverse(path: Path) -> None:
         "        req.host_hit_length = 0\n"
         "        req.cache_protected_len = 0\n"
         "        # ScheduleBatch.prepare_for_extend accounts prefix_indices once.\n"
-        "        req.cached_tokens = 0\n"
+        "        # Tell Decode that these L3-hit pages are already durable;\n"
+        "        # only the computed suffix must be backed up by Decode.\n"
+        "        req.cached_tokens = hit_tokens\n"
         "        req.start_send_idx = hit_tokens\n"
         "        req.set_extend_input_len(len(req.fill_ids) - hit_tokens)\n"
         "        req.dualpath_decode_l3_prefix_ready = True\n"
@@ -997,6 +1909,8 @@ def patch_decode_host_staging(path: Path) -> None:
         "                )\n"
         "            kv_args.dualpath_decode_device_pool = self.token_to_kv_pool\n"
         "            kv_args.dualpath_decode_host_staging_pool = host_staging_pool\n"
+        "            kv_args.dualpath_decode_device_allocator = self.token_to_kv_pool_allocator\n"
+        "            kv_args.dualpath_decode_tp_group = self.gloo_group\n"
         "            kv_data_ptrs = [tensor.data_ptr() for tensor in staging_refs]\n"
         "            kv_data_lens = [tensor.nbytes for tensor in staging_refs]\n"
         "            logger.info(\n"
@@ -1083,54 +1997,284 @@ def patch_decode_host_staging(path: Path) -> None:
 
 def patch_decode_l3_read(path: Path) -> None:
     source = path.read_text()
-    marker = "dualpath_decode_storage_backend"
+    marker = "DUALPATH_DECODE_SCHEDULER_PREFETCH"
     if marker in source:
         print(f"Already patched: {path}")
         return
 
     source = replace_once(
         source,
-        "            kv_args.dualpath_decode_device_pool = self.token_to_kv_pool\n"
-        "            kv_args.dualpath_decode_host_staging_pool = host_staging_pool\n"
-        "            kv_data_ptrs = [tensor.data_ptr() for tensor in staging_refs]\n",
-        "            kv_args.dualpath_decode_device_pool = self.token_to_kv_pool\n"
-        "            kv_args.dualpath_decode_host_staging_pool = host_staging_pool\n"
-        "            kv_args.dualpath_decode_storage_backend = (\n"
-        "                self.scheduler.decode_offload_manager.cache_controller.storage_backend\n"
-        "                if self.scheduler.decode_offload_manager is not None\n"
-        "                else None\n"
-        "            )\n"
-        "            kv_data_ptrs = [tensor.data_ptr() for tensor in staging_refs]\n",
-        "expose Decode file backend to PD staging manager",
+        "    metadata_buffer_index: int = -1\n",
+        "    metadata_buffer_index: int = -1\n"
+        "    # DUALPATH_DECODE_SCHEDULER_PREFETCH: Decode mirrors Prefill's\n"
+        "    # scheduler-owned prefetch lifecycle. The receiver remains passive.\n"
+        "    dualpath_l3_prefetch_operation: Optional[object] = None\n"
+        "    dualpath_l3_page_indices: Optional[object] = None\n"
+        "    dualpath_l3_state_indices: Optional[object] = None\n"
+        "    dualpath_l3_host_token_indices: Optional[object] = None\n"
+        "    dualpath_l3_host_page_indices: Optional[object] = None\n"
+        "    dualpath_l3_hit_tokens: int = 0\n"
+        "    dualpath_l3_prefetch_timing: Optional[dict] = None\n",
+        "store Decode prefetch state on the scheduler request",
     )
     source = replace_once(
         source,
+        "    def pop_preallocated(\n"
+        "        self, rids_to_check: Optional[List[str]] = None\n"
+        "    ) -> Tuple[List[DecodeRequest], List[DecodeRequest]]:\n",
+        "    def _dualpath_init_receiver(self, decode_req: DecodeRequest) -> None:\n"
+        "        \"\"\"Commit scheduler-owned prefetch state to the passive receiver.\"\"\"\n"
+        "        if getattr(\n"
+        "            decode_req.kv_receiver,\n"
+        "            \"dualpath_scheduler_prefetch_supported\",\n"
+        "            False,\n"
+        "        ):\n"
+        "            decode_req.kv_receiver.init(\n"
+        "                decode_req.dualpath_l3_page_indices,\n"
+        "                decode_req.metadata_buffer_index,\n"
+        "                decode_req.dualpath_l3_state_indices,\n"
+        "                request_id=decode_req.req.rid,\n"
+        "                host_staging_token_indices=(\n"
+        "                    decode_req.dualpath_l3_host_token_indices\n"
+        "                ),\n"
+        "                host_staging_page_indices=(\n"
+        "                    decode_req.dualpath_l3_host_page_indices\n"
+        "                ),\n"
+        "                decode_l3_hit_tokens=decode_req.dualpath_l3_hit_tokens,\n"
+        "                decode_l3_prefetch_timing=(\n"
+        "                    decode_req.dualpath_l3_prefetch_timing or {}\n"
+        "                ),\n"
+        "            )\n"
+        "        else:\n"
+        "            decode_req.kv_receiver.init(\n"
+        "                decode_req.dualpath_l3_page_indices,\n"
+        "                decode_req.metadata_buffer_index,\n"
+        "                decode_req.dualpath_l3_state_indices,\n"
+        "            )\n"
+        "        decode_req.req.time_stats.decode_transfer_queue_entry_time = (\n"
+        "            time.perf_counter()\n"
+        "        )\n"
+        "        decode_req.req.add_latency(RequestStage.DECODE_BOOTSTRAP)\n"
+        "        trace_slice_end(\n"
+        "            RequestStage.DECODE_BOOTSTRAP,\n"
+        "            decode_req.req.rid,\n"
+        "            auto_next_anon=True,\n"
+        "        )\n"
+        "\n"
+        "    def _dualpath_progress_l3_prefetch(\n"
+        "        self, rids_to_check: Optional[List[str]] = None\n"
+        "    ) -> Tuple[List[DecodeRequest], set[int]]:\n"
+        "        \"\"\"Advance Decode prefetch in FIFO order, as Prefill does.\"\"\"\n"
+        "        ready = []\n"
+        "        indices_to_remove = set()\n"
+        "        for i, decode_req in enumerate(self.queue):\n"
+        "            operation = decode_req.dualpath_l3_prefetch_operation\n"
+        "            if operation is None:\n"
+        "                continue\n"
+        "            if rids_to_check is not None and decode_req.req.rid not in rids_to_check:\n"
+        "                continue\n"
+        "            done, hit_tokens = self.kv_manager.poll_decode_l3_prefetch(\n"
+        "                operation\n"
+        "            )\n"
+        "            if not done:\n"
+        "                # Keep collective order identical on every TP rank. Later\n"
+        "                # operations may perform I/O, but cannot commit first.\n"
+        "                break\n"
+        "            decode_req.dualpath_l3_hit_tokens = hit_tokens\n"
+        "            decode_req.dualpath_l3_prefetch_timing = (\n"
+        "                operation.dualpath_timing_snapshot()\n"
+        "                if hasattr(operation, \"dualpath_timing_snapshot\")\n"
+        "                else {}\n"
+        "            )\n"
+        "            decode_req.dualpath_l3_prefetch_operation = None\n"
+        "            self._dualpath_init_receiver(decode_req)\n"
+        "            ready.append(decode_req)\n"
+        "            indices_to_remove.add(i)\n"
+        "        return ready, indices_to_remove\n"
+        "\n"
+        "    def pop_preallocated(\n"
+        "        self, rids_to_check: Optional[List[str]] = None\n"
+        "    ) -> Tuple[List[DecodeRequest], List[DecodeRequest]]:\n",
+        "add Prefill-style Decode scheduler prefetch progress",
+    )
+    source = replace_once(
+        source,
+        "        failed_reqs = []\n"
+        "        preallocated_reqs = []\n"
+        "        indices_to_remove = set()\n",
+        "        failed_reqs = []\n"
+        "        (\n"
+        "            preallocated_reqs,\n"
+        "            indices_to_remove,\n"
+        "        ) = self._dualpath_progress_l3_prefetch(rids_to_check)\n",
+        "advance Decode L3 prefetch before new allocations",
+    )
+    source = replace_once(
+        source,
+        "        self._update_handshake_waiters(rids_to_check)\n"
+        "\n"
+        "        failed_reqs = []\n",
+        "        self._update_handshake_waiters(rids_to_check)\n"
+        "        if hasattr(\n"
+        "            self.kv_manager, \"drain_decode_l3_prefetch_cancellations\"\n"
+        "        ):\n"
+        "            self.kv_manager.drain_decode_l3_prefetch_cancellations()\n"
+        "\n"
+        "        failed_reqs = []\n",
+        "drain cancelled Decode prefetch operations without blocking",
+    )
+    source = replace_once(
+        source,
+        "        # First, remove all failed requests from the queue\n"
+        "        for i, decode_req in enumerate(self.queue):\n"
+        "            if rids_to_check is not None and decode_req.req.rid not in rids_to_check:\n"
+        "                continue\n"
+        "            if isinstance(decode_req.req.finished_reason, FINISH_ABORT):\n",
+        "        # First, remove all failed requests from the queue\n"
+        "        for i, decode_req in enumerate(self.queue):\n"
+        "            if rids_to_check is not None and decode_req.req.rid not in rids_to_check:\n"
+        "                continue\n"
+        "            if i in indices_to_remove:\n"
+        "                continue\n"
+        "            if isinstance(decode_req.req.finished_reason, FINISH_ABORT):\n"
+        "                operation = decode_req.dualpath_l3_prefetch_operation\n"
+        "                host_token_indices = (\n"
+        "                    decode_req.dualpath_l3_host_token_indices\n"
+        "                )\n"
+        "                if operation is not None and hasattr(\n"
+        "                    self.kv_manager, \"cancel_decode_l3_prefetch\"\n"
+        "                ):\n"
+        "                    self.kv_manager.cancel_decode_l3_prefetch(\n"
+        "                        operation, host_token_indices\n"
+        "                    )\n"
+        "                    decode_req.dualpath_l3_prefetch_operation = None\n"
+        "                    decode_req.dualpath_l3_host_token_indices = None\n"
+        "                elif host_token_indices is not None and hasattr(\n"
+        "                    self.kv_manager, \"release_decode_host_staging\"\n"
+        "                ):\n"
+        "                    self.kv_manager.release_decode_host_staging(\n"
+        "                        host_token_indices\n"
+        "                    )\n"
+        "                    decode_req.dualpath_l3_host_token_indices = None\n"
+        "                if decode_req.dualpath_l3_page_indices is not None:\n"
+        "                    release_kv_cache(\n"
+        "                        decode_req.req, self.tree_cache, is_insert=False\n"
+        "                    )\n"
+        "                    decode_req.dualpath_l3_page_indices = None\n"
+        "                if decode_req.metadata_buffer_index != -1:\n"
+        "                    self.req_to_metadata_buffer_idx_allocator.free(\n"
+        "                        decode_req.metadata_buffer_index\n"
+        "                    )\n"
+        "                    decode_req.metadata_buffer_index = -1\n",
+        "release scheduler-owned Decode prefetch state on abort",
+    )
+    source = replace_once(
+        source,
+        "        # Then, preallocate the remaining requests if possible\n"
+        "        for i, decode_req in enumerate(self.queue):\n",
+        "        # Then, preallocate the remaining requests if possible\n"
+        "        dualpath_prefetch_inflight = any(\n"
+        "            item.dualpath_l3_prefetch_operation is not None\n"
+        "            for item in self.queue\n"
+        "        )\n"
+        "        dualpath_cancel_pending = (\n"
+        "            hasattr(self.kv_manager, \"decode_l3_prefetch_cancel_pending\")\n"
+        "            and self.kv_manager.decode_l3_prefetch_cancel_pending()\n"
+        "        )\n"
+        "        for i, decode_req in enumerate(self.queue):\n",
+        "serialize Decode prefetch query collectives",
+    )
+    source = replace_once(
+        source,
+        "            if not decode_req.waiting_for_input:\n"
+        "                continue\n"
+        "\n"
+        "            if self.req_to_token_pool.available_size() <= 0:\n",
+        "            if not decode_req.waiting_for_input:\n"
+        "                continue\n"
+        "\n"
+        "            if dualpath_prefetch_inflight or dualpath_cancel_pending:\n"
+        "                # The shared Prefill controller has one ordered query\n"
+        "                # stream. Do not interleave another Decode TP query.\n"
+        "                break\n"
+        "\n"
+        "            if self.req_to_token_pool.available_size() <= 0:\n",
+        "avoid duplicate Decode allocation while prefetch is in flight",
+    )
+    source = replace_once(
+        source,
+        "            page_indices = kv_to_page_indices(kv_indices, page_size)\n"
         "            decode_req.kv_receiver.init(\n"
         "                page_indices, decode_req.metadata_buffer_index, state_indices\n"
+        "            )\n"
+        "            preallocated_reqs.append(decode_req)\n"
+        "            indices_to_remove.add(i)\n"
+        "            decode_req.req.time_stats.decode_transfer_queue_entry_time = (\n"
+        "                time.perf_counter()\n"
+        "            )\n"
+        "            decode_req.req.add_latency(RequestStage.DECODE_BOOTSTRAP)\n"
+        "            trace_slice_end(\n"
+        "                RequestStage.DECODE_BOOTSTRAP, decode_req.req.rid, auto_next_anon=True\n"
         "            )\n",
-        "            if (\n"
+        "            page_indices = kv_to_page_indices(kv_indices, page_size)\n"
+        "            decode_req.dualpath_l3_page_indices = page_indices\n"
+        "            decode_req.dualpath_l3_state_indices = state_indices\n"
+        "            if getattr(\n"
+        "                self.kv_manager, \"decode_host_staging_enabled\", False\n"
+        "            ):\n"
+        "                host_alloc_start = time.perf_counter()\n"
+        "                (\n"
+        "                    decode_req.dualpath_l3_host_token_indices,\n"
+        "                    decode_req.dualpath_l3_host_page_indices,\n"
+        "                ) = self.kv_manager.allocate_decode_host_staging(page_indices)\n"
+        "                decode_req.kv_receiver.dualpath_host_alloc_start = (\n"
+        "                    host_alloc_start\n"
+        "                )\n"
+        "                decode_req.kv_receiver.dualpath_host_alloc_end = (\n"
+        "                    time.perf_counter()\n"
+        "                )\n"
+        "\n"
+        "            decode_l3_read = (\n"
         "                __import__(\"os\").environ.get(\n"
         "                    \"DUALPATH_L3_READ_PATH\", \"prefill\"\n"
         "                )\n"
         "                == \"decode\"\n"
-        "                and hasattr(decode_req.kv_receiver, \"kv_mgr\")\n"
-        "                and hasattr(\n"
-        "                    decode_req.kv_receiver.kv_mgr,\n"
-        "                    \"load_decode_l3_prefix\",\n"
-        "                )\n"
+        "            )\n"
+        "            if decode_l3_read and hasattr(\n"
+        "                self.kv_manager, \"start_decode_l3_prefetch\"\n"
         "            ):\n"
-        "                decode_req.kv_receiver.init(\n"
-        "                    page_indices,\n"
-        "                    decode_req.metadata_buffer_index,\n"
-        "                    state_indices,\n"
-        "                    token_ids=decode_req.req.origin_input_ids,\n"
-        "                    request_id=decode_req.req.rid,\n"
+        "                decode_req.dualpath_l3_prefetch_operation = (\n"
+        "                    self.kv_manager.start_decode_l3_prefetch(\n"
+        "                        decode_req.req.rid,\n"
+        "                        decode_req.req.origin_input_ids,\n"
+        "                        decode_req.dualpath_l3_host_token_indices,\n"
+        "                    )\n"
         "                )\n"
-        "            else:\n"
-        "                decode_req.kv_receiver.init(\n"
-        "                    page_indices, decode_req.metadata_buffer_index, state_indices\n"
-        "                )\n",
-        "load Decode L3 prefix into PD staging",
+        "                if decode_req.dualpath_l3_prefetch_operation is not None:\n"
+        "                    # Leave the request in the preallocation queue. The\n"
+        "                    # next scheduler iterations mirror Prefill's\n"
+        "                    # check_prefetch_progress lifecycle.\n"
+        "                    dualpath_prefetch_inflight = True\n"
+        "                    break\n"
+        "\n"
+        "            self._dualpath_init_receiver(decode_req)\n"
+        "            preallocated_reqs.append(decode_req)\n"
+        "            indices_to_remove.add(i)\n",
+        "move Decode L3 operation ownership into DecodePreallocQueue",
+    )
+    source = replace_once(
+        source,
+        "                self.scheduler.stream_output(\n"
+        "                    [decode_req.req], decode_req.req.return_logprob\n"
+        "                )\n"
+        "                # release pre-allocated kv cache, but don't insert into the tree since it's failed\n",
+        "                self.scheduler.stream_output(\n"
+        "                    [decode_req.req], decode_req.req.return_logprob\n"
+        "                )\n"
+        "                decode_req.kv_receiver.clear()\n"
+        "                decode_req.kv_receiver = None\n"
+        "                # release pre-allocated kv cache, but don't insert into the tree since it's failed\n",
+        "release Decode staging after transfer failure",
     )
     path.write_text(source)
     print(f"Patched: {path}")
@@ -1184,8 +2328,10 @@ def patch_decode_handoff_breakdown(path: Path) -> None:
     source = replace_once(
         source,
         "            page_indices = kv_to_page_indices(kv_indices, page_size)\n"
+        "            # DUALPATH_DECODE_L3_PREFETCH_WIRING\n"
         "            if (\n",
         "            page_indices = kv_to_page_indices(kv_indices, page_size)\n"
+        "            # DUALPATH_DECODE_L3_PREFETCH_WIRING\n"
         "            dualpath_indices_end = time.perf_counter()\n"
         "            dualpath_receiver_init_start = time.perf_counter()\n"
         "            if (\n",
@@ -1472,47 +2618,16 @@ def patch_allocator_kernel_breakdown(path: Path) -> None:
 
 
 def patch_decode_receiver_breakdown(path: Path) -> None:
+    """Decode receiver timing is emitted by the shared async receiver init."""
     source = path.read_text()
-    marker = "dualpath_host_alloc_start"
-    if marker in source:
+    if "dualpath_host_alloc_start" in source:
         print(f"Already patched: {path}")
         return
-    source = replace_once(
-        source,
-        "        if self.kv_mgr.decode_host_staging_enabled:\n"
-        "            self.kv_indices = np.array(kv_indices, dtype=np.int64, copy=True)\n"
-        "            (\n"
-        "                self.host_staging_token_indices,\n"
-        "                kv_indices,\n"
-        "            ) = self.kv_mgr.allocate_decode_host_staging(self.kv_indices)\n"
-        "            self.host_staging_page_indices = np.array(\n",
-        "        if self.kv_mgr.decode_host_staging_enabled:\n"
-        "            self.kv_indices = np.array(kv_indices, dtype=np.int64, copy=True)\n"
-        "            self.dualpath_host_alloc_start = time.perf_counter()\n"
-        "            (\n"
-        "                self.host_staging_token_indices,\n"
-        "                kv_indices,\n"
-        "            ) = self.kv_mgr.allocate_decode_host_staging(self.kv_indices)\n"
-        "            self.dualpath_host_alloc_end = time.perf_counter()\n"
-        "            self.host_staging_page_indices = np.array(\n",
-        "time Decode Host staging allocation",
-    )
-    source = replace_once(
-        source,
-        "            if token_ids is not None and request_id is not None:\n"
-        "                self.decode_l3_hit_tokens = self.kv_mgr.load_decode_l3_prefix(\n"
-        "                    request_id, token_ids, self.host_staging_token_indices\n"
-        "                )\n",
-        "            if token_ids is not None and request_id is not None:\n"
-        "                self.dualpath_l3_load_start = time.perf_counter()\n"
-        "                self.decode_l3_hit_tokens = self.kv_mgr.load_decode_l3_prefix(\n"
-        "                    request_id, token_ids, self.host_staging_token_indices\n"
-        "                )\n"
-        "                self.dualpath_l3_load_end = time.perf_counter()\n",
-        "retain Decode L3 load timestamps on receiver",
-    )
+    # The async Decode L3 implementation records allocation and prefetch
+    # timestamps in MooncakeKVReceiver.init/poll. Keep this hook for older
+    # patch ordering without reintroducing the synchronous reader.
     path.write_text(source)
-    print(f"Patched: {path}")
+    print(f"Decode receiver timing is provided by async L3 patch: {path}")
 
 
 def patch_bounded_decode_host_staging_pool(path: Path) -> None:
@@ -1663,6 +2778,7 @@ def patch_mooncake_decode_host_staging(path: Path) -> None:
         "        self.host_staging_token_indices = None\n"
         "        self.host_staging_h2d_start = None\n"
         "        self.host_staging_h2d_end = None\n"
+        "        self.decode_l3_bootstrap_sent = False\n"
         "        super().__init__(mgr, bootstrap_addr, bootstrap_room, prefill_dp_rank)\n",
         "initialize per-request Decode Host staging state",
     )
@@ -1733,7 +2849,7 @@ def patch_mooncake_decode_host_staging(path: Path) -> None:
 
 def patch_mooncake_decode_l3_reverse(path: Path) -> None:
     source = path.read_text()
-    marker = "DUALPATH_DECODE_L3_READ"
+    marker = "DUALPATH_DECODE_L3_REVERSE"
     if marker in source:
         print(f"Already patched: {path}")
         return
@@ -1795,6 +2911,47 @@ def patch_mooncake_decode_l3_reverse(path: Path) -> None:
         "        self.decode_l3_storage_backend = getattr(\n"
         "            args, \"dualpath_decode_storage_backend\", None\n"
         "        )\n"
+        "        self.decode_l3_prefetch_controller = None\n"
+        "        self.decode_l3_prefetch_tokens = 0\n"
+        "        self.decode_l3_cancelled_prefetch = []\n"
+        "        if (\n"
+        "            self.disaggregation_mode == DisaggregationMode.DECODE\n"
+        "            and self.decode_l3_read_path\n"
+        "            and getattr(args, \"dualpath_decode_host_staging_pool\", None)\n"
+        "            is not None\n"
+        "        ):\n"
+        "            from sglang.srt.managers.cache_controller import HiCacheController\n"
+        "            extra_config = server_args.hicache_storage_backend_extra_config\n"
+        "            if isinstance(extra_config, str):\n"
+        "                try:\n"
+        "                    extra_config = __import__(\"json\").loads(extra_config)\n"
+        "                except Exception as error:\n"
+        "                    raise ValueError(\n"
+        "                        f\"Invalid HiCache backend config: {error}\"\n"
+        "                    ) from error\n"
+        "            extra_config = extra_config or {}\n"
+        "            self.decode_l3_prefetch_controller = HiCacheController(\n"
+        "                token_to_kv_pool_allocator=getattr(\n"
+        "                    args, \"dualpath_decode_device_allocator\"\n"
+        "                ),\n"
+        "                mem_pool_host=args.dualpath_decode_host_staging_pool,\n"
+        "                page_size=args.dualpath_decode_host_staging_pool.page_size,\n"
+        "                tp_group=args.dualpath_decode_tp_group,\n"
+        "                load_cache_event=threading.Event(),\n"
+        "                write_policy=\"write_through\",\n"
+        "                io_backend=server_args.hicache_io_backend,\n"
+        "                storage_backend=server_args.hicache_storage_backend,\n"
+        "                prefetch_threshold=int(\n"
+        "                    extra_config.get(\"prefetch_threshold\", 256)\n"
+        "                ),\n"
+        "                model_name=server_args.served_model_name,\n"
+        "                storage_backend_extra_config=extra_config,\n"
+        "            )\n"
+        "            # The dedicated staging pool is intentionally independent\n"
+        "            # of the Decode page-first HiCache pool.\n"
+        "            self.decode_l3_prefetch_controller.prefetch_capacity_limit = int(\n"
+        "                0.8 * args.dualpath_decode_host_staging_pool.size\n"
+        "            )\n"
         "        self.decode_l3_receivers = {}\n"
         "        self.decode_l3_reverse_pending = set()\n"
         "        self.decode_l3_reverse_done = set()\n"
@@ -1819,25 +2976,31 @@ def patch_mooncake_decode_l3_reverse(path: Path) -> None:
         "        candidate_tokens = max(0, len(token_ids) - 1)\n"
         "        candidate_tokens -= candidate_tokens % page_size\n"
         "        read_start = time.perf_counter()\n"
+        "        lustre_read_s = 0.0\n"
+        "        scatter_s = 0.0\n"
         "        hit_tokens = 0\n"
         "        prior_hash = None\n"
         "        target = self.decode_host_staging_pool.get_dummy_flat_data_page()\n"
         "        for offset in range(0, candidate_tokens, page_size):\n"
         "            page_tokens = token_ids[offset : offset + page_size]\n"
         "            page_hash = get_hash_str(page_tokens, prior_hash=prior_hash)\n"
+        "            lustre_start = time.perf_counter()\n"
         "            data_page = self.decode_l3_storage_backend.get(page_hash, target)\n"
+        "            lustre_read_s += time.perf_counter() - lustre_start\n"
         "            if data_page is None:\n"
         "                break\n"
+        "            scatter_start = time.perf_counter()\n"
         "            self.decode_host_staging_pool.set_from_flat_data_page(\n"
         "                int(host_token_indices[offset]), data_page\n"
         "            )\n"
+        "            scatter_s += time.perf_counter() - scatter_start\n"
         "            hit_tokens += page_size\n"
         "            prior_hash = page_hash\n"
         "        read_end = time.perf_counter()\n"
         "        logger.info(\n"
         "            \"DUALPATH_DECODE_L3_READ rid=%s decode_engine=%s \"\n"
         "            \"node=%s tp_rank=%d read_start=%.9f read_end=%.9f \"\n"
-        "            \"read_s=%.9f tokens=%d\",\n"
+        "            \"read_s=%.9f lustre_read_s=%.9f scatter_s=%.9f tokens=%d\",\n"
         "            request_id,\n"
         "            os.environ.get(\"DECODE_ID\", \"0\"),\n"
         "            os.environ.get(\n"
@@ -1847,6 +3010,8 @@ def patch_mooncake_decode_l3_reverse(path: Path) -> None:
         "            read_start,\n"
         "            read_end,\n"
         "            read_end - read_start,\n"
+        "            lustre_read_s,\n"
+        "            scatter_s,\n"
         "            hit_tokens,\n"
         "        )\n"
         "        return hit_tokens\n"
@@ -1971,6 +3136,112 @@ def patch_mooncake_decode_l3_reverse(path: Path) -> None:
         "    def _transfer_data(self, mooncake_session_id, transfer_blocks):\n",
         "read Decode L3 pages and reverse-send them to Prefill",
     )
+    # Replace the old synchronous Decode reader with the shared Prefill
+    # CacheController pipeline. The preceding replacement is retained as the
+    # source anchor for versions of SGLang that have already received the
+    # historical DualPath patch.
+    legacy_start = source.index(
+        "    def load_decode_l3_prefix("
+    )
+    legacy_end = source.index(
+        "    def register_decode_l3_receiver", legacy_start
+    )
+    source = source[:legacy_start] + source[legacy_end:]
+    source = replace_once(
+        source,
+        "    def _transfer_data(self, mooncake_session_id, transfer_blocks):\n",
+        "    def start_decode_l3_prefetch(\n"
+        "        self, request_id, token_ids, host_token_indices\n"
+        "    ):\n"
+        "        if (\n"
+        "            not self.decode_l3_read_path\n"
+        "            or self.decode_l3_prefetch_controller is None\n"
+        "            or not self.decode_host_staging_enabled\n"
+        "        ):\n"
+        "            return None\n"
+        "        page_size = self.decode_host_staging_pool.page_size\n"
+        "        candidate_tokens = max(0, len(token_ids) - 1)\n"
+        "        candidate_tokens -= candidate_tokens % page_size\n"
+        "        if candidate_tokens < page_size:\n"
+        "            return None\n"
+        "        controller = self.decode_l3_prefetch_controller\n"
+        "        if controller.prefetch_rate_limited():\n"
+        "            return None\n"
+        "        operation = controller.prefetch(\n"
+        "            request_id,\n"
+        "            host_token_indices[:candidate_tokens],\n"
+        "            token_ids[:candidate_tokens],\n"
+        "            last_hash=None,\n"
+        "            prefix_keys=None,\n"
+        "            retain_host_indices=True,\n"
+        "        )\n"
+        "        controller.prefetch_tokens_occupied += candidate_tokens\n"
+        "        return operation\n"
+        "\n"
+        "    def poll_decode_l3_prefetch(self, operation):\n"
+        "        controller = self.decode_l3_prefetch_controller\n"
+        "        if operation is None or controller is None:\n"
+        "            return True, 0\n"
+        "        if not controller.shared_prefetch_can_terminate(\n"
+        "            operation, stop_policy=\"wait_complete\"\n"
+        "        ):\n"
+        "            return False, 0\n"
+        "        completed_tokens, _ = controller.shared_prefetch_finish(operation)\n"
+        "        if operation.revoked:\n"
+        "            try:\n"
+        "                controller.prefetch_revoke_queue.get_nowait()\n"
+        "            except Exception:\n"
+        "                pass\n"
+        "        controller.drain_shared_prefetch_releases()\n"
+        "        controller.prefetch_tokens_occupied = max(\n"
+        "            0, controller.prefetch_tokens_occupied - len(operation.token_ids)\n"
+        "        )\n"
+        "        return True, completed_tokens\n"
+        "\n"
+        "    def cancel_decode_l3_prefetch(\n"
+        "        self, operation, host_token_indices\n"
+        "    ):\n"
+        "        \"\"\"Cancel like Prefill without blocking the scheduler thread.\"\"\"\n"
+        "        if operation is None or self.decode_l3_prefetch_controller is None:\n"
+        "            if host_token_indices is not None:\n"
+        "                self.release_decode_host_staging(host_token_indices)\n"
+        "            return\n"
+        "        operation.mark_terminate()\n"
+        "        self.decode_l3_cancelled_prefetch.append(\n"
+        "            (operation, host_token_indices)\n"
+        "        )\n"
+        "\n"
+        "    def drain_decode_l3_prefetch_cancellations(self):\n"
+        "        if not self.decode_l3_cancelled_prefetch:\n"
+        "            return\n"
+        "        controller = self.decode_l3_prefetch_controller\n"
+        "        pending = []\n"
+        "        for operation, host_token_indices in (\n"
+        "            self.decode_l3_cancelled_prefetch\n"
+        "        ):\n"
+        "            if not operation.io_complete.is_set():\n"
+        "                pending.append((operation, host_token_indices))\n"
+        "                continue\n"
+        "            controller.prefetch_tokens_occupied = max(\n"
+        "                0,\n"
+        "                controller.prefetch_tokens_occupied\n"
+        "                - len(operation.token_ids),\n"
+        "            )\n"
+        "            if operation.revoked:\n"
+        "                try:\n"
+        "                    controller.prefetch_revoke_queue.get_nowait()\n"
+        "                except Exception:\n"
+        "                    pass\n"
+        "            if host_token_indices is not None:\n"
+        "                self.release_decode_host_staging(host_token_indices)\n"
+        "        self.decode_l3_cancelled_prefetch = pending\n"
+        "\n"
+        "    def decode_l3_prefetch_cancel_pending(self):\n"
+        "        return bool(self.decode_l3_cancelled_prefetch)\n"
+        "\n"
+        "    def _transfer_data(self, mooncake_session_id, transfer_blocks):\n",
+        "use shared Prefill async prefetch for Decode L3 staging",
+    )
     source = replace_once(
         source,
         "                waiting_req_bytes = self.server_socket.recv_multipart()\n"
@@ -2064,54 +3335,147 @@ def patch_mooncake_decode_l3_reverse(path: Path) -> None:
         source,
         "        self.host_staging_h2d_start = None\n"
         "        self.host_staging_h2d_end = None\n"
+        "        self.decode_l3_bootstrap_sent = False\n"
         "        super().__init__(mgr, bootstrap_addr, bootstrap_room, prefill_dp_rank)\n",
         "        self.host_staging_h2d_start = None\n"
         "        self.host_staging_h2d_end = None\n"
+        "        self.dualpath_scheduler_prefetch_supported = True\n"
         "        self.host_staging_page_indices = np.array([], dtype=np.int32)\n"
+        "        self.decode_l3_bootstrap_sent = False\n"
         "        self.decode_l3_hit_tokens = 0\n"
+        "        self.dualpath_prefetch_timing = {}\n"
         "        super().__init__(mgr, bootstrap_addr, bootstrap_room, prefill_dp_rank)\n",
         "initialize Decode L3 receiver state",
     )
-    source = replace_once(
-        source,
-        "        state_indices: Optional[List[int]] = None,\n"
-        "    ):\n"
-        "        if self.kv_mgr.decode_host_staging_enabled:\n"
-        "            self.kv_indices = np.array(kv_indices, dtype=np.int64, copy=True)\n"
-        "            (\n"
-        "                self.host_staging_token_indices,\n"
-        "                kv_indices,\n"
-        "            ) = self.kv_mgr.allocate_decode_host_staging(self.kv_indices)\n",
-        "        state_indices: Optional[List[int]] = None,\n"
-        "        token_ids: Optional[List[int]] = None,\n"
-        "        request_id: Optional[str] = None,\n"
-        "    ):\n"
-        "        if self.kv_mgr.decode_host_staging_enabled:\n"
-        "            self.kv_indices = np.array(kv_indices, dtype=np.int64, copy=True)\n"
-        "            (\n"
-        "                self.host_staging_token_indices,\n"
-        "                kv_indices,\n"
-        "            ) = self.kv_mgr.allocate_decode_host_staging(self.kv_indices)\n"
-        "            self.host_staging_page_indices = np.array(\n"
-        "                kv_indices, dtype=np.int32, copy=True\n"
-        "            )\n"
-        "            if token_ids is not None and request_id is not None:\n"
-        "                self.decode_l3_hit_tokens = self.kv_mgr.load_decode_l3_prefix(\n"
-        "                    request_id, token_ids, self.host_staging_token_indices\n"
-        "                )\n"
-        "                self.kv_mgr.register_decode_l3_receiver(\n"
-        "                    self.bootstrap_room, self\n"
-        "                )\n",
-        "load Decode L3 prefix during receiver initialization",
+    receiver_init_start = source.index(
+        "    def init(", source.index("class MooncakeKVReceiver")
     )
-    source = replace_once(
-        source,
-        "                        str(self.required_dst_info_num).encode(\"ascii\"),\n"
-        "                    ]\n",
+    receiver_init_end = source.index("\n    def poll(", receiver_init_start)
+    receiver_init = (
+        "    def init(\n"
+        "        self,\n"
+        "        kv_indices: npt.NDArray[np.int32],\n"
+        "        aux_index: Optional[int] = None,\n"
+        "        state_indices: Optional[List[int]] = None,\n"
+        "        request_id: Optional[str] = None,\n"
+        "        host_staging_token_indices=None,\n"
+        "        host_staging_page_indices=None,\n"
+        "        decode_l3_hit_tokens: int = 0,\n"
+        "        decode_l3_prefetch_timing=None,\n"
+        "    ):\n"
+        "        if self.bootstrap_infos is None:\n"
+        "            self.kv_mgr.record_failure(\n"
+        "                self.bootstrap_room,\n"
+        "                f\"Could not fetch prefill parallel info from bootstrap_addr: {self.bootstrap_addr}\",\n"
+        "            )\n"
+        "            self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)\n"
+        "            return\n"
+        "        self.decode_aux_index = aux_index\n"
+        "        self.decode_state_indices = state_indices\n"
+        "        self.kv_indices = np.array(kv_indices, dtype=np.int64, copy=True)\n"
+        "        if self.kv_mgr.decode_host_staging_enabled:\n"
+        "            if host_staging_token_indices is None:\n"
+        "                raise RuntimeError(\n"
+        "                    \"Decode scheduler did not provide Host staging\"\n"
+        "                )\n"
+        "            self.host_staging_token_indices = host_staging_token_indices\n"
+        "            self.host_staging_page_indices = np.array(\n"
+        "                host_staging_page_indices, dtype=np.int32, copy=True\n"
+        "            )\n"
+        "        self.decode_l3_hit_tokens = int(decode_l3_hit_tokens)\n"
+        "        self.dualpath_prefetch_timing = decode_l3_prefetch_timing or {}\n"
+        "        self.init_time = time.time()\n"
+        "        if request_id is not None:\n"
+        "            self.kv_mgr.register_decode_l3_receiver(\n"
+        "                self.bootstrap_room, self\n"
+        "            )\n"
+        "        self._send_decode_l3_bootstrap()\n"
+        "\n"
+        "    def _send_decode_l3_bootstrap(self):\n"
+        "        if self.decode_l3_bootstrap_sent:\n"
+        "            return\n"
+        "        for bootstrap_info in self.bootstrap_infos:\n"
+        "            sock, lock = self._connect_to_bootstrap_server(bootstrap_info)\n"
+        "            is_dummy = bootstrap_info[\"is_dummy\"]\n"
+        "            with lock:\n"
+        "                sock.send_multipart(\n"
+        "                    [\n"
+        "                        str(self.bootstrap_room).encode(\"ascii\"),\n"
+        "                        self.kv_mgr.local_ip.encode(\"ascii\"),\n"
+        "                        str(self.kv_mgr.rank_port).encode(\"ascii\"),\n"
+        "                        self.session_id.encode(\"ascii\"),\n"
+        "                        (\n"
+        "                            self.host_staging_page_indices.tobytes()\n"
+        "                            if self.kv_mgr.decode_host_staging_enabled\n"
+        "                            else self.kv_indices.tobytes()\n"
+        "                        ) if not is_dummy else b\"\",\n"
+        "                        str(self.decode_aux_index).encode(\"ascii\")\n"
+        "                        if not is_dummy\n"
+        "                        else b\"\",\n"
+        "                        (\n"
+        "                            np.asarray(\n"
+        "                                self.decode_state_indices, dtype=np.int32\n"
+        "                            ).tobytes()\n"
+        "                            if not is_dummy and self.decode_state_indices is not None\n"
+        "                            else b\"\"\n"
+        "                        ),\n"
         "                        str(self.required_dst_info_num).encode(\"ascii\"),\n"
         "                        str(self.decode_l3_hit_tokens).encode(\"ascii\"),\n"
-        "                    ]\n",
-        "send Decode L3 hit tokens to Prefill",
+        "                    ]\n"
+        "                )\n"
+        "        self.decode_l3_bootstrap_sent = True\n"
+    )
+    source = (
+        source[:receiver_init_start]
+        + receiver_init
+        + source[receiver_init_end:]
+    )
+    poll_start = source.index(
+        "    def poll(self) -> KVPoll:",
+        source.index("class MooncakeKVReceiver"),
+    )
+    poll_end = source.index("\n    def clear(self) -> None:", poll_start)
+    source = (
+        source[:poll_start]
+        + "    def poll(self) -> KVPoll:\n"
+        + "        if self.conclude_state is None:\n"
+        + "            status = self.kv_mgr.check_status(self.bootstrap_room)\n"
+        + "            if status in (KVPoll.Success, KVPoll.Failed):\n"
+        + "                if (\n"
+        + "                    status == KVPoll.Success\n"
+        + "                    and self.kv_mgr.decode_host_staging_enabled\n"
+        + "                    and self.host_staging_h2d_end is None\n"
+        + "                ):\n"
+        + "                    (\n"
+        + "                        self.host_staging_h2d_start,\n"
+        + "                        self.host_staging_h2d_end,\n"
+        + "                    ) = self.kv_mgr.stage_received_kv_to_device(\n"
+        + "                        self.host_staging_token_indices,\n"
+        + "                        self.kv_indices,\n"
+        + "                    )\n"
+        + "                    self.kv_mgr.release_decode_host_staging(\n"
+        + "                        self.host_staging_token_indices\n"
+        + "                    )\n"
+        + "                    self.host_staging_token_indices = None\n"
+        + "                self.conclude_state = status\n"
+        + "            elif status == KVPoll.WaitingForInput:\n"
+        + "                if self.init_time is not None:\n"
+        + "                    now = time.time()\n"
+        + "                    elapsed = now - self.init_time\n"
+        + "                    if elapsed >= self.kv_mgr.waiting_timeout:\n"
+        + "                        logger.warning_once(\n"
+        + "                            \"Some requests fail to receive KV Cache transfer done signal after bootstrapping. \"\n"
+        + "                            \"If a greater mean TTFT is acceptable, you can 'export SGLANG_DISAGGREGATION_WAITING_TIMEOUT=600' (10 minutes) to relax the timeout condition. \"\n"
+        + "                        )\n"
+        + "                        self.kv_mgr.record_failure(\n"
+        + "                            self.bootstrap_room,\n"
+        + "                            f\"Request {self.bootstrap_room} timed out after {elapsed:.1f}s in KVPoll.WaitingForInput\",\n"
+        + "                        )\n"
+        + "                        self.conclude_state = KVPoll.Failed\n"
+        + "                        return KVPoll.Failed\n"
+        + "            return status\n"
+        + "        return self.conclude_state\n"
+        + source[poll_end:]
     )
     source = replace_once(
         source,
@@ -2217,6 +3581,10 @@ def patch_decode_owns_l3_offload(path: Path) -> None:
         "            )\n"
         "            self._dualpath_mark_l3_complete(req.rid)\n"
         "            self._release_finished_req(req, 0)\n"
+        "            if hasattr(self.tree_cache, \"dualpath_drop_request_cache\"):\n"
+        "                self.tree_cache.dualpath_drop_request_cache(\n"
+        "                    getattr(req, \"last_node\", None)\n"
+        "                )\n"
         "            return True\n",
         "release Decode HBM when no complete new page exists",
     )
@@ -2251,6 +3619,7 @@ def patch_decode_owns_l3_offload(path: Path) -> None:
         "                start_time,\n"
         "                offload_start,\n"
         "                offload_tokens,\n"
+        "                cache_node,\n"
         "            ) = self.ongoing_backup.pop(ack_id)\n"
         "\n"
         "            logger.info(\n"
@@ -2261,6 +3630,8 @@ def patch_decode_owns_l3_offload(path: Path) -> None:
         "                offload_tokens,\n"
         "            )\n"
         "            self._dualpath_mark_l3_complete(req_id)\n"
+        "            if hasattr(self.tree_cache, \"dualpath_drop_request_cache\"):\n"
+        "                self.tree_cache.dualpath_drop_request_cache(cache_node)\n"
         "            # Release host memory\n",
         "record Decode L3 backup completion",
     )
@@ -2273,9 +3644,970 @@ def patch_decode_owns_l3_offload(path: Path) -> None:
         "            start_time,\n"
         "            prefill_offloaded_len,\n"
         "            len(incremental_tokens),\n"
+        "            getattr(req, \"last_node\", None),\n"
         "        )\n",
         "retain Decode offload range until L3 completion",
     )
+    source = replace_once(
+        source,
+        "        self.tree_cache.protected_size_ -= len(req.prefix_indices)\n",
+        "        # Keep this request's radix node protected until the Lustre\n"
+        "        # backup ACK; the ACK handler removes it and decrements the\n"
+        "        # lock exactly once.\n",
+        "defer Decode radix release until durable backup",
+    )
+    path.write_text(source)
+    print(f"Patched: {path}")
+
+
+def patch_ttft_v3_cache_controller(path: Path) -> None:
+    source = path.read_text()
+    marker = "DUALPATH_TTFT_V3_CACHE_CONTROLLER"
+    if marker in source:
+        print(f"Already patched: {path}")
+        return
+    source = replace_once(
+        source,
+        "device_module = get_device_module()\n",
+        "device_module = get_device_module()\n"
+        "\n"
+        "# DUALPATH_TTFT_V3_CACHE_CONTROLLER\n"
+        "from sglang.srt.utils.dualpath_ttft import (\n"
+        "    DETAIL as DUALPATH_TTFT_DETAIL,\n"
+        "    ENABLED as DUALPATH_TTFT_ENABLED,\n"
+        "    new_cuda_event as dualpath_new_cuda_event,\n"
+        "    now_ns as dualpath_now_ns,\n"
+        ")\n",
+        "import TTFT V3 cache helpers",
+    )
+    source = replace_once(
+        source,
+        "        self.start_event = device_module.Event()  # start event on controller stream\n",
+        "        self.start_event = device_module.Event()  # start event on controller stream\n"
+        "        if DUALPATH_TTFT_ENABLED:\n"
+        "            self.dualpath_start_event = dualpath_new_cuda_event(device_module)\n"
+        "            self.dualpath_finish_event = dualpath_new_cuda_event(device_module)\n",
+        "create constant-count H2D timing events",
+    )
+    source = replace_once(
+        source,
+        "    def complete(self, layer_index: int):\n"
+        "        assert 0 <= layer_index < self._num_layers\n"
+        "        self.load_events[layer_index].record()\n",
+        "    def complete(self, layer_index: int):\n"
+        "        assert 0 <= layer_index < self._num_layers\n"
+        "        self.load_events[layer_index].record()\n"
+        "        if (\n"
+        "            layer_index == self._num_layers - 1\n"
+        "            and getattr(self, \"dualpath_finish_event\", None) is not None\n"
+        "        ):\n"
+        "            self.dualpath_finish_event.record()\n",
+        "finish aggregate H2D timing on the existing load stream",
+    )
+    source = replace_once(
+        source,
+        "            producer_event.start_event.wait(self.load_stream)\n"
+        "            for i in range(self.layer_num):\n",
+        "            producer_event.start_event.wait(self.load_stream)\n"
+        "            if getattr(producer_event, \"dualpath_start_event\", None) is not None:\n"
+        "                producer_event.dualpath_start_event.record(self.load_stream)\n"
+        "            for i in range(self.layer_num):\n",
+        "record aggregate H2D start on the existing stream",
+    )
+    source = replace_once(
+        source,
+        "        return producer_id\n"
+        "\n"
+        "    def evict_device",
+        "        return producer_id\n"
+        "\n"
+        "    def dualpath_loading_timing_events(self, producer_id: int):\n"
+        "        if not DUALPATH_TTFT_ENABLED or producer_id < 0:\n"
+        "            return None, None\n"
+        "        event = self.layer_done_counter.events[producer_id]\n"
+        "        return event.dualpath_start_event, event.dualpath_finish_event\n"
+        "\n"
+        "    def evict_device",
+        "expose aggregate H2D events without synchronization",
+    )
+    source = replace_once(
+        source,
+        "        self.dualpath_read_start = None\n"
+        "        self.dualpath_read_end = None\n"
+        "        self.dualpath_lustre_read_s = 0.0\n"
+        "        self.dualpath_scatter_s = 0.0\n"
+        "\n"
+        "        super().__init__(host_indices, token_ids, last_hash, prefix_keys=prefix_keys)\n",
+        "        if DUALPATH_TTFT_DETAIL:\n"
+        "            self.dualpath_read_start = None\n"
+        "            self.dualpath_read_end = None\n"
+        "            self.dualpath_lustre_read_s = 0.0\n"
+        "            self.dualpath_scatter_s = 0.0\n"
+        "        if DUALPATH_TTFT_ENABLED:\n"
+        "            self.dualpath_before_read_start_ns = 0\n"
+        "            self.dualpath_before_read_end_ns = 0\n"
+        "            self.dualpath_lustre_read_ns = 0\n"
+        "            self.dualpath_scatter_ns = 0\n"
+        "            self.dualpath_read_pages = 0\n"
+        "\n"
+        "        super().__init__(host_indices, token_ids, last_hash, prefix_keys=prefix_keys)\n"
+        "\n"
+        "    def dualpath_timing_snapshot(self):\n"
+        "        if not DUALPATH_TTFT_ENABLED:\n"
+        "            return {}\n"
+        "        return {\n"
+        "            \"before_read_start_ns\": self.dualpath_before_read_start_ns,\n"
+        "            \"before_read_end_ns\": self.dualpath_before_read_end_ns,\n"
+        "            \"before_read_ns\": max(\n"
+        "                0,\n"
+        "                self.dualpath_before_read_end_ns\n"
+        "                - self.dualpath_before_read_start_ns,\n"
+        "            ),\n"
+        "            \"lustre_read_ns\": self.dualpath_lustre_read_ns,\n"
+        "            \"scatter_ns\": self.dualpath_scatter_ns,\n"
+        "            \"pages\": self.dualpath_read_pages,\n"
+        "            \"tokens\": self.completed_tokens,\n"
+        "            \"revoked\": self.revoked,\n"
+        "        }\n",
+        "add request-scoped prefetch timing snapshot",
+    )
+    generic_body = '''    def _generic_page_get(self, operation, hash_values, host_indices, extra_info=None):
+        # DUALPATH_O_DIRECT_REUSABLE_PAGE and TTFT V3: file reads remain
+        # synchronous. Timing uses integer nanosecond accumulators and never
+        # logs in the page or storage-batch loop.
+        if DUALPATH_TTFT_DETAIL and operation.dualpath_read_start is None:
+            operation.dualpath_read_start = time.perf_counter()
+        if getattr(self.storage_backend, "dualpath_o_direct_read", False):
+            data_page = getattr(self, "_dualpath_o_direct_page_buffer", None)
+            if data_page is None:
+                data_page = self.mem_pool_host.get_dummy_flat_data_page()
+                alignment = getattr(
+                    self.storage_backend, "dualpath_o_direct_alignment", 4096
+                )
+                if data_page.data_ptr() % alignment:
+                    element_size = data_page.element_size()
+                    extra_elements = (alignment + element_size - 1) // element_size
+                    owner = torch.empty(
+                        data_page.numel() + extra_elements,
+                        dtype=data_page.dtype,
+                        device=data_page.device,
+                        pin_memory=data_page.is_pinned(),
+                    )
+                    offset_bytes = (-owner.data_ptr()) % alignment
+                    if offset_bytes % element_size:
+                        raise RuntimeError("Cannot align O_DIRECT Prefill page buffer")
+                    offset = offset_bytes // element_size
+                    data_page = owner[offset : offset + data_page.numel()]
+                    self._dualpath_o_direct_page_buffer_owner = owner
+                self._dualpath_o_direct_page_buffer = data_page
+
+            for i, hash_value in enumerate(hash_values):
+                read_start_ns = dualpath_now_ns() if DUALPATH_TTFT_ENABLED else 0
+                page_data = self.storage_backend.get(hash_value, data_page)
+                if DUALPATH_TTFT_ENABLED:
+                    operation.dualpath_lustre_read_ns += (
+                        dualpath_now_ns() - read_start_ns
+                    )
+                if page_data is None:
+                    logger.warning(
+                        "Prefetch operation %s failed to retrieve page %s.",
+                        operation.request_id,
+                        hash_value,
+                    )
+                    break
+                scatter_start_ns = dualpath_now_ns() if DUALPATH_TTFT_ENABLED else 0
+                self.mem_pool_host.set_from_flat_data_page(
+                    host_indices[i * self.page_size], page_data
+                )
+                if DUALPATH_TTFT_ENABLED:
+                    operation.dualpath_scatter_ns += (
+                        dualpath_now_ns() - scatter_start_ns
+                    )
+                    operation.dualpath_read_pages += 1
+                if not operation.increment(self.page_size):
+                    break
+            if DUALPATH_TTFT_DETAIL:
+                operation.dualpath_read_end = time.perf_counter()
+                operation.dualpath_lustre_read_s = (
+                    operation.dualpath_lustre_read_ns / 1_000_000_000.0
+                    if DUALPATH_TTFT_ENABLED else 0.0
+                )
+                operation.dualpath_scatter_s = (
+                    operation.dualpath_scatter_ns / 1_000_000_000.0
+                    if DUALPATH_TTFT_ENABLED else 0.0
+                )
+            return
+
+        dummy_page_dst = [
+            self.mem_pool_host.get_dummy_flat_data_page() for _ in hash_values
+        ]
+        read_start_ns = dualpath_now_ns() if DUALPATH_TTFT_ENABLED else 0
+        page_data = self.storage_backend.batch_get(hash_values, dummy_page_dst)
+        if DUALPATH_TTFT_ENABLED:
+            operation.dualpath_lustre_read_ns += dualpath_now_ns() - read_start_ns
+        if page_data is None:
+            if DUALPATH_TTFT_DETAIL:
+                operation.dualpath_read_end = time.perf_counter()
+            return
+        for i in range(len(hash_values)):
+            if page_data[i] is None:
+                logger.warning(
+                    "Prefetch operation %s failed to retrieve page %s.",
+                    operation.request_id,
+                    hash_values[i],
+                )
+                break
+            scatter_start_ns = dualpath_now_ns() if DUALPATH_TTFT_ENABLED else 0
+            self.mem_pool_host.set_from_flat_data_page(
+                host_indices[i * self.page_size], page_data[i]
+            )
+            if DUALPATH_TTFT_ENABLED:
+                operation.dualpath_scatter_ns += dualpath_now_ns() - scatter_start_ns
+                operation.dualpath_read_pages += 1
+            if not operation.increment(self.page_size):
+                break
+        if DUALPATH_TTFT_DETAIL:
+            operation.dualpath_read_end = time.perf_counter()
+            operation.dualpath_lustre_read_s = (
+                operation.dualpath_lustre_read_ns / 1_000_000_000.0
+                if DUALPATH_TTFT_ENABLED else 0.0
+            )
+            operation.dualpath_scatter_s = (
+                operation.dualpath_scatter_ns / 1_000_000_000.0
+                if DUALPATH_TTFT_ENABLED else 0.0
+            )
+'''
+    source = replace_function(
+        source,
+        "    def _generic_page_get(self, operation, hash_values, host_indices, extra_info=None):\n",
+        generic_body,
+        "replace generic page reader with aggregate V3 timing",
+    )
+    source = replace_once(
+        source,
+        "                operation = self.prefetch_queue.get(block=True, timeout=1)\n"
+        "                if operation is None:\n"
+        "                    continue\n"
+        "\n"
+        "                hash_value, storage_hit_count = self._storage_hit_query(operation)\n",
+        "                operation = self.prefetch_queue.get(block=True, timeout=1)\n"
+        "                if operation is None:\n"
+        "                    continue\n"
+        "                if DUALPATH_TTFT_ENABLED:\n"
+        "                    operation.dualpath_before_read_start_ns = dualpath_now_ns()\n"
+        "\n"
+        "                hash_value, storage_hit_count = self._storage_hit_query(operation)\n",
+        "start pre-read timing after worker dequeue",
+    )
+    source = replace_once(
+        source,
+        "                    storage_hit_count = storage_hit_count_tensor.item()\n"
+        "                operation.query_complete = True\n",
+        "                    storage_hit_count = storage_hit_count_tensor.item()\n"
+        "                if DUALPATH_TTFT_ENABLED:\n"
+        "                    operation.dualpath_before_read_end_ns = dualpath_now_ns()\n"
+        "                operation.query_complete = True\n",
+        "finish pre-read timing after TP hit consensus",
+    )
+    source = gate_logger_call(source, "DUALPATH_DECODE_L3_READ rid=%s")
+    path.write_text(source)
+    print(f"Patched: {path}")
+
+
+def patch_ttft_v3_hiradix(path: Path) -> None:
+    source = path.read_text()
+    marker = "DUALPATH_TTFT_V3_HIRADIX"
+    if marker in source:
+        print(f"Already patched: {path}")
+        return
+    source = replace_once(
+        source,
+        "logger = logging.getLogger(__name__)\n",
+        "logger = logging.getLogger(__name__)\n"
+        "\n"
+        "# DUALPATH_TTFT_V3_HIRADIX\n"
+        "from sglang.srt.utils.dualpath_ttft import (\n"
+        "    DETAIL as DUALPATH_TTFT_DETAIL,\n"
+        "    ENABLED as DUALPATH_TTFT_ENABLED,\n"
+        ")\n",
+        "import TTFT V3 radix helpers",
+    )
+    source = replace_once(
+        source,
+        "        self.dualpath_prefetch_start = {}\n"
+        "        self.dualpath_prefetch_local_end = {}\n"
+        "        self.ongoing_backup = {}\n",
+        "        if DUALPATH_TTFT_DETAIL:\n"
+        "            self.dualpath_prefetch_start = {}\n"
+        "            self.dualpath_prefetch_local_end = {}\n"
+        "        if DUALPATH_TTFT_ENABLED:\n"
+        "            self.dualpath_completed_prefetch_timing = {}\n"
+        "        self.ongoing_backup = {}\n",
+        "initialize Prefill timing handoff only when enabled",
+    )
+    source = replace_once(
+        source,
+        "        self.dualpath_prefetch_start[req_id] = time.perf_counter()\n"
+        "        operation = self.cache_controller.prefetch(\n",
+        "        if DUALPATH_TTFT_DETAIL:\n"
+        "            self.dualpath_prefetch_start[req_id] = time.perf_counter()\n"
+        "        operation = self.cache_controller.prefetch(\n",
+        "avoid legacy Prefill timing state when detail is disabled",
+    )
+    source = replace_once(
+        source,
+        "            self.dualpath_prefetch_start.pop(req_id, None)\n"
+        "            self.dualpath_prefetch_local_end.pop(req_id, None)\n",
+        "            if DUALPATH_TTFT_DETAIL:\n"
+        "                self.dualpath_prefetch_start.pop(req_id, None)\n"
+        "                self.dualpath_prefetch_local_end.pop(req_id, None)\n",
+        "avoid legacy revoke timing when detail is disabled",
+    )
+    source = replace_once(
+        source,
+        "        if (\n"
+        "            operation.completed_tokens == len(operation.hash_value) * self.page_size\n",
+        "        if (\n"
+        "            DUALPATH_TTFT_DETAIL\n"
+        "            and operation.completed_tokens == len(operation.hash_value) * self.page_size\n",
+        "gate legacy local completion timing",
+    )
+    source = replace_once(
+        source,
+        "            info = self.ongoing_prefetch.pop(req_id, None)\n"
+        "            if info is not None:\n"
+        "                last_host_node, token_ids, _, _ = info\n",
+        "            info = self.ongoing_prefetch.pop(req_id, None)\n"
+        "            if info is not None:\n"
+        "                last_host_node, token_ids, _, operation = info\n"
+        "                if DUALPATH_TTFT_ENABLED:\n"
+        "                    self.dualpath_completed_prefetch_timing[req_id] = (\n"
+        "                        operation.dualpath_timing_snapshot()\n"
+        "                    )\n",
+        "preserve revoked Prefill pre-read timing",
+    )
+    source = replace_once(
+        source,
+        "        logger.debug(f\"Prefetch {req_id} completed with {completed_tokens} tokens\")\n"
+        "        dualpath_start = self.dualpath_prefetch_start.pop(req_id, None)\n",
+        "        logger.debug(f\"Prefetch {req_id} completed with {completed_tokens} tokens\")\n"
+        "        if DUALPATH_TTFT_ENABLED:\n"
+        "            self.dualpath_completed_prefetch_timing[req_id] = (\n"
+        "                operation.dualpath_timing_snapshot()\n"
+        "            )\n"
+        "        dualpath_start = (\n"
+        "            self.dualpath_prefetch_start.pop(req_id, None)\n"
+        "            if DUALPATH_TTFT_DETAIL\n"
+        "            else None\n"
+        "        )\n",
+        "preserve completed Prefill prefetch timing",
+    )
+    source = replace_once(
+        source,
+        "    def load_back(\n"
+        "        self, node: TreeNode, mem_quota: Optional[int] = None\n"
+        "    ) -> Optional[torch.Tensor]:\n",
+        "    def dualpath_pop_prefetch_timing(self, request_id: str):\n"
+        "        if not DUALPATH_TTFT_ENABLED:\n"
+        "            return {}\n"
+        "        return self.dualpath_completed_prefetch_timing.pop(request_id, {})\n"
+        "\n"
+        "    def load_back(\n"
+        "        self, node: TreeNode, mem_quota: Optional[int] = None\n"
+        "    ) -> Optional[torch.Tensor]:\n",
+        "expose one-shot Prefill timing handoff",
+    )
+    source = gate_logger_call(source, "DUALPATH_L3_TIMING rid=%s")
+    path.write_text(source)
+    print(f"Patched: {path}")
+
+
+def patch_ttft_v3_scheduler(path: Path) -> None:
+    source = path.read_text()
+    marker = "DUALPATH_TTFT_V3_SCHEDULER"
+    if marker in source:
+        print(f"Already patched: {path}")
+        return
+    source = replace_once(
+        source,
+        "logger = logging.getLogger(__name__)\n",
+        "logger = logging.getLogger(__name__)\n"
+        "\n"
+        "# DUALPATH_TTFT_V3_SCHEDULER\n"
+        "from sglang.srt.utils.dualpath_ttft import (\n"
+        "    DETAIL as DUALPATH_TTFT_DETAIL,\n"
+        "    ENABLED as DUALPATH_TTFT_ENABLED,\n"
+        "    new_cuda_event as dualpath_new_cuda_event,\n"
+        ")\n",
+        "import TTFT V3 scheduler helpers",
+    )
+    source = replace_once(
+        source,
+        "        new_batch.prepare_for_extend()\n"
+        "\n"
+        "        # Mixed-style chunked prefill\n",
+        "        if DUALPATH_TTFT_ENABLED:\n"
+        "            if self.enable_hierarchical_cache:\n"
+        "                new_batch.dualpath_h2d_events = (\n"
+        "                    self.tree_cache.cache_controller.dualpath_loading_timing_events(\n"
+        "                        new_batch.hicache_consumer_index\n"
+        "                    )\n"
+        "                )\n"
+        "            else:\n"
+        "                new_batch.dualpath_h2d_events = (None, None)\n"
+        "            if hasattr(self.tree_cache, \"dualpath_pop_prefetch_timing\"):\n"
+        "                for dualpath_req in can_run_list:\n"
+        "                    dualpath_req.dualpath_prefetch_timing = (\n"
+        "                        self.tree_cache.dualpath_pop_prefetch_timing(\n"
+        "                            dualpath_req.rid\n"
+        "                        )\n"
+        "                    )\n"
+        "        new_batch.prepare_for_extend()\n"
+        "\n"
+        "        # Mixed-style chunked prefill\n",
+        "associate H2D and prefetch timing with the EXTEND batch",
+    )
+    source = replace_once(
+        source,
+        "        # Run forward\n"
+        "        if self.is_generation:\n",
+        "        # Run forward\n"
+        "        if DUALPATH_TTFT_ENABLED and batch.forward_mode == ForwardMode.EXTEND:\n"
+        "            batch.dualpath_compute_start_event = dualpath_new_cuda_event(\n"
+        "                self.device_module\n"
+        "            )\n"
+        "            batch.dualpath_compute_end_event = dualpath_new_cuda_event(\n"
+        "                self.device_module\n"
+        "            )\n"
+        "            dualpath_compute_stream = (\n"
+        "                self.forward_stream if self.enable_overlap else self.default_stream\n"
+        "            )\n"
+        "            batch.dualpath_compute_start_event.record(dualpath_compute_stream)\n"
+        "        if self.is_generation:\n",
+        "record one Prefill computation start event",
+    )
+    source = replace_once(
+        source,
+        "        # Capture prefill end time for EXTEND mode\n"
+        "        if batch.forward_mode == ForwardMode.EXTEND:\n",
+        "        if DUALPATH_TTFT_ENABLED and batch.forward_mode == ForwardMode.EXTEND:\n"
+        "            dualpath_compute_stream = (\n"
+        "                self.forward_stream if self.enable_overlap else self.default_stream\n"
+        "            )\n"
+        "            if getattr(ret, \"delay_sample_func\", None) is None:\n"
+        "                batch.dualpath_compute_end_event.record(dualpath_compute_stream)\n"
+        "            else:\n"
+        "                ret.dualpath_delayed_compute_end_event = (\n"
+        "                    batch.dualpath_compute_end_event\n"
+        "                )\n"
+        "            ret.dualpath_compute_events = (\n"
+        "                batch.dualpath_compute_start_event,\n"
+        "                batch.dualpath_compute_end_event,\n"
+        "            )\n"
+        "            ret.dualpath_h2d_events = batch.dualpath_h2d_events\n"
+        "\n"
+        "        # Capture prefill end time for EXTEND mode\n"
+        "        if batch.forward_mode == ForwardMode.EXTEND:\n",
+        "record one Prefill computation end event",
+    )
+    source = replace_once(
+        source,
+        "            _batch_result = batch_result.delay_sample_func()\n"
+        "            assert _batch_result is batch_result\n",
+        "            _batch_result = batch_result.delay_sample_func()\n"
+        "            assert _batch_result is batch_result\n"
+        "            if DUALPATH_TTFT_ENABLED and hasattr(\n"
+        "                batch_result, \"dualpath_delayed_compute_end_event\"\n"
+        "            ):\n"
+        "                batch_result.dualpath_delayed_compute_end_event.record(\n"
+        "                    self.forward_stream\n"
+        "                )\n",
+        "include delayed first-token sampling in Prefill computation",
+    )
+    source = gate_logger_call(source, "DUALPATH_PREFILL_PREP_BREAKDOWN rid=%s")
+    path.write_text(source)
+    print(f"Patched: {path}")
+
+
+def patch_ttft_v3_prefill(path: Path) -> None:
+    source = path.read_text()
+    marker = "DUALPATH_TTFT_V3_PREFILL"
+    if marker in source:
+        print(f"Already patched: {path}")
+        return
+    source = replace_once(
+        source,
+        "logger = logging.getLogger(__name__)\n",
+        "logger = logging.getLogger(__name__)\n"
+        "\n"
+        "# DUALPATH_TTFT_V3_PREFILL\n"
+        "from sglang.srt.utils.dualpath_ttft import (\n"
+        "    DETAIL as DUALPATH_TTFT_DETAIL,\n"
+        "    ENABLED as DUALPATH_TTFT_ENABLED,\n"
+        "    emit as dualpath_ttft_emit,\n"
+        "    event_overlap_seconds as dualpath_event_overlap_seconds,\n"
+        "    event_seconds as dualpath_event_seconds,\n"
+        "    now_ns as dualpath_now_ns,\n"
+        "    ns_seconds as dualpath_ns_seconds,\n"
+        ")\n",
+        "import TTFT V3 Prefill helpers",
+    )
+    source = replace_once(
+        source,
+        "        if copy_done is not None:\n"
+        "            copy_done.synchronize()\n"
+        "\n"
+        "        logprob_pt = 0\n",
+        "        if copy_done is not None:\n"
+        "            copy_done.synchronize()\n"
+        "\n"
+        "        if DUALPATH_TTFT_ENABLED:\n"
+        "            dualpath_pipeline_end_ns = dualpath_now_ns()\n"
+        "            dualpath_compute_events = getattr(\n"
+        "                result, \"dualpath_compute_events\", (None, None)\n"
+        "            )\n"
+        "            dualpath_h2d_events = getattr(\n"
+        "                result, \"dualpath_h2d_events\", (None, None)\n"
+        "            )\n"
+        "            for dualpath_req in batch.reqs:\n"
+        "                dualpath_req.dualpath_compute_event_pairs = getattr(\n"
+        "                    dualpath_req, \"dualpath_compute_event_pairs\", []\n"
+        "                )\n"
+        "                dualpath_req.dualpath_compute_event_pairs.append(\n"
+        "                    dualpath_compute_events\n"
+        "                )\n"
+        "                dualpath_req.dualpath_h2d_event_pairs = getattr(\n"
+        "                    dualpath_req, \"dualpath_h2d_event_pairs\", []\n"
+        "                )\n"
+        "                dualpath_req.dualpath_h2d_event_pairs.append(\n"
+        "                    dualpath_h2d_events\n"
+        "                )\n"
+        "                dualpath_req.dualpath_prefill_pipeline_end_ns = (\n"
+        "                    dualpath_pipeline_end_ns\n"
+        "                )\n"
+        "\n"
+        "        logprob_pt = 0\n",
+        "retain completed CUDA event pairs after existing synchronization",
+    )
+    source = replace_once(
+        source,
+        "        if not hasattr(req, \"dualpath_transfer_start\"):\n"
+        "            req.dualpath_transfer_start = time.perf_counter()\n"
+        "            req.dualpath_transfer_logical_tokens = 0\n"
+        "            req.dualpath_transfer_page_count = 0\n"
+        "            req.dualpath_transfer_page_size = page_size\n"
+        "        req.dualpath_transfer_logical_tokens += max(0, end_idx - start_idx)\n"
+        "        req.dualpath_transfer_page_count += len(page_indices)\n",
+        "        if DUALPATH_TTFT_ENABLED or DUALPATH_TTFT_DETAIL:\n"
+        "            if not hasattr(req, \"dualpath_transfer_page_count\"):\n"
+        "                if DUALPATH_TTFT_DETAIL:\n"
+        "                    req.dualpath_transfer_start = time.perf_counter()\n"
+        "                if DUALPATH_TTFT_ENABLED:\n"
+        "                    req.dualpath_transfer_start_ns = dualpath_now_ns()\n"
+        "                req.dualpath_transfer_logical_tokens = 0\n"
+        "                req.dualpath_transfer_page_count = 0\n"
+        "                req.dualpath_transfer_page_size = page_size\n"
+        "            req.dualpath_transfer_logical_tokens += max(0, end_idx - start_idx)\n"
+        "            req.dualpath_transfer_page_count += len(page_indices)\n",
+        "record integer P-to-D transfer start",
+    )
+    source = replace_once(
+        source,
+        "            elif poll == KVPoll.Success:  # transfer done\n"
+        "                dualpath_transfer_end = time.perf_counter()\n",
+        "            elif poll == KVPoll.Success:  # transfer done\n"
+        "                dualpath_transfer_end = (\n"
+        "                    time.perf_counter() if DUALPATH_TTFT_DETAIL else 0.0\n"
+        "                )\n"
+        "                if DUALPATH_TTFT_ENABLED:\n"
+        "                    dualpath_transfer_end_ns = dualpath_now_ns()\n"
+        "                    dualpath_transfer_start_ns = getattr(\n"
+        "                        req,\n"
+        "                        \"dualpath_transfer_start_ns\",\n"
+        "                        dualpath_transfer_end_ns,\n"
+        "                    )\n"
+        "                    dualpath_p2d_raw = dualpath_ns_seconds(\n"
+        "                        dualpath_transfer_end_ns\n"
+        "                        - dualpath_transfer_start_ns\n"
+        "                    )\n"
+        "                    dualpath_pipeline_end_ns = getattr(\n"
+        "                        req,\n"
+        "                        \"dualpath_prefill_pipeline_end_ns\",\n"
+        "                        dualpath_transfer_start_ns,\n"
+        "                    )\n"
+        "                    dualpath_p2d_overlap = dualpath_ns_seconds(\n"
+        "                        min(\n"
+        "                            dualpath_transfer_end_ns,\n"
+        "                            max(\n"
+        "                                dualpath_transfer_start_ns,\n"
+        "                                dualpath_pipeline_end_ns,\n"
+        "                            ),\n"
+        "                        )\n"
+        "                        - dualpath_transfer_start_ns\n"
+        "                    )\n"
+        "                    dualpath_prefetch = getattr(\n"
+        "                        req, \"dualpath_prefetch_timing\", {}\n"
+        "                    )\n"
+        "                    dualpath_h2d_raw = 0.0\n"
+        "                    dualpath_compute_raw = 0.0\n"
+        "                    dualpath_compute_overlap = 0.0\n"
+        "                    dualpath_h2d_pairs = getattr(\n"
+        "                        req, \"dualpath_h2d_event_pairs\", []\n"
+        "                    )\n"
+        "                    dualpath_compute_pairs = getattr(\n"
+        "                        req, \"dualpath_compute_event_pairs\", []\n"
+        "                    )\n"
+        "                    for pair_index, dualpath_compute_pair in enumerate(\n"
+        "                        dualpath_compute_pairs\n"
+        "                    ):\n"
+        "                        dualpath_compute_raw += dualpath_event_seconds(\n"
+        "                            *dualpath_compute_pair\n"
+        "                        )\n"
+        "                        if pair_index < len(dualpath_h2d_pairs):\n"
+        "                            dualpath_h2d_pair = dualpath_h2d_pairs[pair_index]\n"
+        "                            dualpath_h2d_raw += dualpath_event_seconds(\n"
+        "                                *dualpath_h2d_pair\n"
+        "                            )\n"
+        "                            dualpath_compute_overlap += (\n"
+        "                                dualpath_event_overlap_seconds(\n"
+        "                                    *dualpath_h2d_pair,\n"
+        "                                    *dualpath_compute_pair,\n"
+        "                                )\n"
+        "                            )\n"
+        "                    dualpath_ttft_emit(\n"
+        "                        logger,\n"
+        "                        rid=req.rid,\n"
+        "                        side=\"prefill\",\n"
+        "                        tp_rank=self.attn_tp_rank,\n"
+        "                        values={\n"
+        "                            \"prefill_before_lustre_read_raw_seconds\": dualpath_ns_seconds(dualpath_prefetch.get(\"before_read_ns\", 0)),\n"
+        "                            \"prefill_lustre_read_raw_seconds\": dualpath_ns_seconds(dualpath_prefetch.get(\"lustre_read_ns\", 0)),\n"
+        "                            \"prefill_scatter_raw_seconds\": dualpath_ns_seconds(dualpath_prefetch.get(\"scatter_ns\", 0)),\n"
+        "                            \"prefill_host_to_device_raw_seconds\": dualpath_h2d_raw,\n"
+        "                            \"prefill_host_to_device_seconds\": dualpath_h2d_raw,\n"
+        "                            \"prefill_computation_raw_seconds\": dualpath_compute_raw,\n"
+        "                            \"prefill_computation_seconds\": max(0.0, dualpath_compute_raw - dualpath_compute_overlap),\n"
+        "                            \"prefill_computation_overlap_removed_seconds\": dualpath_compute_overlap,\n"
+        "                            \"p_to_d_transfer_raw_seconds\": dualpath_p2d_raw,\n"
+        "                            \"p_to_d_transfer_seconds\": max(0.0, dualpath_p2d_raw - dualpath_p2d_overlap),\n"
+        "                            \"p_to_d_transfer_overlap_removed_seconds\": dualpath_p2d_overlap,\n"
+        "                            \"prefetch_before_read_start_ns\": dualpath_prefetch.get(\"before_read_start_ns\", 0),\n"
+        "                            \"prefetch_before_read_end_ns\": dualpath_prefetch.get(\"before_read_end_ns\", 0),\n"
+        "                            \"p_to_d_start_ns\": dualpath_transfer_start_ns,\n"
+        "                            \"p_to_d_end_ns\": dualpath_transfer_end_ns,\n"
+        "                            \"prefill_pipeline_end_ns\": dualpath_pipeline_end_ns,\n"
+        "                            \"read_tokens\": int(dualpath_prefetch.get(\"tokens\", 0)),\n"
+        "                            \"read_pages\": int(dualpath_prefetch.get(\"pages\", 0)),\n"
+        "                            \"p_to_d_logical_tokens\": int(getattr(req, \"dualpath_transfer_logical_tokens\", 0)),\n"
+        "                            \"p_to_d_pages\": int(getattr(req, \"dualpath_transfer_page_count\", 0)),\n"
+        "                            \"p_to_d_page_size\": int(getattr(req, \"dualpath_transfer_page_size\", 0)),\n"
+        "                            \"p_to_d_page_aligned_tokens\": int(getattr(req, \"dualpath_transfer_page_count\", 0) * getattr(req, \"dualpath_transfer_page_size\", 0)),\n"
+        "                        },\n"
+        "                    )\n",
+        "emit one Prefill TTFT V3 record per request and rank",
+    )
+    for log_marker in (
+        "DUALPATH_TTFT_P_TRANSFER_V2 rid=%s",
+        "DUALPATH_D2P_REVERSE rid=%s",
+    ):
+        source = gate_logger_call(source, log_marker)
+    path.write_text(source)
+    print(f"Patched: {path}")
+
+
+def patch_ttft_v3_mooncake(path: Path) -> None:
+    source = path.read_text()
+    marker = "DUALPATH_TTFT_V3_MOONCAKE"
+    if marker in source:
+        print(f"Already patched: {path}")
+        return
+    source = replace_once(
+        source,
+        "logger = logging.getLogger(__name__)\n",
+        "logger = logging.getLogger(__name__)\n"
+        "\n"
+        "# DUALPATH_TTFT_V3_MOONCAKE\n"
+        "from sglang.srt.utils.dualpath_ttft import (\n"
+        "    DETAIL as DUALPATH_TTFT_DETAIL,\n"
+        "    ENABLED as DUALPATH_TTFT_ENABLED,\n"
+        "    now_ns as dualpath_now_ns,\n"
+        ")\n",
+        "import TTFT V3 Mooncake helpers",
+    )
+    source = replace_once(
+        source,
+        "        self.decode_l3_hit_tokens = 0\n"
+        "        self.dualpath_prefetch_timing = {}\n"
+        "        super().__init__(mgr, bootstrap_addr, bootstrap_room, prefill_dp_rank)\n",
+        "        self.decode_l3_hit_tokens = 0\n"
+        "        self.dualpath_prefetch_timing = {}\n"
+        "        if DUALPATH_TTFT_ENABLED:\n"
+        "            self.dualpath_request_id = None\n"
+        "            self.dualpath_d2p_ns = 0\n"
+        "            self.dualpath_d2p_pages = 0\n"
+        "        super().__init__(mgr, bootstrap_addr, bootstrap_room, prefill_dp_rank)\n",
+        "initialize Decode receiver timing only when enabled",
+    )
+    source = replace_once(
+        source,
+        "        self.decode_aux_index = aux_index\n"
+        "        self.decode_state_indices = state_indices\n",
+        "        self.decode_aux_index = aux_index\n"
+        "        self.decode_state_indices = state_indices\n"
+        "        if DUALPATH_TTFT_ENABLED:\n"
+        "            self.dualpath_request_id = request_id\n",
+        "retain the real request id on Decode",
+    )
+    source = replace_once(
+        source,
+        "        start = time.perf_counter()\n"
+        "        with torch.cuda.stream(self.decode_h2d_stream):\n",
+        "        start = (\n"
+        "            time.perf_counter()\n"
+        "            if DUALPATH_TTFT_ENABLED or DUALPATH_TTFT_DETAIL\n"
+        "            else 0.0\n"
+        "        )\n"
+        "        with torch.cuda.stream(self.decode_h2d_stream):\n",
+        "gate Decode H2D start timing",
+    )
+    source = replace_once(
+        source,
+        "        end = time.perf_counter()\n"
+        "        logger.info(\n"
+        "            \"DUALPATH_DECODE_HOST_STAGING_COPY tp_rank=%d pages=%d \"\n",
+        "        end = (\n"
+        "            time.perf_counter()\n"
+        "            if DUALPATH_TTFT_ENABLED or DUALPATH_TTFT_DETAIL\n"
+        "            else 0.0\n"
+        "        )\n"
+        "        logger.info(\n"
+        "            \"DUALPATH_DECODE_HOST_STAGING_COPY tp_rank=%d pages=%d \"\n",
+        "gate Decode H2D end timing",
+    )
+    source = replace_once(
+        source,
+        "            reverse_start = time.perf_counter()\n"
+        "            if not hasattr(self.kv_args, \"prefill_start_layer\"):\n",
+        "            reverse_start = (\n"
+        "                time.perf_counter() if DUALPATH_TTFT_DETAIL else 0.0\n"
+        "            )\n"
+        "            reverse_start_ns = (\n"
+        "                dualpath_now_ns() if DUALPATH_TTFT_ENABLED else 0\n"
+        "            )\n"
+        "            if not hasattr(self.kv_args, \"prefill_start_layer\"):\n",
+        "start Decode-to-Prefill timing",
+    )
+    source = replace_once(
+        source,
+        "            reverse_end = time.perf_counter()\n"
+        "            status = KVPoll.Success if ret == 0 else KVPoll.Failed\n",
+        "            reverse_end = (\n"
+        "                time.perf_counter() if DUALPATH_TTFT_DETAIL else 0.0\n"
+        "            )\n"
+        "            if DUALPATH_TTFT_ENABLED:\n"
+        "                receiver.dualpath_d2p_ns = dualpath_now_ns() - reverse_start_ns\n"
+        "                receiver.dualpath_d2p_pages = len(dst_indices)\n"
+        "            status = KVPoll.Success if ret == 0 else KVPoll.Failed\n",
+        "finish Decode-to-Prefill timing on the Decode node",
+    )
+    source = replace_once(
+        source,
+        "                \"DUALPATH_DECODE_L3_REVERSE rid_room=%d \"\n"
+        "                \"decode_engine=%s node=%s tp_rank=%d pages=%d \"\n",
+        "                \"DUALPATH_DECODE_L3_REVERSE rid=%s rid_room=%d \"\n"
+        "                \"decode_engine=%s node=%s tp_rank=%d pages=%d \"\n",
+        "add the real rid to the legacy reverse diagnostic",
+    )
+    source = replace_once(
+        source,
+        "                room,\n"
+        "                os.environ.get(\"DECODE_ID\", \"0\"),\n",
+        "                getattr(receiver, \"dualpath_request_id\", None) or str(room),\n"
+        "                room,\n"
+        "                os.environ.get(\"DECODE_ID\", \"0\"),\n",
+        "format the real reverse request id",
+    )
+    for log_marker in (
+        "DUALPATH_DECODE_HOST_STAGING_COPY tp_rank=%d",
+        "DUALPATH_DECODE_L3_REVERSE rid=%s",
+    ):
+        source = gate_logger_call(source, log_marker)
+    path.write_text(source)
+    print(f"Patched: {path}")
+
+
+def patch_ttft_v3_decode(path: Path) -> None:
+    source = path.read_text()
+    marker = "DUALPATH_TTFT_V3_DECODE"
+    if marker in source:
+        print(f"Already patched: {path}")
+        return
+    source = replace_once(
+        source,
+        "logger = logging.getLogger(__name__)\n",
+        "logger = logging.getLogger(__name__)\n"
+        "\n"
+        "# DUALPATH_TTFT_V3_DECODE\n"
+        "from sglang.srt.utils.dualpath_ttft import (\n"
+        "    DETAIL as DUALPATH_TTFT_DETAIL,\n"
+        "    ENABLED as DUALPATH_TTFT_ENABLED,\n"
+        "    now_ns as dualpath_now_ns,\n"
+        ")\n",
+        "import TTFT V3 Decode helpers",
+    )
+    source = replace_once(
+        source,
+        "            self._pre_alloc(decode_req.req)\n"
+        "\n"
+        "            kv_indices = (\n",
+        "            dualpath_prealloc_start_ns = (\n"
+        "                dualpath_now_ns() if DUALPATH_TTFT_ENABLED else 0\n"
+        "            )\n"
+        "            self._pre_alloc(decode_req.req)\n"
+        "            if DUALPATH_TTFT_ENABLED:\n"
+        "                decode_req.req.dualpath_preallocation_ns = (\n"
+        "                    dualpath_now_ns() - dualpath_prealloc_start_ns\n"
+        "                )\n"
+        "\n"
+        "            kv_indices = (\n",
+        "time exactly the Decode _pre_alloc call",
+    )
+    source = replace_once(
+        source,
+        "        decode_req.req.time_stats.wait_queue_entry_time = time.perf_counter()\n",
+        "        decode_req.req.time_stats.wait_queue_entry_time = time.perf_counter()\n"
+        "        if DUALPATH_TTFT_ENABLED:\n"
+        "            decode_req.req.dualpath_decode_ready_ns = dualpath_now_ns()\n",
+        "record Decode dispatch-ready boundary",
+    )
+    source = replace_once(
+        source,
+        "                self._commit_transfer_to_req(decode_req)\n"
+        "                req = decode_req.req\n",
+        "                self._commit_transfer_to_req(decode_req)\n"
+        "                req = decode_req.req\n"
+        "                if DUALPATH_TTFT_ENABLED:\n"
+        "                    dualpath_prefetch = getattr(\n"
+        "                        dualpath_host_staging_receiver,\n"
+        "                        \"dualpath_prefetch_timing\",\n"
+        "                        {},\n"
+        "                    )\n"
+        "                    req.dualpath_decode_timing = {\n"
+        "                        \"before_read_ns\": dualpath_prefetch.get(\"before_read_ns\", 0),\n"
+        "                        \"before_read_start_ns\": dualpath_prefetch.get(\"before_read_start_ns\", 0),\n"
+        "                        \"before_read_end_ns\": dualpath_prefetch.get(\"before_read_end_ns\", 0),\n"
+        "                        \"lustre_read_ns\": dualpath_prefetch.get(\"lustre_read_ns\", 0),\n"
+        "                        \"scatter_ns\": dualpath_prefetch.get(\"scatter_ns\", 0),\n"
+        "                        \"read_tokens\": dualpath_prefetch.get(\"tokens\", 0),\n"
+        "                        \"read_pages\": dualpath_prefetch.get(\"pages\", 0),\n"
+        "                        \"d2p_ns\": getattr(dualpath_host_staging_receiver, \"dualpath_d2p_ns\", 0),\n"
+        "                        \"d2p_pages\": getattr(dualpath_host_staging_receiver, \"dualpath_d2p_pages\", 0),\n"
+        "                        \"h2d_seconds\": max(\n"
+        "                            0.0,\n"
+        "                            float(getattr(dualpath_host_staging_receiver, \"host_staging_h2d_end\", 0) or 0)\n"
+        "                            - float(getattr(dualpath_host_staging_receiver, \"host_staging_h2d_start\", 0) or 0),\n"
+        "                        ),\n"
+        "                        \"host_allocation_seconds_diagnostic\": max(\n"
+        "                            0.0,\n"
+        "                            float(getattr(dualpath_host_staging_receiver, \"dualpath_host_alloc_end\", 0) or 0)\n"
+        "                            - float(getattr(dualpath_host_staging_receiver, \"dualpath_host_alloc_start\", 0) or 0),\n"
+        "                        ),\n"
+        "                    }\n",
+        "copy Decode timing before receiver cleanup",
+    )
+    for log_marker in (
+        "DUALPATH_TTFT_D_RECEIVE rid=%s",
+        "DUALPATH_TTFT_D_HOST_STAGING rid=%s",
+        "DUALPATH_DECODE_HANDOFF_BREAKDOWN rid=%s",
+        "DUALPATH_DECODE_PREALLOC_INNER rid=%s",
+        "DUALPATH_DECODE_ALLOCATOR_MERGE rid=%s",
+    ):
+        source = gate_logger_call(source, log_marker)
+    path.write_text(source)
+    print(f"Patched: {path}")
+
+
+def patch_ttft_v3_dispatch(path: Path) -> None:
+    source = path.read_text()
+    marker = "DUALPATH_TTFT_V3_DISPATCH"
+    if marker in source:
+        print(f"Already patched: {path}")
+        return
+    source = replace_once(
+        source,
+        "logger = logging.getLogger(__name__)\n",
+        "logger = logging.getLogger(__name__)\n"
+        "\n"
+        "# DUALPATH_TTFT_V3_DISPATCH\n"
+        "from sglang.srt.utils.dualpath_ttft import (\n"
+        "    DETAIL as DUALPATH_TTFT_DETAIL,\n"
+        "    ENABLED as DUALPATH_TTFT_ENABLED,\n"
+        "    emit as dualpath_ttft_emit,\n"
+        "    now_ns as dualpath_now_ns,\n"
+        "    ns_seconds as dualpath_ns_seconds,\n"
+        ")\n",
+        "import TTFT V3 dispatch helpers",
+    )
+    source = replace_once(
+        source,
+        "        dualpath_dispatch_time = time.perf_counter()\n"
+        "        if self.attn_tp_rank == 0:\n",
+        "        dualpath_dispatch_time = (\n"
+        "            time.perf_counter() if DUALPATH_TTFT_DETAIL else 0.0\n"
+        "        )\n"
+        "        if DUALPATH_TTFT_ENABLED:\n"
+        "            dualpath_dispatch_ns = dualpath_now_ns()\n"
+        "            for req in batch.reqs:\n"
+        "                dualpath_decode = getattr(req, \"dualpath_decode_timing\", {})\n"
+        "                dualpath_dispatch_raw = dualpath_ns_seconds(\n"
+        "                    dualpath_dispatch_ns\n"
+        "                    - getattr(req, \"dualpath_decode_ready_ns\", dualpath_dispatch_ns)\n"
+        "                )\n"
+        "                dualpath_ttft_emit(\n"
+        "                    logger,\n"
+        "                    rid=req.rid,\n"
+        "                    side=\"decode\",\n"
+        "                    tp_rank=self.attn_tp_rank,\n"
+        "                    values={\n"
+        "                        \"decode_preallocation_raw_seconds\": dualpath_ns_seconds(getattr(req, \"dualpath_preallocation_ns\", 0)),\n"
+        "                        \"decode_before_lustre_read_raw_seconds\": dualpath_ns_seconds(dualpath_decode.get(\"before_read_ns\", 0)),\n"
+        "                        \"decode_lustre_read_raw_seconds\": dualpath_ns_seconds(dualpath_decode.get(\"lustre_read_ns\", 0)),\n"
+        "                        \"decode_scatter_raw_seconds\": dualpath_ns_seconds(dualpath_decode.get(\"scatter_ns\", 0)),\n"
+        "                        \"d_to_p_transfer_raw_seconds\": dualpath_ns_seconds(dualpath_decode.get(\"d2p_ns\", 0)),\n"
+        "                        \"decode_host_to_device_raw_seconds\": float(dualpath_decode.get(\"h2d_seconds\", 0.0)),\n"
+        "                        \"decode_dispatch_raw_seconds\": dualpath_dispatch_raw if self.attn_tp_rank == 0 else 0.0,\n"
+        "                        \"decode_before_read_start_ns\": dualpath_decode.get(\"before_read_start_ns\", 0),\n"
+        "                        \"decode_before_read_end_ns\": dualpath_decode.get(\"before_read_end_ns\", 0),\n"
+        "                        \"decode_dispatch_ns\": dualpath_dispatch_ns,\n"
+        "                        \"read_tokens\": int(dualpath_decode.get(\"read_tokens\", 0)),\n"
+        "                        \"read_pages\": int(dualpath_decode.get(\"read_pages\", 0)),\n"
+        "                        \"d_to_p_pages\": int(dualpath_decode.get(\"d2p_pages\", 0)),\n"
+        "                        \"decode_host_allocation_seconds_diagnostic\": float(dualpath_decode.get(\"host_allocation_seconds_diagnostic\", 0.0)),\n"
+        "                    },\n"
+        "                )\n"
+        "        if self.attn_tp_rank == 0:\n",
+        "emit one Decode TTFT V3 record per request and rank",
+    )
+    source = gate_logger_call(source, "DUALPATH_TTFT_D_DISPATCH rid=%s")
+    path.write_text(source)
+    print(f"Patched: {path}")
+
+
+def patch_ttft_v3_detail_logs(path: Path, markers: tuple[str, ...]) -> None:
+    source = path.read_text()
+    detail_import = "    DETAIL as DUALPATH_TTFT_DETAIL,\n"
+    if detail_import not in source:
+        source = replace_once(
+            source,
+            "logger = logging.getLogger(__name__)\n",
+            "logger = logging.getLogger(__name__)\n"
+            + "from sglang.srt.utils.dualpath_ttft import (\n"
+            + detail_import
+            + ")\n",
+            f"import TTFT detail flag in {path.name}",
+        )
+    for log_marker in markers:
+        source = gate_logger_call(source, log_marker)
     path.write_text(source)
     print(f"Patched: {path}")
 
@@ -2289,6 +4621,12 @@ def main() -> None:
     )
     args = parser.parse_args()
     srt = args.site_packages / "sglang/srt"
+    write_ttft_v3_helper(srt / "utils/dualpath_ttft.py")
+    patch_hicache_file_o_direct_read(srt / "mem_cache/hicache_storage.py")
+    patch_prefill_o_direct_reusable_buffer(
+        srt / "managers/cache_controller.py"
+    )
+    patch_shared_prefetch_progress(srt / "managers/cache_controller.py")
     patch_hiradix(srt / "mem_cache/hiradix_cache.py")
     patch_decode_l3_scheduler(srt / "managers/scheduler.py")
     patch_decode_l3_schedule_policy(srt / "managers/schedule_policy.py")
@@ -2296,9 +4634,6 @@ def main() -> None:
         srt / "managers/scheduler_runtime_checker_mixin.py"
     )
     patch_schedule_batch(srt / "managers/schedule_batch.py")
-    patch_prefill_prepare_breakdown(
-        srt / "managers/scheduler.py", srt / "managers/schedule_batch.py"
-    )
     patch_mooncake_bounded_transfer(
         srt / "disaggregation/mooncake/conn.py"
     )
@@ -2310,10 +4645,6 @@ def main() -> None:
     )
     patch_decode_host_staging(srt / "disaggregation/decode.py")
     patch_decode_l3_read(srt / "disaggregation/decode.py")
-    patch_decode_handoff_breakdown(srt / "disaggregation/decode.py")
-    patch_decode_prealloc_inner_breakdown(srt / "disaggregation/decode.py")
-    patch_decode_allocator_merge_breakdown(srt / "disaggregation/decode.py")
-    patch_allocator_kernel_breakdown(srt / "mem_cache/allocator.py")
     patch_mooncake_decode_host_staging(
         srt / "disaggregation/mooncake/conn.py"
     )
@@ -2329,7 +4660,19 @@ def main() -> None:
     patch_first_token_dispatch(
         srt / "managers/scheduler_output_processor_mixin.py"
     )
-    patch_http_yield(srt / "entrypoints/http_server.py")
+    patch_ttft_v3_cache_controller(srt / "managers/cache_controller.py")
+    patch_ttft_v3_hiradix(srt / "mem_cache/hiradix_cache.py")
+    patch_ttft_v3_scheduler(srt / "managers/scheduler.py")
+    patch_ttft_v3_prefill(srt / "disaggregation/prefill.py")
+    patch_ttft_v3_mooncake(srt / "disaggregation/mooncake/conn.py")
+    patch_ttft_v3_decode(srt / "disaggregation/decode.py")
+    patch_ttft_v3_dispatch(
+        srt / "managers/scheduler_output_processor_mixin.py"
+    )
+    patch_ttft_v3_detail_logs(
+        srt / "managers/schedule_batch.py",
+        ("DUALPATH_REQ_TIMING rid=%s",),
+    )
 
 
 if __name__ == "__main__":

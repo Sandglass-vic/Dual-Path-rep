@@ -10,20 +10,7 @@ import re
 from pathlib import Path
 
 from plot_style import COLORS
-
-
-COMPONENTS = (
-    ("prefill_l3_kv_read_seconds", "Prefill KV Read (Lustre) + Radix tree", COLORS["orange"]),
-    ("decode_l3_kv_read_seconds", "Decode KV Read (Lustre)", COLORS["purple"]),
-    ("decode_prealloc_seconds", "Decode pre-allocation", COLORS["yellow"]),
-    ("decode_to_prefill_kv_transfer_seconds", "D->P transfer", COLORS["pink"]),
-    ("prefill_host_to_device_seconds", "Prefill HiCache Host->GPU", COLORS["blue"]),
-    ("prefill_logits_sampling_seconds", "Prefill + Sampling", COLORS["green"]),
-    ("pd_transfer_seconds", "P->D transfer", COLORS["red"]),
-    ("decode_host_to_device_seconds", "Decode Host->GPU", COLORS["cyan"]),
-    ("decode_dispatch_seconds", "Decode dispatch", COLORS["brown"]),
-    ("misc_seconds", "Misc", COLORS["gray"]),
-)
+from ttft_components import components_for_path, normalize_ttft_row
 CASE_COLORS = (COLORS["blue"], COLORS["orange"], COLORS["green"], COLORS["red"])
 
 
@@ -95,25 +82,28 @@ def load_case(code_home: Path, job_id: str, task: str) -> dict[str, object]:
     if not rounds or not trajectories:
         raise RuntimeError(f"Incomplete case data under {task_dir}")
 
-    values: dict[str, float] = {}
-    for field, _, _ in COMPONENTS:
-        if field == "misc_seconds":
-            continue
-        values[field] = sum(float(row.get(field, 0.0)) for row in rounds) / len(rounds)
-    misc_fields = (
-        "bootstrap_and_scheduling_seconds",
-        "decode_l3_bootstrap_handoff_seconds",
-        "sse_egress_seconds",
-        "server_runtime_residual_seconds",
-        "router_client_runtime_seconds",
-    )
-    values["misc_seconds"] = sum(
-        sum(float(row.get(field, 0.0)) for row in rounds) / len(rounds)
-        for field in misc_fields
-    )
+    path = infer_path(metadata, task_dir)
+    for row in rounds:
+        normalize_ttft_row(row)
+        if int(row.get("ttft_timing_schema_version", 0)) < 3:
+            row["misc_seconds"] = sum(
+                float(row.get(field, 0.0))
+                for field in (
+                    "bootstrap_and_scheduling_seconds",
+                    "decode_l3_bootstrap_handoff_seconds",
+                    "sse_egress_seconds",
+                    "server_runtime_residual_seconds",
+                    "router_client_runtime_seconds",
+                    "kv_read_overhead_seconds",
+                )
+            )
+    components = components_for_path(path)
+    values = {
+        field: sum(float(row.get(field, 0.0)) for row in rounds) / len(rounds)
+        for field, _, _ in components
+    }
     ttft = sum(float(row.get("ttft_seconds", 0.0)) for row in rounds) / len(rounds)
     jct = max(float(row.get("elapsed_seconds", 0.0)) for row in trajectories)
-    path = infer_path(metadata, task_dir)
     label = f"{topology(task)}-{path}"
     return {
         "job_id": job_id,
@@ -123,6 +113,7 @@ def load_case(code_home: Path, job_id: str, task: str) -> dict[str, object]:
         "ttft_seconds": ttft,
         "jct_seconds": jct,
         "components": values,
+        "component_fields": [field for field, _, _ in components],
         "rounds": len(rounds),
         "trajectories": len(trajectories),
     }
@@ -136,7 +127,14 @@ def write_svg(cases: list[dict[str, object]], output: Path) -> None:
 
     legend_columns = 3
     legend_x_positions = (35.0, 350.0, 680.0)
-    for index, (_, label, color) in enumerate(COMPONENTS):
+    legend_components = []
+    seen_fields = set()
+    for case in cases:
+        for component in components_for_path(str(case["path"])):
+            if component[0] not in seen_fields:
+                seen_fields.add(component[0])
+                legend_components.append(component)
+    for index, (_, label, color) in enumerate(legend_components):
         column = index % legend_columns
         row = index // legend_columns
         x = legend_x_positions[column]
@@ -167,7 +165,7 @@ def write_svg(cases: list[dict[str, object]], output: Path) -> None:
             x = left + spacing * (index + 0.5)
             if "TTFT" in title:
                 cursor = bottom
-                for field, _, color in COMPONENTS:
+                for field, _, color in components_for_path(str(case["path"])):
                     segment = float(case["components"][field]) * 1000.0 / max_value * (bottom - top)
                     cursor -= segment
                     elements.append(f'<rect x="{x - bar_width / 2:.1f}" y="{cursor:.1f}" width="{bar_width:.1f}" height="{max(segment, 0.0):.1f}" fill="{color}"/>')

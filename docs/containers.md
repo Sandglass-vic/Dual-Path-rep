@@ -86,6 +86,68 @@ staging，以及由 `DECODE_HICACHE_RATIO` 控制的 `page_first_direct` Decode
 HiCache Host pool。HiCache L3 使用 Lustre file backend；Mooncake 仅负责 P→D
 Transfer Engine，不使用 Mooncake Store/global segment。
 
+当前 Timing V3 测试镜像（2026-09-17）：
+
+```text
+/mnt/lustre/users/sezhou/dual-path/images/sglang-file-l3-dual-staging-69302.sqsh
+构建 Job：69302，COMPLETED，ExitCode=0:0
+SHA-256：99f8b0ba9cd0c1c58da526fc5df5bfc78325f6a4b09cd0cbce1216602d6f88af
+```
+
+该镜像加入低开销 `DUALPATH_TTFT_V3` request/rank 聚合日志、Prefill/Decode
+Lustre read 与 scatter 分离、GPU H2D/computation overlap 归属、双向 Mooncake
+transfer timing，以及 V3 offline 汇总所需的 raw/critical/overlap 字段。构建脚本
+自带的 patch assertions 和 SGLang 源码 compile 已通过。Job `69290` 修正
+Decode preallocation queue 的 TP CPU group 传递，使用 queue 自身的
+`self.gloo_group`，避免启动阶段访问不存在的 `self.attn_tp_cpu_group`；Job
+`69293` 补齐 `schedule_batch.py` 的 `DUALPATH_TTFT_DETAIL` import，避免首个
+Decode output 调用 `Req.log_time_stats()` 时出现 `NameError`。Job `69297` 将
+Decode Lustre prefetch 生命周期移入 scheduler-owned `DecodePreallocQueue`，复用
+Prefill HiCacheController 的 query/I/O worker 流程，并限制每个 TP rank 仅有一个
+有序在途 prefetch，避免同步 TP collective 在并发请求间交错；Decode 仍保留独立
+Host staging buffer。Job `69302` 修正 receiver 能力判断：只有显式声明支持
+scheduler prefetch 的 `MooncakeKVReceiver` 才接收 request、Host staging 和 timing
+扩展参数，`FakeKVReceiver` 等基线 receiver 保持原有三参数 `init()` 调用。
+`scripts/pd_alloc.sh` 默认使用该镜像。**Timing V3，尚未 smoke，由用户验证；
+当前不得视为已验证性能基线。**
+
+上一版 scheduler-owned Decode prefetch 镜像：
+
+```text
+/mnt/lustre/users/sezhou/dual-path/images/sglang-file-l3-dual-staging-69297.sqsh
+构建 Job：69297，COMPLETED，ExitCode=0:0
+SHA-256：02b3444bbfa3bc31eee650bde689ecd5dce5cadf8677a880f93066c0efc78669
+```
+
+该镜像会向 `FakeKVReceiver.init()` 传入 Mooncake 专用扩展参数，运行时触发
+`unexpected keyword argument 'request_id'`，不得继续用于实验。
+
+更早的 Timing V3 启动修复镜像：
+
+```text
+/mnt/lustre/users/sezhou/dual-path/images/sglang-file-l3-dual-staging-69293.sqsh
+构建 Job：69293，COMPLETED，ExitCode=0:0
+SHA-256：5214d7e17a963144b674430635574fde5f7cdb9da7a2dfbb1bf2fec9c852dd3e
+```
+
+该镜像不包含 scheduler-owned 异步 Decode prefetch。Allocation `69298` 误用该
+旧默认镜像，不能用于验证 Job `69297` 的实现。
+
+上一版 KV read/scatter timing 测试镜像：
+
+```text
+/mnt/lustre/users/sezhou/dual-path/images/sglang-file-l3-dual-staging-69108.sqsh
+构建 Job：69108，COMPLETED，ExitCode=0:0
+SHA-256：6b3cb67ed3737184c8ebffc856a7f73c303bbae457a94215e2f146f530e73805
+```
+
+该镜像继承 `69054` 的 O_DIRECT Prefill buffer reuse：在
+`DUAL_PATH_O_DIRECT_READ=1` 时让 Prefill 每个 TP rank 复用一个
+4096-byte-aligned pinned page，替代上游 generic path 每批创建 128 个临时 page
+的行为。它新增 Prefill/Decode `storage_backend.get()` 与 Host-pool scatter 的独立
+计时。构建期源码、配置实例化与 patch 顺序检查已通过；该镜像已由 Timing V3
+镜像 `69302` 取代，仍保留用于旧结果复现。
+
 候选 `shared-host-v5`（构建 Job `67084`，SHA-256
 `bdeae5df...6237f2`）尝试让 P→D staging 与 Decode D2H→L3 offload 共用
 HiCache Host pool，但动态 Job `67086` 发现 Mooncake Store 会把请求的

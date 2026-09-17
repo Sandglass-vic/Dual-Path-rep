@@ -48,12 +48,15 @@ SGLang HiCache **无法**关闭 L2 pool（`--hicache-size 0` 仍按 ratio 分配
 
 1. SGLang 原生在 Prefill PD `KVPoll.Success` 后执行
    `release_kv_cache(req, tree_cache)`，解除当前 request 的 radix lock；
-2. Prefill 为 read-only，不执行 D2H/Host→L3 backup；PD ACK 后立即驱逐所有
+2. 每个 request/turn 使用包含 `rid` 的独立 `extra_key`，使本地 radix tree
+   不会把上一轮相同 token prefix 当成 L1/L2 命中；Lustre page hash 不包含
+   `extra_key`，所以相同 token prefix 仍可从 Lustre 恢复；
+3. Prefill 为 read-only，不执行 D2H/Host→L3 backup；PD ACK 后立即驱逐所有
    `lock_ref=0` 的 L1/L2 page；
-3. Decode 从 Prefill 传来的 `cached_tokens` 边界开始 offload，负责持久化本轮
+4. Decode 从 Prefill 传来的 `cached_tokens` 边界开始 offload，负责持久化本轮
    新计算的全部 KV；
-4. **不**清 Mooncake Store；
-5. `STORAGE_SETTLE_SECONDS`（默认 1s）只等待 Decode→Store 对下一 turn 可见，
+5. **不**清 Mooncake Store；
+6. `STORAGE_SETTLE_SECONDS`（默认 1s）只等待 Decode→Store 对下一 turn 可见，
    不计入 `turn_wall_seconds` / `trajectory_jct`。
 
 环境变量（`pd_benchmark_lib.sh` 默认）：
@@ -62,6 +65,7 @@ SGLang HiCache **无法**关闭 L2 pool（`--hicache-size 0` 仍按 ratio 分配
 DUALPATH_PREFILL_RELEASE_LOCAL_CACHE=1
 PREFILL_HICACHE_READ_ONLY=1
 PREFILL_HICACHE_EVICT_UNLOCKED=1
+DUALPATH_NO_CROSS_TURN_KV_REUSE=1
 PREFILL_HICACHE_WRITE_POLICY=write_through_selective
 DUALPATH_PREFILL_BACKUP_TIMEOUT=0
 DUALPATH_DECODE_PD_HOST_STAGING=1
@@ -70,6 +74,11 @@ DECODE_HICACHE_RATIO=1.05
 FLUSH_LOCAL_CACHE_BETWEEN_TURNS=0
 STORAGE_SETTLE_SECONDS=0
 ```
+
+`DUALPATH_NO_CROSS_TURN_KV_REUSE=1` 是双重保障中的“命名空间隔离”：即使旧
+page 因异步 prefetch 的 `lock_ref` 暂时未能立即驱逐，新一轮也不会命中它。
+随后 `release_kv_cache()` 与 lock-aware eviction 回收实际 L1/L2 pages。设置为
+`0` 仅用于允许跨 request 本地 prefix reuse 的对照实验。
 
 PD ACK 路径在释放 request radix lock 后，先调用 HiCache `loading_check()` 收割
 已经完成的 L3→Host→GPU copy event 并解除对应 node lock，再立即驱逐这些 page。
@@ -192,6 +201,44 @@ SGLang 侧使用 `MOONCAKE_MASTER=<master-host>:50051` 和
 HICACHE_STORAGE_BACKEND=file
 SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR=<job-specific Lustre path>
 ```
+
+File backend reads use the existing buffered path by default. Set
+`DUAL_PATH_O_DIRECT_READ=1` when starting the engines to enable the patched
+Lustre `O_DIRECT` read path. With the value unset or `0`, the current
+`open(..., buffering=0) + readinto()` behavior is unchanged. The option affects
+only file reads; file writes remain buffered. For Prefill, the patched direct
+path keeps one 4096-byte-aligned pinned page per TP rank, reads one page and
+immediately scatters it into the HiCache Host pool before reusing the page. It
+does not allocate the generic 128-page temporary batch. Decode already reuses
+one page-sized target for the request. The buffered path and non-file storage
+backends retain the upstream batch behavior.
+The option does not affect KV writes, P→D/D→P transfers, or Host→GPU copies.
+It is fixed when the server starts, so Prefill and Decode must be restarted to
+change it.
+
+### Prefetch、H2D 与双向传输的 V3 边界
+
+Timing V3 将 storage prefetch 拆成三个连续 CPU 阶段：worker dequeue 后的
+hash/`batch_exists()`/TP hit consensus、仅 `get()`/`batch_get()` 的 Lustre read、
+以及写入 Host pool 的 scatter。Prefill 和 Decode 复用同一
+`CacheController.prefetch_thread_func`；差异来自目标 Host pool 和后续 radix
+语义，不再用跨节点 wall-clock envelope 比较。
+
+Decode read path 也由 `DecodePreallocQueue` 持有 prefetch operation，并复用
+Prefill 的 `HiCacheController` query worker、I/O auxiliary worker、完成判定和 TP
+consensus。Decode 唯一独立的数据结构是 `layer_first` PD Host staging；
+`MooncakeKVReceiver` 只处理 D→P/P→D 网络状态，不再推进 storage prefetch。
+取消中的 staging 在 worker 设置 `io_complete` 后延迟释放，scheduler 不等待线程。
+
+Prefill Host→GPU 使用 HiCache `start_loading()` 的 load stream 聚合 event；仍保留
+SGLang 原有逐层 ready event 供 forward 等待，但 timing 不新增逐层 event 或同步。
+Decode Host→GPU 是 PD pinned `layer_first` staging 到 Decode HBM，读取发生在已有
+stream synchronize 之后，不增加额外同步。
+
+P→D 从 Prefill 第一次实际 send 到 wait-send 成功，raw 包含 chunked transfer 与
+Prefill pipeline 的重叠；critical contribution 扣除该重叠。Decode path 的 D→P
+从 Decode 同步 Mooncake reverse send 前到 send 返回，并携带真实 request ID。
+完整定义见 [TTFT Timing V3](ttft-timing-v3.md)。
 
 Mooncake `0.3.13.post1` 仅保留为 P→D Transfer Engine。为避免旧 file backend
 在异步写入期间被下一 turn 读取，每个 Decode TP rank 在 request 的 L3 backup

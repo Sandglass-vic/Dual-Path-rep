@@ -19,6 +19,7 @@ KV_BYTES_PER_TOKEN = 64 * 8 * 128 * 2 * 2  # layers * KV heads * head dim * K/V 
 GIB = 1024**3
 GB = 10**9
 TITLE_SUFFIX = ""
+V3_PREFIX = "DUALPATH_TTFT_V3 "
 
 P_TRANSFER = re.compile(
     r"DUALPATH_TTFT_P_TRANSFER(?:_V2)? rid=(?P<rid>\S+) "
@@ -35,12 +36,21 @@ PREFILL_L3_READ = re.compile(
     r"read_start=(?P<start>[0-9.]+) read_end=(?P<end>[0-9.]+) "
     r"read_s=(?P<seconds>[0-9.]+) tokens=(?P<tokens>\d+)"
 )
+PREFILL_KV_READ_BREAKDOWN = re.compile(
+    r"DUALPATH_PREFILL_KV_READ_BREAKDOWN rid=(?P<rid>\S+) "
+    r"prefill_engine=(?P<engine>\S+) "
+    r"(?:node=(?P<node>\S+) )?tp_rank=(?P<rank>\d+) "
+    r"lustre_read_s=(?P<lustre>[0-9.]+) "
+    r"scatter_s=(?P<scatter>[0-9.]+) pages=(?P<pages>\d+)"
+)
 DECODE_L3_READ = re.compile(
     r"DUALPATH_DECODE_L3_READ rid=(?P<rid>\S+) "
     r"decode_engine=(?P<engine>\S+) "
     r"(?:node=(?P<node>\S+) )?tp_rank=(?P<rank>\d+) .*?"
     r"read_start=(?P<start>[0-9.]+) read_end=(?P<end>[0-9.]+) "
-    r"read_s=(?P<seconds>[0-9.]+) tokens=(?P<tokens>\d+)"
+    r"read_s=(?P<seconds>[0-9.]+) "
+    r"(?:lustre_read_s=(?P<lustre>[0-9.]+) "
+    r"scatter_s=(?P<scatter>[0-9.]+) )?tokens=(?P<tokens>\d+)"
 )
 
 
@@ -60,10 +70,67 @@ def parse_logs(
         str, dict[str, dict[int, list[tuple[float, float, float, int, str]]]]
     ] = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
     decode_read_values: dict[
-        str, dict[str, dict[int, list[tuple[float, float, float, int, str]]]]
+        str, dict[str, dict[int, list[tuple[float, float, float, int, str, float, float]]]]
+    ] = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
+    prefill_breakdown_values: dict[
+        str, dict[str, dict[int, list[tuple[float, float, int]]]]
     ] = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
     for path in log_dir.rglob(log_glob):
         for line in path.read_text(errors="replace").splitlines():
+            marker = line.find(V3_PREFIX)
+            if marker >= 0:
+                payload = json.loads(line[marker + len(V3_PREFIX) :])
+                if int(payload.get("schema_version", 0)) != 3:
+                    continue
+                rid = str(payload["rid"])
+                side = str(payload["side"])
+                engine = str(payload.get("engine", "unknown"))
+                node = str(payload.get("node", "unknown"))
+                rank = int(payload.get("tp_rank", -1))
+                prefix = "prefill" if side == "prefill" else "decode"
+                before = float(
+                    payload.get(f"{prefix}_before_lustre_read_raw_seconds", 0.0)
+                )
+                lustre = float(
+                    payload.get(f"{prefix}_lustre_read_raw_seconds", 0.0)
+                )
+                scatter = float(payload.get(f"{prefix}_scatter_raw_seconds", 0.0))
+                read_total = before + lustre + scatter
+                if read_total > 0:
+                    target = read_values if side == "prefill" else decode_read_values
+                    item = (
+                        0.0,
+                        read_total,
+                        read_total,
+                        int(payload.get("read_tokens", 0)),
+                        node,
+                        lustre,
+                        scatter,
+                    )
+                    if side == "prefill":
+                        target[rid][engine][rank].append(item[:5])
+                        prefill_breakdown_values[rid][engine][rank].append(
+                            (lustre, scatter, int(payload.get("read_pages", 0)))
+                        )
+                    else:
+                        target[rid][engine][rank].append(item)
+                if side == "prefill":
+                    transfer_seconds = float(
+                        payload.get("p_to_d_transfer_raw_seconds", 0.0)
+                    )
+                    if transfer_seconds > 0:
+                        transfer_values[rid].append(
+                            (
+                                transfer_seconds,
+                                int(payload.get("p_to_d_logical_tokens", 0)),
+                                int(payload.get("p_to_d_page_aligned_tokens", 0)),
+                                int(payload.get("p_to_d_pages", 0)),
+                                int(payload.get("p_to_d_page_size", 0)),
+                                engine,
+                                node,
+                            )
+                        )
+                continue
             transfer_match = P_TRANSFER.search(line)
             if transfer_match:
                 transfer_values[transfer_match.group("rid")].append(
@@ -92,6 +159,18 @@ def parse_logs(
                     )
                 )
                 continue
+            breakdown_match = PREFILL_KV_READ_BREAKDOWN.search(line)
+            if breakdown_match:
+                prefill_breakdown_values[breakdown_match.group("rid")][
+                    breakdown_match.group("engine")
+                ][int(breakdown_match.group("rank"))].append(
+                    (
+                        float(breakdown_match.group("lustre")),
+                        float(breakdown_match.group("scatter")),
+                        int(breakdown_match.group("pages")),
+                    )
+                )
+                continue
             read_match = DECODE_L3_READ.search(line)
             if read_match:
                 decode_read_values[read_match.group("rid")][
@@ -103,6 +182,8 @@ def parse_logs(
                         float(read_match.group("seconds")),
                         int(read_match.group("tokens")),
                         read_match.group("node") or "unknown",
+                        float(read_match.group("lustre") or 0.0),
+                        float(read_match.group("scatter") or 0.0),
                     )
                 )
 
@@ -116,7 +197,7 @@ def parse_logs(
         )
         for rid, items in transfer_values.items()
     }
-    def reduce_reads(values):
+    def reduce_reads(values, breakdown_values=None):
         return {
             rid: {
                 engine: {
@@ -126,6 +207,22 @@ def parse_logs(
                         statistics.median(item[2] for item in items),
                         round(statistics.median(item[3] for item in items)),
                         items[0][4],
+                        (
+                            sum(item[0] for item in breakdown_values[rid][engine][rank])
+                            if breakdown_values is not None
+                            and breakdown_values[rid][engine][rank]
+                            else statistics.median(item[2] for item in items)
+                            if breakdown_values is not None
+                            else statistics.median(item[5] for item in items)
+                        ),
+                        (
+                            sum(item[1] for item in breakdown_values[rid][engine][rank])
+                            if breakdown_values is not None
+                            and breakdown_values[rid][engine][rank]
+                            else 0.0
+                            if breakdown_values is not None
+                            else statistics.median(item[6] for item in items)
+                        ),
                     )
                     for rank, items in ranks.items()
                 }
@@ -154,7 +251,7 @@ def parse_logs(
     }
     return (
         transfer,
-        reduce_reads(read_values),
+        reduce_reads(read_values, prefill_breakdown_values),
         reduce_reads(decode_read_values),
         transfer_details,
     )
@@ -183,8 +280,8 @@ def build_rows(
         engine = next(iter(request_engines), "")
         rank_timings = request_engines.get(engine, {})
         if not rank_timings:
-            return engine, "unknown", rank_timings, -1, 0.0, 0.0, 0
-        slowest_rank, (_, _, slowest_seconds, _, _) = max(
+            return engine, "unknown", rank_timings, -1, 0.0, 0.0, 0, 0.0, 0.0
+        slowest_rank, (_, _, slowest_seconds, _, _, lustre_seconds, scatter_seconds) = max(
             rank_timings.items(), key=lambda entry: entry[1][2]
         )
         union_seconds = max(entry[1] for entry in rank_timings.values()) - min(
@@ -201,8 +298,10 @@ def build_rows(
             "node": node,
             "l3_read_gib": tokens * KV_BYTES_PER_TOKEN / GIB,
         }
-        for rank, (_, _, seconds, _, _) in sorted(rank_timings.items()):
+        for rank, (_, _, seconds, _, _, rank_lustre, rank_scatter) in sorted(rank_timings.items()):
             rank_row[f"tp_rank_{rank}_read_seconds"] = seconds
+            rank_row[f"tp_rank_{rank}_lustre_seconds"] = rank_lustre
+            rank_row[f"tp_rank_{rank}_scatter_seconds"] = rank_scatter
         rank_row["tp_slowest_read_seconds"] = slowest_seconds
         rank_row["tp_union_read_seconds"] = union_seconds
         engine_rank_rows[f"{side}:{engine}"].append(rank_row)
@@ -214,6 +313,8 @@ def build_rows(
             slowest_seconds,
             union_seconds,
             tokens,
+            lustre_seconds,
+            scatter_seconds,
         )
 
     for item in rounds:
@@ -239,6 +340,8 @@ def build_rows(
             prefill_l3_seconds,
             _,
             prefill_l3_tokens,
+            prefill_lustre_seconds,
+            prefill_scatter_seconds,
         ) = reduce_side(item, rid, "prefill", prefill_l3_read.get(rid, {}))
         (
             decode_engine,
@@ -248,6 +351,8 @@ def build_rows(
             decode_l3_seconds,
             _,
             decode_l3_tokens,
+            decode_lustre_seconds,
+            decode_scatter_seconds,
         ) = reduce_side(item, rid, "decode", decode_l3_read.get(rid, {}))
         # Page-aligned tokens estimate actual KV payload sent by all TP ranks.
         # V1 logs lack page fields and fall back to logical tokens.
@@ -275,7 +380,7 @@ def build_rows(
                 "l3_rank_read_seconds_json": json.dumps(
                     {
                         str(rank): seconds
-                    for rank, (_, _, seconds, _, _) in sorted(
+                    for rank, (_, _, seconds, _, _, _, _) in sorted(
                         prefill_rank_timings.items()
                     )
                     },
@@ -327,17 +432,21 @@ def build_rows(
                 "prefill_l3_read_tokens": prefill_l3_tokens,
                 "prefill_l3_read_gib": prefill_l3_bytes / GIB,
                 "prefill_l3_read_seconds": prefill_l3_seconds,
+                "prefill_lustre_read_seconds": prefill_lustre_seconds,
+                "prefill_scatter_seconds": prefill_scatter_seconds,
                 "prefill_l3_effective_bandwidth_gbps": (
-                    prefill_l3_bytes / prefill_l3_seconds / GB
-                    if prefill_l3_seconds > 0
+                    prefill_l3_bytes / prefill_lustre_seconds / GB
+                    if prefill_lustre_seconds > 0
                     else 0.0
                 ),
                 "decode_l3_read_tokens": decode_l3_tokens,
                 "decode_l3_read_gib": decode_l3_bytes / GIB,
                 "decode_l3_read_seconds": decode_l3_seconds,
+                "decode_lustre_read_seconds": decode_lustre_seconds,
+                "decode_scatter_seconds": decode_scatter_seconds,
                 "decode_l3_effective_bandwidth_gbps": (
-                    decode_l3_bytes / decode_l3_seconds / GB
-                    if decode_l3_seconds > 0
+                    decode_l3_bytes / decode_lustre_seconds / GB
+                    if decode_lustre_seconds > 0
                     else 0.0
                 ),
             }
@@ -481,6 +590,10 @@ def main() -> None:
                 "decode_l3_read_gib",
                 "prefill_l3_read_tokens",
                 "decode_l3_read_tokens",
+                "prefill_lustre_read_seconds",
+                "prefill_scatter_seconds",
+                "decode_lustre_read_seconds",
+                "decode_scatter_seconds",
             ):
                 row.setdefault(field, 0)
         engine_rank_rows: dict[
@@ -659,18 +772,30 @@ def main() -> None:
         (
             (
                 "prefill_l3_effective_bandwidth_gbps",
-                "Prefill KV Read (Lustre)",
+                "Prefill Lustre Read",
                 COLORS["orange"],
             ),
             (
                 "decode_l3_effective_bandwidth_gbps",
-                "Decode KV Read (Lustre)",
+                "Decode Lustre Read",
                 COLORS["blue"],
             ),
         ),
         "GB/s",
         "KV Read (Lustre) Bandwidth by Turn",
         args.output_dir / "l3-bandwidth.svg",
+    )
+    plot(
+        rows,
+        (
+            ("prefill_lustre_read_seconds", "Prefill Lustre Read", COLORS["orange"]),
+            ("prefill_scatter_seconds", "Prefill Scatter", COLORS["brown"]),
+            ("decode_lustre_read_seconds", "Decode Lustre Read", COLORS["purple"]),
+            ("decode_scatter_seconds", "Decode Scatter", COLORS["cyan"]),
+        ),
+        "Seconds",
+        "KV Restore Read and Scatter Time by Turn",
+        args.output_dir / "kv-read-scatter-time.svg",
     )
     rank_colors = (
         COLORS["blue"], COLORS["orange"], COLORS["green"], COLORS["red"],
@@ -740,12 +865,12 @@ def main() -> None:
     positive_l3 = [
         float(row["prefill_l3_effective_bandwidth_gbps"])
         for row in rows
-        if float(row["prefill_l3_read_seconds"]) > 0
+        if float(row["prefill_lustre_read_seconds"]) > 0
     ]
     positive_decode_l3 = [
         float(row["decode_l3_effective_bandwidth_gbps"])
         for row in rows
-        if float(row["decode_l3_read_seconds"]) > 0
+        if float(row["decode_lustre_read_seconds"]) > 0
     ]
     summary = {
         "turns": len(rows),

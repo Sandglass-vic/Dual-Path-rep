@@ -16,13 +16,14 @@
 12. [指标规范](metrics.md)：唯一 metric 来源——**trajectory_jct**、
     per-agent mean TTFT/TPOT（agent 内先平均）、代表轨迹 vs 全量 fullchain、
     task/dataset/agents/rep 产物布局。
-13. [当前数据流与消融开关](dataflow-and-ablation.md)：L3、P→D、chunk 传输边界和一键 profile。
-14. [四轮延迟结果](latency-results.md)：历史 Job `65032`（诊断口径）。
-15. [TTFT 全链路历史测例](ttft-fullchain.md)：历史 Job `65144` 数值。
-16. [完整轨迹历史测例](trajectory-metrics.md)：历史 Job `65502` KV/带宽现象。
-17. [里程碑与风险](milestones-and-risks.md)：完成标准、风险和执行顺序。
-18. [复现与安全](reproducibility-and-security.md)：结果元数据、Git 和凭据规则。
-19. [参考资料](references.md)：论文和官方文档链接。
+13. [TTFT Timing V3](ttft-timing-v3.md)：正式 breakdown 时间线、边界、重叠归属和 TP 聚合。
+14. [当前数据流与消融开关](dataflow-and-ablation.md)：L3、P→D、chunk 传输边界和一键 profile。
+15. [四轮延迟结果](latency-results.md)：历史 Job `65032`（诊断口径）。
+16. [TTFT 全链路历史测例](ttft-fullchain.md)：历史 Job `65144` 数值。
+17. [完整轨迹历史测例](trajectory-metrics.md)：历史 Job `65502` KV/带宽现象。
+18. [里程碑与风险](milestones-and-risks.md)：完成标准、风险和执行顺序。
+19. [复现与安全](reproducibility-and-security.md)：结果元数据、Git 和凭据规则。
+20. [参考资料](references.md)：论文和官方文档链接。
 
 ## 信息唯一来源
 
