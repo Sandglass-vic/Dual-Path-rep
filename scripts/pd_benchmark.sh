@@ -16,7 +16,7 @@ Common client workload settings:
 
 DUALPATH_L3_READ_PATH is a required per-role launch parameter. The same value
 must be supplied on every Prefill, Decode, and client invocation:
-  DUALPATH_L3_READ_PATH=prefill|decode scripts/pd_benchmark.sh prefill|decode|client
+  DUALPATH_L3_READ_PATH=prefill|decode|dynamic scripts/pd_benchmark.sh prefill|decode|client
 
 Workload settings are resolved per client invocation, so the same running
 Prefill/Decode servers can be reused for multiple client runs.
@@ -60,7 +60,8 @@ runtime_override_names=(
   SGLANG_MOONCAKE_MAX_TRANSFER_BATCH_INDICES SERVER_TIMEOUT
   PREFILL_PORT DECODE_PORT BOOTSTRAP_PORT ROUTER_PORT IB_DEVICE
   DUALPATH_TTFT_TIMING DUALPATH_TTFT_TIMING_DETAIL
-  DUALPATH_L3_READ_PATH DUAL_PATH_O_DIRECT_READ STORAGE_TOPOLOGY
+  DUALPATH_L3_READ_PATH DUALPATH_DYNAMIC_PATH_POLICY
+  DUAL_PATH_O_DIRECT_READ STORAGE_TOPOLOGY
   DUALPATH_RUNTIME_CACHE_ROOT DUALPATH_DATASET_ROOT
   ENGINE_THREADS_PER_RANK
   TASK_NAME DATASET AGENTS REPETITION MAX_TURNS TRAJECTORY_OFFSET
@@ -88,8 +89,9 @@ for name in "${runtime_override_names[@]}"; do
   fi
 done
 : "${DUALPATH_L3_READ_PATH:?Set DUALPATH_L3_READ_PATH=prefill or decode for every role}"
-[[ $DUALPATH_L3_READ_PATH == prefill || $DUALPATH_L3_READ_PATH == decode ]] || {
-  echo "DUALPATH_L3_READ_PATH must be prefill or decode" >&2
+[[ $DUALPATH_L3_READ_PATH == prefill || $DUALPATH_L3_READ_PATH == decode ||
+   $DUALPATH_L3_READ_PATH == dynamic ]] || {
+  echo "DUALPATH_L3_READ_PATH must be prefill, decode or dynamic" >&2
   exit 2
 }
 [[ ${ALLOC_JOB_ID:-$allocation_id} == "$allocation_id" ]] || {

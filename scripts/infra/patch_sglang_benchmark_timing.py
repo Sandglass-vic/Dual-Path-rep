@@ -25,6 +25,83 @@ def replace_function(source: str, signature: str, body: str, label: str) -> str:
     return source[:start] + body.rstrip() + "\n" + source[end:]
 
 
+def write_read_path_helper(path: Path) -> None:
+    path.write_text(
+        '''"""Request-scoped DualPath L3 read-path decision.
+
+`dynamic` lets each request pick Prefill or Decode as its L3 reader. Both
+engines must agree, and neither may block waiting for the decision: Prefill
+resolves it inside `_prefetch_kvcache()`, which runs on the scheduler event
+loop before the PD bootstrap handshake even exists.
+
+The decision is therefore derived, not negotiated. The benchmark client owns
+the request id and encodes `(trajectory, turn)` in it; Router hands the same
+id to both engines, and `Scheduler.recv_requests()` broadcasts the request to
+every TP rank. A pure function of the rid is consequently identical on both
+sides and on every rank, with no coordinator, no RPC and no timeout.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import zlib
+from functools import lru_cache
+
+CONFIGURED = os.environ.get("DUALPATH_L3_READ_PATH", "prefill")
+POLICY = os.environ.get("DUALPATH_DYNAMIC_PATH_POLICY", "alternate_per_turn")
+IS_DYNAMIC = CONFIGURED == "dynamic"
+
+# Requests without a trajectory id (warmup, health checks) must not fail.
+FALLBACK = "prefill"
+
+_RID = re.compile(r"([^-]+)-(\\d+)-turn-(\\d+)")
+
+
+def _phase(prefix: str, index: str) -> int:
+    """Per-trajectory offset so they do not all switch on the same turn.
+
+    Trajectory ids are numbered (32k-0000, 32k-0001, ...), so the index
+    parity spreads neighbours to opposite phases exactly. Hashing the whole
+    id does not: crc32 of 32k-0000..32k-0003 happens to share one parity bit,
+    which would put every trajectory in lockstep.
+    """
+    try:
+        return int(index) & 1
+    except ValueError:
+        return zlib.crc32(f"{prefix}-{index}".encode()) & 1
+
+
+@lru_cache(maxsize=8192)
+def resolve(rid: str) -> str:
+    """Return "prefill" or "decode" for this request. Never raises."""
+    if not IS_DYNAMIC:
+        return CONFIGURED
+    match = _RID.search(rid or "")
+    if match is None:
+        return FALLBACK
+    turn = int(match.group(3))
+    if POLICY == "same_turn_lockstep":
+        # Diagnostic: every trajectory switches on the same turn. Reproduces
+        # path/agent aliasing on purpose; not for measurement.
+        phase = 0
+    else:
+        phase = _phase(match.group(1), match.group(2))
+    return "prefill" if (turn + phase) % 2 == 0 else "decode"
+
+
+def is_decode_read(rid: str) -> bool:
+    return resolve(rid) == "decode"
+
+
+def decode_capable() -> bool:
+    """Whether Decode-side L3 machinery must be constructed at startup."""
+    return CONFIGURED in ("decode", "dynamic")
+'''
+    )
+    print(f"Wrote: {path}")
+
+
 def write_ttft_v3_helper(path: Path) -> None:
     path.write_text(
         '''"""Low-overhead request-scoped DualPath TTFT timing helpers."""
@@ -38,6 +115,8 @@ import socket
 import time
 from typing import Any
 
+from sglang.srt.utils.dualpath_read_path import resolve as resolve_read_path
+
 
 SCHEMA_VERSION = 3
 ENABLED = os.environ.get("DUALPATH_TTFT_TIMING", "0").lower() in (
@@ -46,7 +125,7 @@ ENABLED = os.environ.get("DUALPATH_TTFT_TIMING", "0").lower() in (
 DETAIL = os.environ.get("DUALPATH_TTFT_TIMING_DETAIL", "0").lower() in (
     "1", "true", "yes", "on"
 )
-READ_PATH = os.environ.get("DUALPATH_L3_READ_PATH", "prefill")
+CONFIGURED_PATH = os.environ.get("DUALPATH_L3_READ_PATH", "prefill")
 NODE = socket.gethostname().split(".", 1)[0]
 PREFILL_ENGINE = os.environ.get("PREFILL_ID", "0")
 DECODE_ENGINE = os.environ.get("DECODE_ID", "0")
@@ -140,7 +219,10 @@ def emit(
     payload: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "rid": rid,
-        "path": READ_PATH,
+        # Under `dynamic` these differ: configured_path is the run mode,
+        # path is what this request actually did.
+        "configured_path": CONFIGURED_PATH,
+        "path": resolve_read_path(rid),
         "side": side,
         "engine": PREFILL_ENGINE if side == "prefill" else DECODE_ENGINE,
         "node": PREFILL_NODE if side == "prefill" else DECODE_NODE,
@@ -3815,6 +3897,123 @@ def patch_mooncake_decode_l3_reverse(path: Path) -> None:
     print(f"Patched: {path}")
 
 
+DUALPATH_READ_PATH_IMPORT = (
+    "from sglang.srt.utils.dualpath_read_path import (\n"
+    "    is_decode_read as dualpath_is_decode_read,\n"
+    ")\n"
+)
+
+
+def patch_dynamic_read_path(source: str, sites: tuple[tuple[str, str], ...],
+                            anchor: str, label: str) -> str:
+    """Turn process-level read-path switches into per-request decisions.
+
+    Every one of these call sites already has the request in scope, so the
+    only thing the process-level environment lookup bought was uniformity.
+    Replacing it with a pure function of the rid keeps static `prefill` and
+    `decode` behaviour byte-identical while letting `dynamic` choose per
+    request.
+    """
+    if "dualpath_is_decode_read" in source:
+        return source
+    for old, new in sites:
+        source = replace_once(source, old, new, label)
+    return replace_once(
+        source, anchor, DUALPATH_READ_PATH_IMPORT + anchor,
+        f"import the read-path resolver for {label}",
+    )
+
+
+_ENV_DECODE_READ = (
+    "__import__(\"os\").environ.get(\n"
+    "                    \"DUALPATH_L3_READ_PATH\", \"prefill\"\n"
+    "                )\n"
+)
+
+DYNAMIC_READ_PATH_SITES = {
+    "managers/scheduler.py": (
+        (
+            "            dualpath_decode_l3_read = (\n"
+            "                " + _ENV_DECODE_READ +
+            "                == \"decode\"\n"
+            "            )\n",
+            "            dualpath_decode_l3_read = dualpath_is_decode_read(req.rid)\n",
+        ),
+    ),
+    "disaggregation/prefill.py": (
+        (
+            "        if (\n"
+            "            __import__(\"os\").environ.get(\n"
+            "                \"DUALPATH_L3_READ_PATH\", \"prefill\"\n"
+            "            )\n"
+            "            != \"decode\"\n"
+            "        ):\n"
+            "            return True\n",
+            "        if not dualpath_is_decode_read(req.rid):\n"
+            "            return True\n",
+        ),
+    ),
+    "disaggregation/decode.py": (
+        (
+            "            decode_l3_read = (\n"
+            "                " + _ENV_DECODE_READ +
+            "                == \"decode\"\n"
+            "            )\n",
+            "            decode_l3_read = dualpath_is_decode_read(\n"
+            "                decode_req.req.rid\n"
+            "            )\n",
+        ),
+    ),
+    "disaggregation/decode_kvcache_offload_manager.py": (
+        (
+            "        decode_l3_read = (\n"
+            "            __import__(\"os\").environ.get(\n"
+            "                \"DUALPATH_L3_READ_PATH\", \"prefill\"\n"
+            "            )\n"
+            "            == \"decode\"\n"
+            "        )\n",
+            "        decode_l3_read = dualpath_is_decode_read(req.rid)\n",
+        ),
+    ),
+    # Startup-time capability, not a per-request choice: dynamic still needs
+    # the Decode-side L3 machinery constructed.
+    "disaggregation/mooncake/conn.py": (
+        (
+            "        self.decode_l3_read_path = (\n"
+            "            os.environ.get(\"DUALPATH_L3_READ_PATH\", \"prefill\")\n"
+            "            == \"decode\"\n"
+            "        )\n",
+            "        self.decode_l3_read_path = dualpath_decode_capable()\n",
+        ),
+    ),
+}
+
+
+def patch_dynamic_read_path_file(path: Path, rel: str) -> None:
+    source = path.read_text()
+    if "dualpath_read_path import" in source:
+        print(f"Already patched: {path}")
+        return
+    for old, new in DYNAMIC_READ_PATH_SITES[rel]:
+        source = replace_once(source, old, new, f"resolve read path per request in {rel}")
+    names = ["is_decode_read as dualpath_is_decode_read"]
+    if "dualpath_decode_capable()" in source:
+        names.append("decode_capable as dualpath_decode_capable")
+    imports = (
+        "# DUALPATH_DYNAMIC_READ_PATH\n"
+        "from sglang.srt.utils.dualpath_read_path import (\n"
+        + "".join(f"    {n},\n" for n in names)
+        + ")\n"
+    )
+    source = replace_once(
+        source, "logger = logging.getLogger(__name__)\n",
+        "logger = logging.getLogger(__name__)\n\n" + imports,
+        f"import the read-path resolver into {rel}",
+    )
+    path.write_text(source)
+    print(f"Patched: {path}")
+
+
 def patch_decode_offload_prefill_path_boundary(source: str) -> str:
     """Skip the durable prefix on the Prefill read path too.
 
@@ -5115,6 +5314,7 @@ def main() -> None:
     )
     args = parser.parse_args()
     srt = args.site_packages / "sglang/srt"
+    write_read_path_helper(srt / "utils/dualpath_read_path.py")
     write_ttft_v3_helper(srt / "utils/dualpath_ttft.py")
     patch_hicache_file_o_direct_read(srt / "mem_cache/hicache_storage.py")
     patch_prefill_o_direct_reusable_buffer(
@@ -5167,6 +5367,10 @@ def main() -> None:
         srt / "managers/schedule_batch.py",
         ("DUALPATH_REQ_TIMING rid=%s",),
     )
+    # Last: rewrite the process-level read-path switches into per-request
+    # decisions, after every other patch has settled their surrounding code.
+    for rel in DYNAMIC_READ_PATH_SITES:
+        patch_dynamic_read_path_file(srt / rel, rel)
 
 
 if __name__ == "__main__":

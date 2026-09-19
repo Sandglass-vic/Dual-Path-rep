@@ -78,6 +78,7 @@ output_processor = (
 ).read_text()
 http_server = (root / "entrypoints/http_server.py").read_text()
 ttft_v3 = (root / "utils/dualpath_ttft.py").read_text()
+read_path = (root / "utils/dualpath_read_path.py").read_text()
 assert version("mooncake-transfer-engine-cuda13") == "0.3.13.post1"
 assert "DUALPATH_L3_TIMING" in hiradix
 assert "prefill_engine=%s" in hiradix
@@ -222,6 +223,24 @@ assert mooncake_conn.index(
 ) < mooncake_conn.index("self.conclude_state = status")
 assert "DUALPATH_TTFT_D_DISPATCH" in output_processor
 assert "SCHEMA_VERSION = 3" in ttft_v3
+# Dynamic read path: one decision per request, derived not negotiated.
+assert "def resolve" in read_path
+assert "alternate_per_turn" not in read_path or "same_turn_lockstep" in read_path
+assert '"configured_path": CONFIGURED_PATH' in ttft_v3
+assert "resolve_read_path(rid)" in ttft_v3
+for dualpath_rel, dualpath_src in (
+    ("managers/scheduler.py", scheduler),
+    ("disaggregation/prefill.py", prefill),
+    ("disaggregation/decode.py", decode),
+    ("disaggregation/decode_kvcache_offload_manager.py", decode_offload),
+    ("disaggregation/mooncake/conn.py", mooncake_conn),
+):
+    if "DUALPATH_L3_READ_PATH" in dualpath_src:
+        raise SystemExit(
+            f"{dualpath_rel} still switches on the process-level read path"
+        )
+assert "dualpath_is_decode_read(req.rid)" in scheduler
+assert "dualpath_decode_capable()" in mooncake_conn
 assert "DUALPATH_TTFT_V3_CACHE_CONTROLLER" in cache_controller
 assert "dualpath_before_read_start_ns" in cache_controller
 assert "dualpath_lustre_read_ns" in cache_controller
@@ -276,6 +295,7 @@ compile(
 )
 compile(http_server, str(root / "entrypoints/http_server.py"), "exec")
 compile(ttft_v3, str(root / "utils/dualpath_ttft.py"), "exec")
+compile(read_path, str(root / "utils/dualpath_read_path.py"), "exec")
 print("MOONCAKE_VERSION=0.3.13.post1")
 print("SGLANG_BENCHMARK_TIMING_PATCH_OK")
 PY

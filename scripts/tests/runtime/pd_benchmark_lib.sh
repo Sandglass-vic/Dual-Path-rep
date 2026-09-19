@@ -70,6 +70,8 @@ dualpath_export_common_env() {
   export DUALPATH_DECODE_L3_SYNC_RANKS=${DUALPATH_DECODE_L3_SYNC_RANKS:-${TP_SIZE:-4}}
   export DUALPATH_DECODE_L3_SYNC_TIMEOUT=${DUALPATH_DECODE_L3_SYNC_TIMEOUT:-600}
   export DUALPATH_L3_READ_PATH=${DUALPATH_L3_READ_PATH:-prefill}
+  # Only consulted when DUALPATH_L3_READ_PATH=dynamic.
+  export DUALPATH_DYNAMIC_PATH_POLICY=${DUALPATH_DYNAMIC_PATH_POLICY:-alternate_per_turn}
   # Give every request/turn its own local radix namespace. Lustre page hashes
   # remain token-based, so cross-turn reuse is forced through Lustre instead.
   export DUALPATH_NO_CROSS_TURN_KV_REUSE=${DUALPATH_NO_CROSS_TURN_KV_REUSE:-1}
@@ -78,8 +80,9 @@ dualpath_export_common_env() {
     echo "DUALPATH_NO_CROSS_TURN_KV_REUSE must be 0 or 1" >&2
     return 2
   fi
-  if [[ "$DUALPATH_L3_READ_PATH" != prefill && "$DUALPATH_L3_READ_PATH" != decode ]]; then
-    echo "DUALPATH_L3_READ_PATH must be prefill or decode" >&2
+  if [[ "$DUALPATH_L3_READ_PATH" != prefill && "$DUALPATH_L3_READ_PATH" != decode && \
+        "$DUALPATH_L3_READ_PATH" != dynamic ]]; then
+    echo "DUALPATH_L3_READ_PATH must be prefill, decode or dynamic" >&2
     return 2
   fi
   export MODEL_DIR LOG_DIR CACHE_DIR IB_DEVICE PREFILL_PORT DECODE_PORT
@@ -94,7 +97,7 @@ dualpath_export_common_env() {
   export DUALPATH_DECODE_PD_HOST_STAGING_GB DECODE_HICACHE_RATIO
   export FLUSH_LOCAL_CACHE_BETWEEN_TURNS STORAGE_SETTLE_SECONDS
   export DUALPATH_DECODE_L3_SYNC_RANKS DUALPATH_DECODE_L3_SYNC_TIMEOUT
-  export DUALPATH_L3_READ_PATH
+  export DUALPATH_L3_READ_PATH DUALPATH_DYNAMIC_PATH_POLICY
   export DUALPATH_NO_CROSS_TURN_KV_REUSE
   export DUAL_PATH_O_DIRECT_READ
   export DUALPATH_TTFT_TIMING DUALPATH_TTFT_TIMING_DETAIL
@@ -279,6 +282,9 @@ Path(sys.argv[1]).write_text(json.dumps({
         os.environ.get("DUALPATH_DECODE_L3_SYNC_TIMEOUT", "600")
     ),
     "l3_read_path": os.environ.get("DUALPATH_L3_READ_PATH", "prefill"),
+    "dynamic_path_policy": os.environ.get(
+        "DUALPATH_DYNAMIC_PATH_POLICY", "alternate_per_turn"
+    ),
     "ttft_timing_v3": bool(int(os.environ.get("DUALPATH_TTFT_TIMING", "1"))),
     "ttft_timing_detail": bool(
         int(os.environ.get("DUALPATH_TTFT_TIMING_DETAIL", "0"))

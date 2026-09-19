@@ -4,7 +4,8 @@
 的 `dynamic` read path。Dynamic 模式下，每个 request 单独选择 Prefill 或 Decode
 作为 L3 KV 读取方；两侧通过同一个不可变 decision 协调工作。
 
-本文是实现方案，不代表当前代码已经支持 `dynamic`。
+**实现状态**：§1–§9 已实现（阶段一至三），见 `srt/utils/dualpath_read_path.py`。
+尚未实验验证。与本文原稿的两处偏差见 §14。
 
 ## 1. 目标与约束
 
@@ -77,7 +78,7 @@ DUALPATH_DYNAMIC_FAIL_MODE=fail_closed
 | `decode` | 所有 request 使用 Decode L3 read |
 | `dynamic` | 每个 request 单独决定 path |
 | `alternate_per_turn` | 每条 trajectory 内按 turn 交替，轨迹间相位错开（默认） |
-| `alternate_global` | 按全局 admission 顺序交替，**仅用于诊断**，见 §3.1 |
+| `same_turn_lockstep` | 所有轨迹在同一 turn 同时切换，**仅用于诊断** |
 | `fail_closed` | 请求未携带合法 decision 时拒绝该 request |
 
 没有 `DUALPATH_DYNAMIC_DECISION_TIMEOUT`：decision 随请求一起到达（§4），引擎侧
@@ -160,7 +161,7 @@ path = "prefill" if (turn_index + phase) % 2 == 0 else "decode"
 ```
 
 全局 `sequence_no` 仍然分配并记录，但只作为审计信息，不参与选路。
-`alternate_global` 保留为诊断选项，用于复现上表这一退化现象。
+`same_turn_lockstep` 保留为诊断选项，用于制造可控的退化对照。
 
 ### 3.2 谁来分配：客户端即全局 admission 点
 
@@ -662,3 +663,48 @@ def handle_request(req):
 8. 静态 `prefill` / `decode` 通过同一套 strategy 接口保留；
 9. timing、统计和 `cached_tokens` 都按 resolved path 计算；
 10. decision 缺失时默认 fail-closed，避免双读和错误归因。
+
+## 14. 实现与本文原稿的偏差
+
+**decision 的载体是 rid，不是新增请求字段。** §4 原本要给 `GenerateReqInput` 加字段并
+依赖 Router 透传。实测发现客户端已经把 `(trajectory, turn)` 编码进它完全掌控的 `rid`，
+而 Router 把同一个 rid 交给两侧引擎、`recv_requests()` 又广播给所有 TP rank。于是
+`resolve(rid)` 这个纯函数天然在两侧、所有 rank 上给出同一结果，不需要改 `GenerateReqInput`、
+`tokenizer_manager`，也不依赖 Rust Router 是否保留未知字段（后者无法在本地验证）。
+
+§11 曾担心"rid 会变所以不能反推"——客户端 stream 重试会把 rid 改成
+`<rid>-stream-retry-N`，但解析用的正则只取 `(trajectory, turn)`，后缀不影响结果。
+已验证 104 条真实 rid 加后缀后决策不变。
+
+**相位函数用轨迹编号，不用 hash。** §3.1 写的是 `stable_hash(trajectory_id) & 1`。实测
+`crc32` 对 `32k-0000`..`32k-0003` 给出**相同**的奇偶位，四条轨迹会全部同相，正好制造出
+§3.1 想避免的那种退化。改用轨迹编号的奇偶（`32k-0001` → 1），相邻轨迹严格反相。
+
+## 15. 实现细节
+
+新模块 `srt/utils/dualpath_read_path.py`（由 `write_read_path_helper()` 生成，沿用
+`write_ttft_v3_helper()` 的范式）：
+
+```python
+resolve(rid) -> "prefill" | "decode"     # 纯函数，LRU 缓存，永不抛异常
+is_decode_read(rid) -> bool
+decode_capable() -> bool                  # 启动期能力开关
+```
+
+五个原先读 `DUALPATH_L3_READ_PATH` 的运行时开关点已全部改为按请求决策：
+
+| 文件 | 改法 |
+|---|---|
+| `managers/scheduler.py` | `dualpath_is_decode_read(req.rid)` |
+| `disaggregation/prefill.py` | `if not dualpath_is_decode_read(req.rid)` |
+| `disaggregation/decode.py` | `dualpath_is_decode_read(decode_req.req.rid)` |
+| `disaggregation/decode_kvcache_offload_manager.py` | `dualpath_is_decode_read(req.rid)` |
+| `disaggregation/mooncake/conn.py` | `dualpath_decode_capable()`（启动期能力，非按请求） |
+
+构建期断言会遍历这五个文件，若任何一个仍出现 `DUALPATH_L3_READ_PATH` 就直接失败。
+
+TTFT V3 记录同时输出 `configured_path`（run 模式）与 `path`（该请求实际走的路径），
+`run.json` 增加 `dynamic_path_policy`。
+
+无法解析的 rid（warmup、`HEALTH_CHECK_*`）回退到 `prefill` 而非 fail-closed——让健康检查
+失败会直接打断 run，代价远大于收益。

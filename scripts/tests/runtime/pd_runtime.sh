@@ -28,8 +28,9 @@ export TP_SIZE=${TP_SIZE:-4}
 export JOB_RUNTIME_DIR=${JOB_RUNTIME_DIR:-$RUNTIME_HOME/test/$ALLOC_JOB_ID}
 export SERVER_CACHE_DIR=${SERVER_CACHE_DIR:-$JOB_RUNTIME_DIR/pd-servers/kv-cache/file}
 : "${DUALPATH_L3_READ_PATH:?Set DUALPATH_L3_READ_PATH=prefill or decode for every role}"
-[[ $DUALPATH_L3_READ_PATH == prefill || $DUALPATH_L3_READ_PATH == decode ]] || {
-  echo "DUALPATH_L3_READ_PATH must be prefill or decode" >&2
+[[ $DUALPATH_L3_READ_PATH == prefill || $DUALPATH_L3_READ_PATH == decode ||
+   $DUALPATH_L3_READ_PATH == dynamic ]] || {
+  echo "DUALPATH_L3_READ_PATH must be prefill, decode or dynamic" >&2
   exit 2
 }
 
