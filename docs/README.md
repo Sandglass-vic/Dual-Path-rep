@@ -19,12 +19,14 @@
     task/dataset/agents/rep 产物布局。
 14. [TTFT Timing V3](ttft-timing-v3.md)：正式 breakdown 时间线、边界、重叠归属和 TP 聚合。
 15. [当前数据流与消融开关](dataflow-and-ablation.md)：L3、P→D、chunk 传输边界和一键 profile。
-16. [四轮延迟结果](latency-results.md)：历史 Job `65032`（诊断口径）。
-17. [TTFT 全链路历史测例](ttft-fullchain.md)：历史 Job `65144` 数值。
-18. [完整轨迹历史测例](trajectory-metrics.md)：历史 Job `65502` KV/带宽现象。
-19. [里程碑与风险](milestones-and-risks.md)：完成标准、风险和执行顺序。
-20. [复现与安全](reproducibility-and-security.md)：结果元数据、Git 和凭据规则。
-21. [参考资料](references.md)：论文和官方文档链接。
+16. [Dynamic L3 Read Path](dynamic.md)：request-scoped path 决策、Prefill/Decode 协调和交替策略设计。
+17. [四轮延迟结果](latency-results.md)：历史 Job `65032`（诊断口径）。
+18. [TTFT 全链路历史测例](ttft-fullchain.md)：历史 Job `65144` 数值。
+19. [完整轨迹历史测例](trajectory-metrics.md)：历史 Job `65502` KV/带宽现象。
+20. [里程碑与风险](milestones-and-risks.md)：完成标准、风险和执行顺序。
+21. [复现与安全](reproducibility-and-security.md)：结果元数据、Git 和凭据规则。
+22. [参考资料](references.md)：论文和官方文档链接。
+23. [当前任务交接](task-handoff-2026-09-19.md)：pza100、镜像、最近实验结果和下一步修复点。
 
 ## 信息唯一来源
 

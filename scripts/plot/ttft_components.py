@@ -8,6 +8,7 @@ from plot_style import COLORS
 
 
 PREFILL_PATH_COMPONENTS = (
+    ("queue_wait_seconds", "Queue wait", COLORS["lightgray"]),
     ("prefill_before_lustre_read_seconds", "Prefill before Lustre Read", COLORS["purple"]),
     ("prefill_lustre_read_seconds", "Prefill KV Read (Lustre)", COLORS["orange"]),
     ("prefill_scatter_seconds", "Prefill Scatter", COLORS["brown"]),
@@ -20,6 +21,7 @@ PREFILL_PATH_COMPONENTS = (
 )
 
 DECODE_PATH_COMPONENTS = (
+    ("queue_wait_seconds", "Queue wait", COLORS["lightgray"]),
     ("decode_preallocation_seconds", "Decode pre-allocation", COLORS["yellow"]),
     ("decode_before_lustre_read_seconds", "Decode before Lustre Read", COLORS["purple"]),
     ("decode_lustre_read_seconds", "Decode KV Read (Lustre)", COLORS["orange"]),
@@ -76,5 +78,7 @@ def normalize_ttft_row(row: dict[str, Any]) -> dict[str, Any]:
     )
     row.setdefault("decode_host_to_device_seconds", 0.0)
     row.setdefault("decode_dispatch_seconds", 0.0)
+    # Runs predating the queue-wait stage fold that time into misc.
+    row.setdefault("queue_wait_seconds", 0.0)
     row.setdefault("misc_seconds", 0.0)
     return row

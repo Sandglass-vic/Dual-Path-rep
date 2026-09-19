@@ -204,7 +204,10 @@ SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR=<job-specific Lustre path>
 
 File backend reads use the existing buffered path by default. Set
 `DUAL_PATH_O_DIRECT_READ=1` when starting the engines to enable the patched
-Lustre `O_DIRECT` read path. With the value unset or `0`, the current
+POSIX file-backend `O_DIRECT` read path. The launcher validates the actual
+cache directory with an aligned direct-read probe, so the same path supports
+Lustre, XFS, and NFS mounts whose client/kernel combination implements
+`O_DIRECT`. With the value unset or `0`, the current
 `open(..., buffering=0) + readinto()` behavior is unchanged. The option affects
 only file reads; file writes remain buffered. For Prefill, the patched direct
 path keeps one 4096-byte-aligned pinned page per TP rank, reads one page and
@@ -215,6 +218,42 @@ backends retain the upstream batch behavior.
 The option does not affect KV writes, P→D/D→P transfers, or Host→GPU copies.
 It is fixed when the server starts, so Prefill and Decode must be restarted to
 change it.
+
+### Host pool 尺寸与 L3 prefetch 配额
+
+SGLang 对在飞的 storage prefetch 设了一个全局 token 配额
+（`managers/cache_controller.py`）：
+
+```python
+self.prefetch_capacity_limit = int(
+    0.8 * (self.mem_pool_host.size - self.mem_pool_device.size)
+)
+```
+
+`hiradix_cache.prefetch_from_storage()` 在入口用 `prefetch_rate_limited()` 检查它，
+超限就直接 `return`：不发 hash query、不落日志、不重试，该请求本轮退化为全量重算。
+`prefetch_tokens_occupied` 在请求到达时累加，但要等它被 `get_new_batch_prefill()`
+扫到才递减，所以 32K 场景下配额实际被占住 10–13 秒，而 Lustre 读只要约 1 秒。
+
+关键在于配额由 **Host pool 减 device pool** 决定。用 `--hicache-ratio` 时 Host pool
+随 GPU 的 KV 容量缩放，换到 KV 池更小的卡上配额会一起塌掉。A100 40GB 上
+`max_total_num_tokens=94080`、`--hicache-ratio 1.35` 只给出 26368 tokens 的配额，
+比单个 32K 前缀还小，导致 4 个并发 agent 里同时只有一个能预取，其余静默跳过。
+
+因此 Prefill 改用绝对尺寸 `HICACHE_SIZE_GB`（映射到 `--hicache-size`，单位 GB，
+非 0 时覆盖 `--hicache-ratio`），把配额与 GPU 解耦：
+
+```text
+HICACHE_SIZE_GB=40   # A100 40GB：Host pool 610368 tokens，配额 413030 tokens
+```
+
+配额需要覆盖 `(并发 agent 数 - 1) x 最大前缀 tokens`；32K/4-agent 的最大前缀约
+32256 tokens，故配额需 > 96768，40 GB 的 413030 留有充足余量。每 rank 40 GB、
+TP4 合计 160 GB pinned host memory，pza100 节点 502 GB 可以容纳。
+
+注意 SGLang 仍 `assert host_pool.size > device_pool.size`。40 GB 在 A100 40GB
+与 H100 80GB 上都成立，但换到 KV 池更大的配置时仍需复核，或设为 0 退回
+`HICACHE_RATIO` 分配。
 
 ### Prefetch、H2D 与双向传输的 V3 边界
 

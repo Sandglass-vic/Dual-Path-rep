@@ -75,7 +75,7 @@ def main() -> None:
         "--result-dir",
         type=Path,
         required=True,
-        help="Lustre runtime results (raw rounds/summary)",
+        help="Shared runtime results (raw rounds/summary)",
     )
     parser.add_argument("--log-dir", type=Path, required=True)
     parser.add_argument(
@@ -95,7 +95,7 @@ def main() -> None:
     sys.path.insert(0, str(plot_dir))
     from plot_style import metadata_title_suffix
     args.repo_result_dir.mkdir(parents=True, exist_ok=True)
-    # Keep all derived summaries and plots on the repository side. The Lustre
+    # Keep all derived summaries and plots on the repository side. The shared
     # result directory is the immutable source of replay output.
     summary_dir = args.repo_result_dir / "summary"
     summary_dir.mkdir(parents=True, exist_ok=True)
@@ -175,6 +175,8 @@ def main() -> None:
                 str(args.log_dir),
                 "--log-glob",
                 "*.log",
+                "--l3-read-path",
+                str(metadata.get("l3_read_path", "prefill")),
                 "--output-dir",
                 str(longest_dir),
                 "--csv-output",

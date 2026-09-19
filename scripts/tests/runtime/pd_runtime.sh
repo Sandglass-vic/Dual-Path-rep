@@ -11,7 +11,7 @@ fi
 [[ $role_id =~ ^[0-9]+$ ]] || { echo "Invalid engine ID: $role_id" >&2; exit 2; }
 
 CODE_HOME=${CODE_HOME:-/workspace/dual-path}
-RUNTIME_HOME=${RUNTIME_HOME:-/mnt/lustre/users/sezhou/dual-path}
+RUNTIME_HOME=${RUNTIME_HOME:-/data/home/yongxiao/mydata}
 : "${PREFILL_HOSTS:?PREFILL_HOSTS is required}"
 : "${DECODE_HOSTS:?DECODE_HOSTS is required}"
 read -r -a prefill_hosts <<<"$PREFILL_HOSTS"
@@ -24,6 +24,7 @@ export MODEL_DIR=${MODEL_DIR:-$RUNTIME_HOME/models/Qwen2.5-32B}
 export PREFILL_PORT=${PREFILL_PORT:-30000} DECODE_PORT=${DECODE_PORT:-30000}
 export BOOTSTRAP_PORT=${BOOTSTRAP_PORT:-8998} ROUTER_PORT=${ROUTER_PORT:-8000}
 export SERVER_TIMEOUT=${SERVER_TIMEOUT:-1200}
+export TP_SIZE=${TP_SIZE:-4}
 export JOB_RUNTIME_DIR=${JOB_RUNTIME_DIR:-$RUNTIME_HOME/test/$ALLOC_JOB_ID}
 export SERVER_CACHE_DIR=${SERVER_CACHE_DIR:-$JOB_RUNTIME_DIR/pd-servers/kv-cache/file}
 : "${DUALPATH_L3_READ_PATH:?Set DUALPATH_L3_READ_PATH=prefill or decode for every role}"
@@ -38,6 +39,52 @@ source "$CODE_HOME/scripts/tests/runtime/pd_benchmark_lib.sh"
 apply_ablation_profile "${ABLATION_PROFILE:-full}"
 dualpath_export_common_env
 unset MOONCAKE_MASTER MOONCAKE_TE_META_DATA_SERVER
+
+probe_o_direct_read() {
+  local directory=$1
+  python - "$directory" <<'PY'
+import ctypes
+import mmap
+import os
+import pathlib
+import sys
+
+directory = pathlib.Path(sys.argv[1])
+alignment = 4096
+path = directory / f".dualpath-o-direct-probe-{os.getpid()}"
+view = None
+scratch = None
+try:
+    with path.open("wb", buffering=0) as file:
+        file.write(b"\0" * alignment)
+        os.fsync(file.fileno())
+
+    scratch = mmap.mmap(-1, alignment * 2)
+    address = ctypes.addressof(ctypes.c_char.from_buffer(scratch))
+    offset = (-address) % alignment
+    view = memoryview(scratch)[offset : offset + alignment]
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECT)
+    try:
+        count = os.readv(fd, [view])
+    finally:
+        os.close(fd)
+    if count != alignment:
+        raise OSError(f"short O_DIRECT probe read: {count}/{alignment}")
+except Exception as exc:
+    print(
+        f"O_DIRECT read probe failed for {directory}: "
+        f"{type(exc).__name__}: {exc}",
+        file=sys.stderr,
+    )
+    raise SystemExit(2)
+finally:
+    if view is not None:
+        view.release()
+    if scratch is not None:
+        scratch.close()
+    path.unlink(missing_ok=True)
+PY
+}
 
 if [[ $role == prefill || $role == decode ]]; then
   TASK_NAME=${TASK_NAME:-allocation-$ALLOC_JOB_ID}
@@ -108,9 +155,16 @@ if [[ $role == client ]]; then
 fi
 
 if [[ $role == prefill || $role == decode ]]; then
-  mkdir -p "$LOG_DIR"
+  mkdir -p "$LOG_DIR" "$CACHE_DIR"
+  storage_fstype=$(stat -f -c %T "$CACHE_DIR")
+  export STORAGE_FSTYPE=${STORAGE_FSTYPE:-$storage_fstype}
+  if [[ $DUAL_PATH_O_DIRECT_READ == 1 ]]; then
+    probe_o_direct_read "$CACHE_DIR"
+  fi
   printf 'Server configuration: role=%s l3_read=%s log_dir=%s cache_dir=%s\n' \
     "$role" "$DUALPATH_L3_READ_PATH" "$LOG_DIR" "$CACHE_DIR"
+  printf '  storage_fstype=%s storage_topology=%s\n' \
+    "$STORAGE_FSTYPE" "${STORAGE_TOPOLOGY:-g5-xfs-export-g6-nfs}"
   printf '  dual_path_o_direct_read=%s\n' "$DUAL_PATH_O_DIRECT_READ"
   printf '  ttft_timing_v3=%s detail=%s\n' \
     "$DUALPATH_TTFT_TIMING" "$DUALPATH_TTFT_TIMING_DETAIL"
@@ -146,6 +200,8 @@ if [[ -e $RUN_DIR/summary.json || -e $RUN_DIR/rounds.jsonl ]]; then
   exit 2
 fi
 mkdir -p "$LOG_DIR" "$RUN_DIR" "$CACHE_DIR"
+storage_fstype=$(stat -f -c %T "$CACHE_DIR")
+export STORAGE_FSTYPE=${STORAGE_FSTYPE:-$storage_fstype}
 if [[ -n $DUALPATH_DECODE_L3_SYNC_DIR ]]; then
   mkdir -p "$DUALPATH_DECODE_L3_SYNC_DIR"
 fi

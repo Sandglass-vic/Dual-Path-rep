@@ -443,6 +443,13 @@ def main() -> None:
             prefill_scatter = float(prefill_l3.get("scatter", 0.0))
             decode_lustre_read = float(decode_l3.get("lustre", 0.0))
             decode_scatter = float(decode_l3.get("scatter", 0.0))
+            l3_read_path = str(metadata.get("l3_read_path", "prefill"))
+            if l3_read_path == "prefill":
+                selected_cached_tokens = int(prefill_l3.get("tokens", 0))
+            elif l3_read_path == "decode":
+                selected_cached_tokens = int(decode_l3.get("tokens", 0))
+            else:
+                raise RuntimeError(f"Invalid L3 read path: {l3_read_path}")
             read = prefill_read + decode_read
             prefill = float(request.get("prefill", 0.0))
             ttft = float(item["ttft_seconds"])
@@ -451,6 +458,8 @@ def main() -> None:
                 {
                     **metadata,
                     **item,
+                    "router_reported_cached_tokens": int(item["cached_tokens"]),
+                    "cached_tokens": selected_cached_tokens,
                     "sch_seconds": sch,
                     "alloc_seconds": alloc,
                     "read_seconds": read,
@@ -485,8 +494,7 @@ def main() -> None:
                         if decode_lustre_read > 0
                         else 0.0
                     ),
-                    "l3_read_tokens_logical": int(prefill_l3.get("tokens", 0))
-                    + int(decode_l3.get("tokens", 0)),
+                    "l3_read_tokens_logical": selected_cached_tokens,
                     "l3_prefetched_tokens_tp0": int(prefill_l3.get("tokens", 0)),
                     "l3_prefetched_tokens_logical": int(prefill_l3.get("tokens", 0)),
                     "l3_prefill_engine_id": prefill_l3.get("engine", ""),
@@ -524,7 +532,7 @@ def main() -> None:
                         else 0.0
                     ),
                     "cache_hit_rate": (
-                        int(item["cached_tokens"]) / int(item["prompt_tokens"])
+                        selected_cached_tokens / int(item["prompt_tokens"])
                         if int(item["prompt_tokens"]) > 0
                         else 0.0
                     ),
@@ -572,8 +580,8 @@ def main() -> None:
                 "residual_mean_seconds": mean(values("residual_seconds")),
                 "prompt_tokens_min": min(int(item["prompt_tokens"]) for item in rounds),
                 "prompt_tokens_max": max(int(item["prompt_tokens"]) for item in rounds),
-                "cached_tokens_min": min(int(item["cached_tokens"]) for item in rounds),
-                "cached_tokens_max": max(int(item["cached_tokens"]) for item in rounds),
+                "cached_tokens_min": min(values("cached_tokens")),
+                "cached_tokens_max": max(values("cached_tokens")),
                 "stream_retry_count": sum(
                     int(item.get("stream_retry_count", 0)) for item in rounds
                 ),
@@ -689,6 +697,7 @@ def main() -> None:
         if bool(item.get("prefill_l3", True))
         and bool(item.get("decode_offload", True))
         and bool(item.get("prefill_hicache_evict_unlocked", False))
+        and str(item.get("l3_read_path", "prefill")) == "prefill"
     ]
     validation = {
         "runs": len(run_rows),

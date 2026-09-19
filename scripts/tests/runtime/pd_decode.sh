@@ -15,6 +15,7 @@ export DUALPATH_DECODE_PD_HOST_STAGING=${DUALPATH_DECODE_PD_HOST_STAGING:-1}
 DECODE_PORT=${DECODE_PORT:-30000}
 MEM_FRACTION_STATIC=${MEM_FRACTION_STATIC:-0.75}
 CONTEXT_LENGTH=${CONTEXT_LENGTH:-4096}
+TP_SIZE=${TP_SIZE:-4}
 PD_TRANSFER_BACKEND=${PD_TRANSFER_BACKEND:-mooncake}
 HICACHE_STORAGE_BACKEND=${HICACHE_STORAGE_BACKEND:-file}
 DECODE_OFFLOAD_KVCACHE=${DECODE_OFFLOAD_KVCACHE:-${ENABLE_HICACHE_L3:-0}}
@@ -110,7 +111,7 @@ fi
 
 mkdir -p "$LOG_DIR"
 
-echo "Starting TP8 decode on $DECODE_HOST"
+echo "Starting TP${TP_SIZE} decode on $DECODE_HOST"
 echo "Streaming Decode output to console and $DECODE_LOG"
 set +e
 PYTHONUNBUFFERED=1 python -u -m sglang.launch_server \
@@ -118,7 +119,7 @@ PYTHONUNBUFFERED=1 python -u -m sglang.launch_server \
   --served-model-name qwen2.5-32b \
   --host 0.0.0.0 \
   --port "$DECODE_PORT" \
-  --tp-size 8 \
+  --tp-size "$TP_SIZE" \
   --dtype bfloat16 \
   --kv-cache-dtype auto \
   --context-length "$CONTEXT_LENGTH" \

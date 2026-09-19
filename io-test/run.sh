@@ -2,21 +2,24 @@
 # Compare one-node and two-node Decode-style Lustre page reads inside an salloc.
 set -euo pipefail
 
-CODE_HOME=${CODE_HOME:-/labhome/sezhou/dual-path}
-RUNTIME_HOME=${RUNTIME_HOME:-/mnt/lustre/users/sezhou/dual-path}
-IMAGE=${IMAGE:-$RUNTIME_HOME/images/sglang-file-l3-dual-staging-69054.sqsh}
-TP_RANKS=${TP_RANKS:-8}
+CODE_HOME=${CODE_HOME:-/data/home/yongxiao/dual-path}
+RUNTIME_HOME=${RUNTIME_HOME:-/data/home/yongxiao/mydata}
+IMAGE=${IMAGE:-$RUNTIME_HOME/images/sglang:26.01-py3-mooncake0.3.13.post1-dualpath-patched.sqsh}
+CONTAINER_MOUNTS=${CONTAINER_MOUNTS:-/data:/data,$CODE_HOME:/workspace/dual-path:ro}
+TP_RANKS=${TP_RANKS:-4}
 PAGES_PER_RANK=${PAGES_PER_RANK:-512}
-PAGE_BYTES=${PAGE_BYTES:-2097152}
+PAGE_BYTES=${PAGE_BYTES:-4194304}
 PASSES=${PASSES:-1}
 REPETITIONS=${REPETITIONS:-3}
 BUFFER_TYPE=${BUFFER_TYPE:-pinned}
-CPUS_PER_NODE=${CPUS_PER_NODE:-112}
+CPUS_PER_NODE=${CPUS_PER_NODE:-32}
+GRES=${GRES:-gpu:1}
 DROP_CACHE=${DROP_CACHE:-1}
 COPY_TO_STAGING=${COPY_TO_STAGING:-1}
 COPY_IMPLEMENTATION=${COPY_IMPLEMENTATION:-torch}
 TORCH_THREADS=${TORCH_THREADS:-1}
 KEEP_DATA=${KEEP_DATA:-0}
+INCLUDE_PEER_SINGLE=${INCLUDE_PEER_SINGLE:-0}
 LAYERS=${LAYERS:-64}
 PAGE_TOKENS=${PAGE_TOKENS:-64}
 HEAD_DIM=${HEAD_DIM:-128}
@@ -48,6 +51,10 @@ done
   echo "COPY_IMPLEMENTATION must be torch or python" >&2
   exit 2
 }
+[[ $INCLUDE_PEER_SINGLE == 0 || $INCLUDE_PEER_SINGLE == 1 ]] || {
+  echo "INCLUDE_PEER_SINGLE must be 0 or 1" >&2
+  exit 2
+}
 
 RUN_ROOT=${RUN_ROOT:-$RUNTIME_HOME/io-test/$SLURM_JOB_ID}
 DATA_DIR=${DATA_DIR:-$RUN_ROOT/kv-pages}
@@ -59,7 +66,7 @@ mkdir -p "$LOCAL_RESULT_DIR"
 
 container_args=(
   --container-image="$IMAGE"
-  --container-mounts="/mnt/lustre:/mnt/lustre,$CODE_HOME:/workspace/dual-path"
+  --container-mounts="$CONTAINER_MOUNTS"
   --container-workdir=/workspace/dual-path
   --no-container-mount-home
 )
@@ -71,7 +78,7 @@ run_python() {
   srun --jobid="$SLURM_JOB_ID" --overlap --unbuffered --label \
     --nodes="$nodes" --ntasks="$nodes" --ntasks-per-node=1 \
     --nodelist="$hosts" --cpus-per-task="$CPUS_PER_NODE" \
-    --gres=gpu:1 --mpi=none "${container_args[@]}" \
+    --gres="$GRES" --mpi=none "${container_args[@]}" \
     python3 /workspace/dual-path/io-test/kv_read_bench.py "$@"
 }
 
@@ -104,15 +111,19 @@ host_csv="${reader_hosts[0]},${reader_hosts[1]}"
 run_read_phase() {
   local phase=$1
   local repetition=$2
-  local nodes hosts
+  local nodes hosts sync_host
   if [[ $phase == single ]]; then
     nodes=1
     hosts=${reader_hosts[0]}
+  elif [[ $phase == peer ]]; then
+    nodes=1
+    hosts=${reader_hosts[1]}
   else
     nodes=2
     hosts=$host_csv
   fi
-  echo "Running phase=$phase repetition=$repetition hosts=$hosts"
+  sync_host=$(printf "%s\n" "${reader_hosts[@]}" | sort -V | head -n 1)
+  echo "Running phase=$phase repetition=$repetition hosts=$hosts sync_host=$sync_host"
   run_python "$nodes" "$hosts" read \
     --data-dir "$DATA_DIR" --tp-ranks "$TP_RANKS" \
     --pages-per-rank "$PAGES_PER_RANK" --page-bytes "$PAGE_BYTES" \
@@ -120,7 +131,7 @@ run_read_phase() {
     "${copy_args[@]}" --copy-implementation "$COPY_IMPLEMENTATION" \
     --torch-threads "$TORCH_THREADS" \
     --layers "$LAYERS" --page-tokens "$PAGE_TOKENS" --head-dim "$HEAD_DIM" \
-    --sync-host "${reader_hosts[0]}" --sync-port "$SYNC_PORT" \
+    --sync-host "$sync_host" --sync-port "$SYNC_PORT" \
     --phase "$phase" --repetition "$repetition" --nodes "$nodes" \
     | tee -a "$RESULT_LOG"
 }
@@ -129,9 +140,15 @@ run_read_phase() {
 for ((repetition = 1; repetition <= REPETITIONS; repetition++)); do
   if (( repetition % 2 == 1 )); then
     run_read_phase single "$repetition"
+    if [[ $INCLUDE_PEER_SINGLE == 1 ]]; then
+      run_read_phase peer "$repetition"
+    fi
     run_read_phase dual "$repetition"
   else
     run_read_phase dual "$repetition"
+    if [[ $INCLUDE_PEER_SINGLE == 1 ]]; then
+      run_read_phase peer "$repetition"
+    fi
     run_read_phase single "$repetition"
   fi
 done

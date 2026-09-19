@@ -17,6 +17,9 @@ COLORS = {
     "pink": "#CC79A7",
     "gray": "#F1F3F5",
     "yellow": "#F0E442",
+    # Light neutral for queue wait. Stays a shade darker than the near-white
+    # "gray" used for Misc so the two remain distinguishable.
+    "lightgray": "#C9CDD2",
 }
 
 

@@ -6,19 +6,19 @@ from __future__ import annotations
 import argparse
 import json
 import statistics
+import sys
 from collections import defaultdict
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from marker_log import records_with_prefix  # noqa: E402
 
 RESULT_PREFIX = "KVIO_RESULT "
 
 
 def load_results(path: Path) -> list[dict]:
-    results = []
-    for line in path.read_text().splitlines():
-        marker = line.find(RESULT_PREFIX)
-        if marker >= 0:
-            results.append(json.loads(line[marker + len(RESULT_PREFIX) :]))
+    results = records_with_prefix(path, RESULT_PREFIX)
     if not results:
         raise RuntimeError(f"No {RESULT_PREFIX.strip()} records found in {path}")
     return results
@@ -26,9 +26,13 @@ def load_results(path: Path) -> list[dict]:
 
 def aggregate_phase(items: list[dict]) -> dict:
     total_bytes = sum(item["bytes"] for item in items)
-    start_ns = min(item["wall_start_ns"] for item in items)
-    end_ns = max(item["wall_end_ns"] for item in items)
+    # g5 and g6 CLOCK_REALTIME differ by tens of seconds, so the envelope has to
+    # be built from the barrier-corrected timestamps in the leader's timebase.
+    start_ns = min(item.get("wall_start_ns_leader", item["wall_start_ns"]) for item in items)
+    end_ns = max(item.get("wall_end_ns_leader", item["wall_end_ns"]) for item in items)
     seconds = (end_ns - start_ns) / 1e9
+    offsets = [abs(int(item.get("clock_leader_minus_local_ns", 0))) for item in items]
+    round_trips = [int(item.get("clock_offset_round_trip_ns", 0)) for item in items]
     return {
         "nodes": len(items),
         "hosts": [item["host"] for item in items],
@@ -37,6 +41,18 @@ def aggregate_phase(items: list[dict]) -> dict:
         "aggregate_gib_s": total_bytes / seconds / 2**30,
         "per_node_gib_s": {item["host"]: item["gib_s"] for item in items},
         "per_node_mean_gib_s": statistics.mean(item["gib_s"] for item in items),
+        "per_node_file_io_gib_s": {
+            item["host"]: item["file_io_gib_s"]
+            for item in items
+            if "file_io_gib_s" in item
+        },
+        "per_node_scatter_gib_s": {
+            item["host"]: item["scatter_gib_s"]
+            for item in items
+            if item.get("scatter_gib_s") is not None
+        },
+        "max_clock_offset_ns": max(offsets),
+        "max_clock_offset_error_ns": max(round_trips),
     }
 
 
@@ -53,7 +69,7 @@ def main() -> None:
 
     repetitions: dict[int, dict[str, dict]] = defaultdict(dict)
     for (phase, repetition), items in sorted(by_phase.items()):
-        expected = 1 if phase == "single" else 2
+        expected = 2 if phase == "dual" else 1
         if len(items) != expected:
             raise RuntimeError(
                 f"phase={phase} repetition={repetition} has {len(items)} nodes, expected {expected}"
@@ -62,21 +78,25 @@ def main() -> None:
 
     comparisons = []
     for repetition, phases in sorted(repetitions.items()):
-        if set(phases) != {"single", "dual"}:
+        if not {"single", "dual"}.issubset(phases):
             raise RuntimeError(f"repetition={repetition} is missing single or dual phase")
         single = phases["single"]
         dual = phases["dual"]
-        comparisons.append(
-            {
-                "repetition": repetition,
-                "single_gib_s": single["aggregate_gib_s"],
-                "dual_aggregate_gib_s": dual["aggregate_gib_s"],
-                "dual_per_node_mean_gib_s": dual["per_node_mean_gib_s"],
-                "aggregate_scaling": dual["aggregate_gib_s"] / single["aggregate_gib_s"],
-                "per_node_retention": dual["per_node_mean_gib_s"] / single["aggregate_gib_s"],
-                "dual_per_node_gib_s": dual["per_node_gib_s"],
-            }
-        )
+        comparison = {
+            "repetition": repetition,
+            "single_gib_s": single["aggregate_gib_s"],
+            "dual_aggregate_gib_s": dual["aggregate_gib_s"],
+            "dual_per_node_mean_gib_s": dual["per_node_mean_gib_s"],
+            "aggregate_scaling": dual["aggregate_gib_s"] / single["aggregate_gib_s"],
+            "per_node_retention": dual["per_node_mean_gib_s"] / single["aggregate_gib_s"],
+            "dual_per_node_gib_s": dual["per_node_gib_s"],
+        }
+        if "peer" in phases:
+            comparison["peer_gib_s"] = phases["peer"]["aggregate_gib_s"]
+            comparison["peer_to_writer_ratio"] = (
+                phases["peer"]["aggregate_gib_s"] / single["aggregate_gib_s"]
+            )
+        comparisons.append(comparison)
 
     scaling = statistics.median(item["aggregate_scaling"] for item in comparisons)
     retention = statistics.median(item["per_node_retention"] for item in comparisons)
@@ -99,6 +119,15 @@ def main() -> None:
         "comparisons": comparisons,
         "median_aggregate_scaling": scaling,
         "median_per_node_retention": retention,
+        "median_peer_to_writer_ratio": (
+            statistics.median(
+                item["peer_to_writer_ratio"]
+                for item in comparisons
+                if "peer_to_writer_ratio" in item
+            )
+            if any("peer_to_writer_ratio" in item for item in comparisons)
+            else None
+        ),
         "drop_cache": sorted(drops_cache),
         "diagnosis": diagnosis,
     }

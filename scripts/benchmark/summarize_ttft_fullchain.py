@@ -27,7 +27,34 @@ V3_STAGE_NAMES = (
     "d_to_p_transfer",
     "decode_host_to_device",
     "decode_dispatch",
+    "queue_wait",
 )
+
+
+def _v3_queue_wait(record: dict[str, Any], read_record: dict[str, Any], side: str) -> float:
+    """Queue time that no other stage already accounts for.
+
+    A queued request's own L3 read runs while it is still sitting in that
+    queue, so the raw window double counts the read pipeline. Subtract the
+    intersection instead of the read duration: the read can start before the
+    request reaches the head of the queue.
+    """
+    raw = _v3_stage(record, "queue_wait", "raw_seconds")
+    q_start = float(record.get("queue_wait_start_ns", 0) or 0)
+    q_end = float(record.get("queue_wait_end_ns", 0) or 0)
+    # Prefill stamps the read window as prefetch_*, Decode as decode_*.
+    prefix = "prefetch" if side == "prefill" else "decode"
+    r_start = float(read_record.get(f"{prefix}_before_read_start_ns", 0) or 0)
+    r_end = float(read_record.get(f"{prefix}_before_read_end_ns", 0) or 0)
+    if raw <= 0 or q_end <= q_start or r_end <= r_start:
+        return raw
+    # before_read_end only marks the hash query; the reads follow it.
+    r_end += 1e9 * (
+        _v3_stage(read_record, f"{side}_lustre_read", "raw_seconds")
+        + _v3_stage(read_record, f"{side}_scatter", "raw_seconds")
+    )
+    overlap = max(0.0, min(q_end, r_end) - max(q_start, r_start)) / 1e9
+    return max(0.0, raw - overlap)
 
 
 def collect_v3(paths: list[Path]) -> dict[str, dict[str, list[dict[str, Any]]]]:
@@ -137,8 +164,17 @@ def summarize_v3(
             else _v3_pick_max(decode, "decode_dispatch")
         )
 
+        # The two sides queue over the same wall-clock window (Prefill's
+        # bootstrap queue drains only once Decode is ready), so count the
+        # owning side's queue once instead of summing both.
+        queue_side = "decode" if path == "decode" else "prefill"
+        selected["queue_wait"] = _v3_pick_max(
+            decode if path == "decode" else prefill, "queue_wait"
+        )
+
         if path == "decode":
             critical_order = (
+                "queue_wait",
                 "decode_preallocation",
                 "decode_before_lustre_read",
                 "decode_lustre_read",
@@ -151,6 +187,7 @@ def summarize_v3(
             )
         else:
             critical_order = (
+                "queue_wait",
                 "prefill_before_lustre_read",
                 "prefill_lustre_read",
                 "prefill_scatter",
@@ -177,6 +214,16 @@ def summarize_v3(
             output[f"{stage}_selected_engine_diagnostic"] = str(
                 record.get("engine", "")
             )
+
+        queue_record = selected.get("queue_wait", {})
+        output["queue_wait_seconds"] = _v3_queue_wait(
+            queue_record, read_record, queue_side
+        )
+        output["queue_wait_overlap_removed_seconds"] = max(
+            0.0,
+            _v3_stage(queue_record, "queue_wait", "raw_seconds")
+            - output["queue_wait_seconds"],
+        )
 
         critical_sum = sum(float(output[f"{stage}_seconds"]) for stage in critical_order)
         ttft = float(round_item["ttft_seconds"])

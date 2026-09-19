@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=sglang-mooncake013-image
-#SBATCH --partition=GAIA
+#SBATCH --partition=run
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
+#SBATCH --cpus-per-task=48
+#SBATCH --mem=0
 #SBATCH --time=00:30:00
-#SBATCH --exclude=dgx-gaia-10,dgx-gaia-12,dgx-gaia-18,dgx-gaia-30,dgx-gaia-35,dgx-gaia-38,dgx-gaia-46,dgx-gaia-53
-#SBATCH --output=/labhome/sezhou/dual-path/timing-image-%j.out
+#SBATCH --output=timing-image-%j.out
 
 set -euo pipefail
 
@@ -41,6 +42,10 @@ enroot start --root --rw \
       "sglang-router==0.3.1"
     python /workspace/dual-path/scripts/infra/patch_sglang_benchmark_timing.py
   '
+
+# The root bind mount leaves a root-owned mountpoint in the writable container.
+# Make the now-empty path traversable before the unprivileged export walk.
+enroot start --root --rw "$CONTAINER_NAME" chmod 0755 /workspace /workspace/dual-path
 
 enroot start "$CONTAINER_NAME" python - <<'PY'
 from importlib.metadata import version
@@ -79,9 +84,31 @@ assert "prefill_engine=%s" in hiradix
 assert "DUALPATH_HICACHE_READ_ONLY" in hiradix
 assert "DUALPATH_HICACHE_EVICT_UNLOCKED" in hiradix
 assert "DUALPATH_PREFILL_DEFERRED_CACHE_RELEASE" in hiradix
+# patch_hiradix_prefetch_skips() applies to both a pristine and an
+# already-patched base, so these must always hold.
+for dualpath_marker in (
+    "DUALPATH_L3_PREFETCH_SKIP",
+    'dualpath_skip_reason = "rate_limited"',
+    "reason=no_host_mem",
+):
+    if dualpath_marker not in hiradix:
+        raise SystemExit(f"hiradix_cache.py is missing {dualpath_marker}")
+if (
+    "last_host_node, token_ids, host_indices, operation = self.ongoing_prefetch[rid]"
+    in hiradix
+):
+    raise SystemExit("hiradix_cache.py still unpacks a 4-tuple ongoing_prefetch")
 assert "self.dualpath_prefetch_local_end[operation.request_id]" in hiradix
 assert "shared_prefetch_can_terminate" in hiradix
 assert "shared_prefetch_finish" in hiradix
+# The durable L3 hash lookup stays namespace-free, but the restored pages must
+# be inserted back under the request's radix namespace or the prefix never
+# matches and Prefill recomputes the whole prompt.
+assert "extra_key=req.extra_key," in scheduler
+assert "extra_key=extra_key" in hiradix
+assert "extra_key" not in hiradix[
+    hiradix.index("operation = self.cache_controller.prefetch(") :
+][:200]
 assert "DUALPATH_REQ_TIMING" in schedule_batch
 assert "DETAIL as DUALPATH_TTFT_DETAIL" in schedule_batch
 assert '"DUALPATH_NO_CROSS_TURN_KV_REUSE", "1"' in schedule_batch
@@ -145,6 +172,23 @@ file_backend = HiCacheFile(SimpleNamespace(
 assert file_backend.dualpath_o_direct_read is True
 assert file_backend.dualpath_o_direct_alignment == 4096
 assert "DUALPATH_DECODE_OFFLOAD_BACKUP_COMPLETE" in decode_offload
+# Prefill read path must skip the durable L3 prefix instead of republishing
+# the whole context every turn.
+assert "dualpath_prefill_l3_prefix_trusted" in decode_offload
+assert 'dualpath_durable_prefix = getattr(req, "cached_tokens", 0)' in decode_offload
+# The Decode-restored L3 prefix is reported once, not once per side:
+# prepare_for_extend counts prefix_indices, so Prefill must not stamp it too.
+assert "req.cached_tokens = 0" in prefill
+assert "req.cached_tokens = hit_tokens" not in prefill
+# The offload guard runs on Decode, so it must not read Prefill-only env.
+assert "DUALPATH_HICACHE_READ_ONLY" not in decode_offload
+# Queue wait is an explicit TTFT V3 stage on both sides.
+assert '"queue_wait",' in ttft_v3
+assert "def queue_window_ns" in ttft_v3
+assert "dualpath_queue_window_ns" in prefill
+assert "dualpath_queue_window_ns" in output_processor
+assert '"queue_wait_raw_seconds"' in prefill
+assert '"queue_wait_raw_seconds"' in output_processor
 assert "DUALPATH_DECODE_L3_SYNC_COMPLETE" in decode_offload
 assert "DUALPATH_DECODE_L3_SYNC_DIR" in decode_offload
 assert decode_offload.index('getattr(storage_backend, "file_path", None)') < (
