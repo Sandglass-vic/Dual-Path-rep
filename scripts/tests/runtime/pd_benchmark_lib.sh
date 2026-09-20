@@ -3,10 +3,10 @@
 # shellcheck disable=SC2034
 
 dualpath_export_common_env() {
-  export NCCL_IB_HCA=${NCCL_IB_HCA:-mlx5_0,mlx5_4}
-  export NCCL_NET_GDR_LEVEL=${NCCL_NET_GDR_LEVEL:-PIX}
-  export NCCL_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME:-ibs3}
-  export GLOO_SOCKET_IFNAME=${GLOO_SOCKET_IFNAME:-ibs3}
+  # NCCL and Gloo pick their own interface and HCAs here. Pinning them is
+  # fabric-specific: mlx5_0,mlx5_4 and ibs3 name the pza100 A100 nodes and do
+  # not exist on DGX H100. Export NCCL_IB_HCA, NCCL_NET_GDR_LEVEL,
+  # NCCL_SOCKET_IFNAME or GLOO_SOCKET_IFNAME before launching to override.
   export ENABLE_BENCHMARK_TIMING=1
   export DUALPATH_TTFT_TIMING=${DUALPATH_TTFT_TIMING:-1}
   export DUALPATH_TTFT_TIMING_DETAIL=${DUALPATH_TTFT_TIMING_DETAIL:-0}
@@ -37,7 +37,7 @@ dualpath_export_common_env() {
   export HICACHE_RATIO=${HICACHE_RATIO:-1.35}
   export PREFILL_HICACHE_MEM_LAYOUT=${PREFILL_HICACHE_MEM_LAYOUT:-layer_first}
   export DECODE_HICACHE_RATIO=${DECODE_HICACHE_RATIO:-1.05}
-  export CONTEXT_LENGTH=${CONTEXT_LENGTH:-4096}
+  export CONTEXT_LENGTH=${CONTEXT_LENGTH:-65536}
   export MOONCAKE_PROTOCOL=${MOONCAKE_PROTOCOL:-rdma}
   export MOONCAKE_DEVICE=${MOONCAKE_DEVICE:-$IB_DEVICE}
   # Mooncake defaults synchronous transfers to 30s. Long-context concurrent
