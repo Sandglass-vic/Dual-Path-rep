@@ -62,6 +62,7 @@ def parse_logs(
     dict[str, dict[str, dict[int, tuple[float, float, float, int, str]]]],
     dict[str, dict[str, dict[int, tuple[float, float, float, int, str]]]],
     dict[str, list[dict[str, float | int | str]]],
+    dict[str, str],
 ]:
     transfer_values: dict[
         str, list[tuple[float, int, int, int, int, str, str]]
@@ -75,6 +76,7 @@ def parse_logs(
     prefill_breakdown_values: dict[
         str, dict[str, dict[int, list[tuple[float, float, int]]]]
     ] = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
+    path_values: dict[str, set[str]] = defaultdict(set)
     for path in log_dir.rglob(log_glob):
         for line in path.read_text(errors="replace").splitlines():
             marker = line.find(V3_PREFIX)
@@ -84,6 +86,9 @@ def parse_logs(
                     continue
                 rid = str(payload["rid"])
                 side = str(payload["side"])
+                resolved_path = str(payload.get("path", ""))
+                if resolved_path in ("prefill", "decode"):
+                    path_values[rid].add(resolved_path)
                 engine = str(payload.get("engine", "unknown"))
                 node = str(payload.get("node", "unknown"))
                 rank = int(payload.get("tp_rank", -1))
@@ -249,11 +254,19 @@ def parse_logs(
         ]
         for rid, values in transfer_values.items()
     }
+    resolved_paths = {}
+    for rid, paths in path_values.items():
+        if len(paths) > 1:
+            raise RuntimeError(
+                f"{rid} has inconsistent resolved L3 paths: {sorted(paths)}"
+            )
+        resolved_paths[rid] = next(iter(paths), "")
     return (
         transfer,
         reduce_reads(read_values, prefill_breakdown_values),
         reduce_reads(decode_read_values),
         transfer_details,
+        resolved_paths,
     )
 
 
@@ -267,7 +280,7 @@ def build_rows(
     dict[str, list[dict[str, float | int | str]]],
 ]:
     rounds = [json.loads(line) for line in rounds_path.read_text().splitlines()]
-    transfer, prefill_l3_read, decode_l3_read, transfer_details = parse_logs(
+    transfer, prefill_l3_read, decode_l3_read, transfer_details, resolved_paths = parse_logs(
         log_dir, log_glob=log_glob
     )
     rows = []
@@ -363,9 +376,14 @@ def build_rows(
         transfer_bytes = transfer_payload_tokens * KV_BYTES_PER_TOKEN
         prefill_l3_bytes = prefill_l3_tokens * KV_BYTES_PER_TOKEN
         decode_l3_bytes = decode_l3_tokens * KV_BYTES_PER_TOKEN
+        resolved_path = l3_read_path
+        if l3_read_path == "dynamic":
+            resolved_path = resolved_paths.get(rid, "")
+            if resolved_path not in ("prefill", "decode"):
+                raise RuntimeError(f"Dynamic request {rid} has no resolved L3 path")
         cached_tokens = (
             prefill_l3_tokens
-            if l3_read_path == "prefill"
+            if resolved_path == "prefill"
             else decode_l3_tokens
         )
         l3_tokens = cached_tokens
@@ -377,6 +395,7 @@ def build_rows(
                 "prompt_tokens": prompt_tokens,
                 "router_reported_cached_tokens": router_reported_cached_tokens,
                 "cached_tokens": cached_tokens,
+                "resolved_l3_read_path": resolved_path,
                 "cache_hit_rate": cached_tokens / prompt_tokens,
                 "l3_read_tokens": l3_tokens,
                 "l3_hit_rate": l3_tokens / prompt_tokens,
@@ -574,7 +593,9 @@ def main() -> None:
     source.add_argument("--metrics-csv", type=Path)
     parser.add_argument("--log-dir", type=Path)
     parser.add_argument("--log-glob", default="*.log")
-    parser.add_argument("--l3-read-path", choices=("prefill", "decode"))
+    parser.add_argument(
+        "--l3-read-path", choices=("prefill", "decode", "dynamic")
+    )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--csv-output", type=Path)
     parser.add_argument("--summary-output", type=Path)

@@ -680,3 +680,61 @@ request 有 4 个 TP 记录，首轮冷 cache 不产生正向 offload，故 agen
 补充：allocation `495` 是一次手工编排失败，客户端漏传 `CONTEXT_LENGTH=32768`，在
 第 2 轮因默认 `4096` 上限退出；它没有进入正式结果统计。随后补齐参数后，`497--500`
 四组均完整通过。
+
+## 10. Dynamic read path 验收与汇总器修复
+
+2026-09-19 根据 [dynamic.md](dynamic.md) 从原始基底重建 dynamic 镜像：
+
+```text
+构建 job: 501
+/data/home/yongxiao/mydata/images/sglang:26.01-py3-mooncake0.3.13.post1-dualpath-patched-dynamic-20260919.sqsh
+SHA256: 57a944f3fc19ad4a4fee928cdb6a915ee032878d7aa5470121ca27aef3694cd0
+```
+
+配置为 `1P1D / TP4 / client colocated with Decode / 32K / agent4 / rep1 / O_DIRECT`，
+三侧都使用：
+
+```text
+DUALPATH_L3_READ_PATH=dynamic
+DUALPATH_DYNAMIC_PATH_POLICY=alternate_per_turn
+```
+
+Allocation `502` 完整完成 `104/104` turns，无 replay error 或卡死：
+
+| 指标 | 结果 |
+|---|---:|
+| wall time | 347.07s |
+| mean TTFT | 6.471s |
+| p50 / p90 / p99 TTFT | 5.144s / 13.941s / 23.749s |
+| Prefill-owned requests | 52 |
+| Decode-owned requests | 52 |
+| Prefill L3 read tokens | 969,728 |
+| Decode L3 read tokens | 969,472 |
+| Decode L3 sync wait | 34.59s |
+
+正确性核对：
+
+- 两侧日志对 104 个完整 request ID 的 resolved path `0 mismatch`；
+- 四条 trajectory 都按 turn 交替，trajectory 0/2 与 1/3 相位相反；
+- 每个 request 只有 owner 侧有对应的 L3 read tokens，非 owner 侧为 0；
+- 正式 request 没有 `reason=rate_limited` 的 prefetch skip。4 条 skip 都是
+  `HEALTH_CHECK` 的 `requested_tokens=0 / below_threshold`，不属于 workload；
+- dynamic 的客户端 `cached_tokens` 与 owner 侧 L3 read 一致，总量为
+  `1,939,200` tokens；
+- TP4 的 TTFT path 记录一致，未发现 rank 间 path 分歧。
+
+性能解释：dynamic 的平均 TTFT 接近静态 Decode path（`6.471s` vs `6.771s`），明显高于
+静态 Prefill path（`1.874s`）。这是预期结果：dynamic 一半请求走 Decode L3，需要承担
+Decode 的文件读取、staging 和 completion sync；另一半请求走 Prefill L3，两个 owner
+共享同一组节点和文件后端。dynamic 的平均阶段耗时为 Prefill L3 read `0.308s`、
+Decode L3 read `1.964s`、queue wait `3.143s`、P-to-D `0.089s`、D-to-P `0.041s`。
+因此当前瓶颈是 Decode-owned 请求的 L3 read 与跨侧同步，不是选路或 O_DIRECT 正确性。
+
+初次执行 `pd_plot.sh` 暴露离线工具 bug：`summarize_latency_benchmark.py` 和
+`plot_trajectory_metrics.py` 只接受静态 `prefill/decode`。已修复为读取 TTFT V3 中的
+request-scoped `path`，并新增 dynamic cross-read 校验；`plot_style.py` 也新增
+`Dynamic-Path` 标题。修复后图表成功生成：
+
+```text
+/data/home/yongxiao/dual-path/results/latency-benchmark/32k-a4-r1-dynamic-odirect-new
+```

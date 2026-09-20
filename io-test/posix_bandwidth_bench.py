@@ -41,6 +41,13 @@ def advise_drop(path: Path) -> None:
         return
     fd = os.open(path, os.O_RDONLY)
     try:
+        # DONTNEED only reclaims clean pages, and it reports success either
+        # way. Without the flush a freshly written source stays fully cached
+        # and the following "cold" phase silently measures DRAM.
+        try:
+            os.fsync(fd)
+        except OSError:
+            pass
         os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
     finally:
         os.close(fd)
@@ -257,6 +264,24 @@ def run_io(args: argparse.Namespace) -> None:
         args.output.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
 
 
+def drop(args: argparse.Namespace) -> None:
+    """Evict the read source from this host's page cache.
+
+    A reader's own O_DIRECT or POSIX_FADV_DONTNEED only clears the client
+    cache. When g6 reads over NFS the pages stay in g5's server cache, so a
+    "cold" g6 phase still measures the storage network rather than the NVMe.
+    Running this on the server host before the phase closes that gap.
+    """
+    directory = Path(args.directory)
+    dropped = 0
+    for job in range(args.jobs):
+        path = directory / f"{args.filename_prefix}.{job}"
+        if path.exists():
+            advise_drop(path)
+            dropped += 1
+    print(f"dropped page cache for {dropped}/{args.jobs} files under {directory}")
+
+
 def positive(value: str) -> int:
     parsed = int(value)
     if parsed <= 0:
@@ -267,11 +292,13 @@ def positive(value: str) -> int:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
-    for command in ("prepare", "io"):
+    for command in ("prepare", "io", "drop"):
         child = subparsers.add_parser(command)
         child.add_argument("--directory", required=True)
         child.add_argument("--filename-prefix", default="source")
         child.add_argument("--jobs", type=positive, required=True)
+        if command == "drop":
+            continue
         child.add_argument("--size-bytes", type=positive, required=True)
         child.add_argument("--block-bytes", type=positive, required=True)
     io_parser = subparsers.choices["io"]
@@ -285,6 +312,9 @@ def main() -> None:
     io_parser.add_argument("--sync-port", type=positive, default=29777)
     io_parser.add_argument("--output", type=Path)
     args = parser.parse_args()
+    if args.command == "drop":
+        drop(args)
+        return
     if args.size_bytes % args.block_bytes:
         parser.error("--size-bytes must be divisible by --block-bytes")
     if args.block_bytes % mmap.PAGESIZE:

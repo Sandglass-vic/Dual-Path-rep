@@ -38,6 +38,11 @@ MATRIX_COPY_IMPLEMENTATION=${MATRIX_COPY_IMPLEMENTATION:-torch}
 # cache unless g5 evicts them too. 0 therefore measures the storage network
 # path, 1 measures network plus NVMe.
 MATRIX_DROP_PEER_CACHE=${MATRIX_DROP_PEER_CACHE:-0}
+# Same idea for the raw phases, which have their own reader and never went
+# through run_hot_cache.sh. Evicts the source from g5's page cache before each
+# read phase so g6 and dual-read measure the NVMe instead of g5's DRAM.
+# buffered-hot is skipped: warm cache is the point of that mode.
+RAW_DROP_SERVER_CACHE=${RAW_DROP_SERVER_CACHE:-0}
 
 RUN_MATRIX=${RUN_MATRIX:-1}
 RUN_RAW=${RUN_RAW:-1}
@@ -295,12 +300,27 @@ prepare_raw_read_source() {
   fi
 }
 
+drop_raw_source_server_cache() {
+  # g6 reads the source through g5's NFS server, so only evicting the g6
+  # client cache still measures the storage network. Evict it on g5 as well
+  # to force the read down to the NVMe.
+  local case_id=$1 jobs=$2
+  run_step \
+    --nodes=1 --ntasks=1 --nodelist=g5 --cpus-per-task=1 --gres=none \
+    python3 "$CODE_HOME/io-test/posix_bandwidth_bench.py" drop \
+      --directory "$DATA_ROOT/raw/$case_id/read-source" \
+      --filename-prefix source --jobs "$jobs"
+}
+
 run_raw_phase() {
   local case_id=$1 phase=$2 hosts=$3 nodes=$4 rw=$5 mode=$6 jobs=$7 block_size=$8 repetition=$9
   local size_mib=$((RAW_TOTAL_GIB * 1024 / jobs))
   local size_bytes=$((size_mib * 1024 * 1024))
   local block_bytes
   block_bytes=$(numfmt --from=iec "$block_size")
+  if [[ $rw == read && $RAW_DROP_SERVER_CACHE == 1 && $mode != buffered-hot ]]; then
+    drop_raw_source_server_cache "$case_id" "$jobs"
+  fi
   local sync_port=$((31000 + RANDOM % 20000))
   local direct=0 invalidate=1
   if [[ $mode == direct ]]; then

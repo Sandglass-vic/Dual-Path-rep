@@ -118,6 +118,35 @@ RUN_MATRIX=0 RUN_KV=0 RUN_WRITE=0 \
 
 `TP_RANKS` 本身可以调大，但超过 4 就不再代表 TP4 Decode，只能当硬件能力上界看。
 
+### 双节点同时读：`dual-read` 与 `RAW_DROP_SERVER_CACHE`
+
+`dual-read` 让 g5 和 g6 通过 `cluster_barrier.py` 对齐时钟后同时读，用来回答
+"两条路径是两份独立带宽，还是同一份的两个入口"。
+
+```bash
+RUN_MATRIX=0 RUN_KV=0 RUN_WRITE=0 \
+  RAW_PHASES="g5-read g6-read dual-read" \
+  RAW_MODES=direct RAW_JOBS_LIST="4" REPETITIONS=3 \
+  io-test/run_pza100_cluster.sh
+```
+
+读报告时注意 `dual_aggregate_median_gib_s` 是 `总字节 / 两节点墙钟并集`。g5 比 g6 快
+一倍，会先读完然后空转，把这个数拉低。真正反映干扰程度的是 `g5_retention` /
+`g6_retention`——它们是各自在 dual 阶段相对单独跑的保持率。
+
+默认情况下 g6 读到的数据仍在 **g5 的 NFS 服务端 page cache** 里：g6 客户端的
+`O_DIRECT` 只绕过 g6 自己的缓存。要让 g6 和 dual-read 真正穿到 NVMe，加上：
+
+```bash
+RAW_DROP_SERVER_CACHE=1
+```
+
+它会在每个 read 相位前到 g5 上对源文件做 `posix_fadvise(DONTNEED)`（`buffered-hot`
+除外，热缓存正是那个模式的目的）。两组结果对比即可分离出"g5 内存贡献了多少带宽"。
+
+注意 `DONTNEED` 只回收干净页且无论如何都返回成功，所以 `advise_drop()` 会先
+`fsync`。少了这一步，刚写完的源文件会整个留在缓存里，而"冷"相位会静默地在测 DRAM。
+
 ### 压存储路径上限：`run_odirect_sweep.sh`
 
 要回答"这条路径最多能做到多少"（而不是"Decode 能拿到多少"），用这个脚本扫进程数
