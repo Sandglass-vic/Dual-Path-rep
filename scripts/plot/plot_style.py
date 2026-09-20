@@ -17,6 +17,9 @@ COLORS = {
     "pink": "#CC79A7",
     "gray": "#F1F3F5",
     "yellow": "#F0E442",
+    # Light neutral for queue wait. Stays a shade darker than the near-white
+    # "gray" used for Misc so the two remain distinguishable.
+    "lightgray": "#C9CDD2",
 }
 
 
@@ -24,7 +27,10 @@ def metadata_title_suffix(metadata: dict[str, Any]) -> str:
     dataset = str(metadata.get("dataset", f"{metadata.get('max_len_k', '?')}K"))
     agents = int(metadata.get("agents", 0))
     path = str(metadata.get("l3_read_path", "prefill")).lower()
-    path_label = "Decode-Path" if path == "decode" else "Prefill-Path"
+    path_label = {
+        "decode": "Decode-Path",
+        "dynamic": "Dynamic-Path",
+    }.get(path, "Prefill-Path")
     return f"-{dataset}-{agents}Agent-{path_label}"
 
 

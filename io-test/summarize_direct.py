@@ -6,21 +6,16 @@ from __future__ import annotations
 import argparse
 import json
 import statistics
+import sys
 from collections import defaultdict
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from marker_log import records_with_prefix  # noqa: E402
 
 RESULT_PREFIX = "KVIO_RESULT "
 CACHE_PROBE_PREFIX = "KVIO_CACHE_PROBE "
-
-
-def records_with_prefix(path: Path, prefix: str) -> list[dict]:
-    records = []
-    for line in path.read_text().splitlines():
-        marker = line.find(prefix)
-        if marker >= 0:
-            records.append(json.loads(line[marker + len(prefix) :]))
-    return records
 
 
 def main() -> None:

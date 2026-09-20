@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Post-process one completed manual benchmark run on a node with Lustre access.
+# Post-process one completed manual benchmark run with shared runtime access.
 set -euo pipefail
 
-CODE_HOME=${CODE_HOME:-/labhome/sezhou/dual-path}
-RUNTIME_HOME=${RUNTIME_HOME:-/mnt/lustre/users/sezhou/dual-path}
+CODE_HOME=${CODE_HOME:-/data/home/yongxiao/dual-path}
+RUNTIME_HOME=${RUNTIME_HOME:-/data/home/yongxiao/mydata}
 TASK_NAME=${TASK_NAME:-${1:-}}
 : "${TASK_NAME:?Usage: TASK_NAME=<run> scripts/pd_plot.sh, or pass the run name as argument}"
 [[ $TASK_NAME =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]] || {

@@ -62,6 +62,7 @@ def parse_logs(
     dict[str, dict[str, dict[int, tuple[float, float, float, int, str]]]],
     dict[str, dict[str, dict[int, tuple[float, float, float, int, str]]]],
     dict[str, list[dict[str, float | int | str]]],
+    dict[str, str],
 ]:
     transfer_values: dict[
         str, list[tuple[float, int, int, int, int, str, str]]
@@ -75,6 +76,7 @@ def parse_logs(
     prefill_breakdown_values: dict[
         str, dict[str, dict[int, list[tuple[float, float, int]]]]
     ] = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
+    path_values: dict[str, set[str]] = defaultdict(set)
     for path in log_dir.rglob(log_glob):
         for line in path.read_text(errors="replace").splitlines():
             marker = line.find(V3_PREFIX)
@@ -84,6 +86,9 @@ def parse_logs(
                     continue
                 rid = str(payload["rid"])
                 side = str(payload["side"])
+                resolved_path = str(payload.get("path", ""))
+                if resolved_path in ("prefill", "decode"):
+                    path_values[rid].add(resolved_path)
                 engine = str(payload.get("engine", "unknown"))
                 node = str(payload.get("node", "unknown"))
                 rank = int(payload.get("tp_rank", -1))
@@ -249,22 +254,33 @@ def parse_logs(
         ]
         for rid, values in transfer_values.items()
     }
+    resolved_paths = {}
+    for rid, paths in path_values.items():
+        if len(paths) > 1:
+            raise RuntimeError(
+                f"{rid} has inconsistent resolved L3 paths: {sorted(paths)}"
+            )
+        resolved_paths[rid] = next(iter(paths), "")
     return (
         transfer,
         reduce_reads(read_values, prefill_breakdown_values),
         reduce_reads(decode_read_values),
         transfer_details,
+        resolved_paths,
     )
 
 
 def build_rows(
-    rounds_path: Path, log_dir: Path, log_glob: str = "*.log"
+    rounds_path: Path,
+    log_dir: Path,
+    l3_read_path: str,
+    log_glob: str = "*.log",
 ) -> tuple[
     list[dict[str, float | int | str]],
     dict[str, list[dict[str, float | int | str]]],
 ]:
     rounds = [json.loads(line) for line in rounds_path.read_text().splitlines()]
-    transfer, prefill_l3_read, decode_l3_read, transfer_details = parse_logs(
+    transfer, prefill_l3_read, decode_l3_read, transfer_details, resolved_paths = parse_logs(
         log_dir, log_glob=log_glob
     )
     rows = []
@@ -322,7 +338,7 @@ def build_rows(
         prompt_tokens = int(item["prompt_tokens"])
         generated_tokens = int(item["actual_generate_tokens"])
         append_tokens = int(item["append_tokens"])
-        cached_tokens = int(item["cached_tokens"])
+        router_reported_cached_tokens = int(item["cached_tokens"])
         (
             transfer_seconds,
             transfer_tokens,
@@ -360,14 +376,26 @@ def build_rows(
         transfer_bytes = transfer_payload_tokens * KV_BYTES_PER_TOKEN
         prefill_l3_bytes = prefill_l3_tokens * KV_BYTES_PER_TOKEN
         decode_l3_bytes = decode_l3_tokens * KV_BYTES_PER_TOKEN
-        l3_tokens = prefill_l3_tokens + decode_l3_tokens
+        resolved_path = l3_read_path
+        if l3_read_path == "dynamic":
+            resolved_path = resolved_paths.get(rid, "")
+            if resolved_path not in ("prefill", "decode"):
+                raise RuntimeError(f"Dynamic request {rid} has no resolved L3 path")
+        cached_tokens = (
+            prefill_l3_tokens
+            if resolved_path == "prefill"
+            else decode_l3_tokens
+        )
+        l3_tokens = cached_tokens
         rows.append(
             {
                 "trajectory_id": item["trajectory_id"],
                 "turn_id": int(item["turn_id"]),
                 "request_id": rid,
                 "prompt_tokens": prompt_tokens,
+                "router_reported_cached_tokens": router_reported_cached_tokens,
                 "cached_tokens": cached_tokens,
+                "resolved_l3_read_path": resolved_path,
                 "cache_hit_rate": cached_tokens / prompt_tokens,
                 "l3_read_tokens": l3_tokens,
                 "l3_hit_rate": l3_tokens / prompt_tokens,
@@ -565,6 +593,9 @@ def main() -> None:
     source.add_argument("--metrics-csv", type=Path)
     parser.add_argument("--log-dir", type=Path)
     parser.add_argument("--log-glob", default="*.log")
+    parser.add_argument(
+        "--l3-read-path", choices=("prefill", "decode", "dynamic")
+    )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--csv-output", type=Path)
     parser.add_argument("--summary-output", type=Path)
@@ -602,8 +633,13 @@ def main() -> None:
     else:
         if args.log_dir is None:
             parser.error("--log-dir is required with --rounds")
+        if args.l3_read_path is None:
+            parser.error("--l3-read-path is required with --rounds")
         rows, engine_rank_rows = build_rows(
-            args.rounds, args.log_dir, log_glob=args.log_glob
+            args.rounds,
+            args.log_dir,
+            args.l3_read_path,
+            log_glob=args.log_glob,
         )
     transfer_coverage = sum(
         float(row["pd_transfer_seconds"]) > 0 for row in rows
@@ -811,19 +847,9 @@ def main() -> None:
         "KV Read (Lustre) Data by Turn",
         args.output_dir / "l3-read-data.svg",
     )
+    engine_rank_ids = {}
     for side_engine, rank_rows in sorted(engine_rank_rows.items()):
         side, engine = side_engine.split(":", 1)
-        for row in rank_rows:
-            missing = [
-                rank
-                for rank in range(8)
-                if f"tp_rank_{rank}_read_seconds" not in row
-            ]
-            if missing:
-                raise RuntimeError(
-                    f"{side.title()} Engine {engine} request {row['request_id']} "
-                    f"is missing TP rank timings: {missing}"
-                )
         rank_ids = sorted(
             {
                 int(key.removeprefix("tp_rank_").removesuffix("_read_seconds"))
@@ -832,15 +858,27 @@ def main() -> None:
                 if key.startswith("tp_rank_") and key.endswith("_read_seconds")
             }
         )
-        if len(rank_ids) != 8:
+        if not rank_ids:
             raise RuntimeError(
-                f"{side.title()} Engine {engine} has {len(rank_ids)}/8 TP rank timings"
+                f"{side.title()} Engine {engine} has no TP rank timings"
             )
+        for row in rank_rows:
+            missing = [
+                rank
+                for rank in rank_ids
+                if f"tp_rank_{rank}_read_seconds" not in row
+            ]
+            if missing:
+                raise RuntimeError(
+                    f"{side.title()} Engine {engine} request {row['request_id']} "
+                    f"is missing TP rank timings: {missing}"
+                )
+        engine_rank_ids[side_engine] = rank_ids
         series = tuple(
             (
                 f"tp_rank_{rank}_read_seconds",
                 f"TP rank {rank}",
-                rank_colors[rank],
+                rank_colors[rank % len(rank_colors)],
             )
             for rank in rank_ids
         ) + (
@@ -912,7 +950,7 @@ def main() -> None:
                         float(row[f"tp_rank_{rank}_read_seconds"])
                         for row in rank_rows
                     )
-                    for rank in range(8)
+                    for rank in engine_rank_ids[side_engine]
                 },
             }
             for side_engine, rank_rows in sorted(engine_rank_rows.items())

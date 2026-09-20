@@ -3,6 +3,10 @@
 # shellcheck disable=SC2034
 
 dualpath_export_common_env() {
+  export NCCL_IB_HCA=${NCCL_IB_HCA:-mlx5_0,mlx5_4}
+  export NCCL_NET_GDR_LEVEL=${NCCL_NET_GDR_LEVEL:-PIX}
+  export NCCL_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME:-ibs3}
+  export GLOO_SOCKET_IFNAME=${GLOO_SOCKET_IFNAME:-ibs3}
   export ENABLE_BENCHMARK_TIMING=1
   export DUALPATH_TTFT_TIMING=${DUALPATH_TTFT_TIMING:-1}
   export DUALPATH_TTFT_TIMING_DETAIL=${DUALPATH_TTFT_TIMING_DETAIL:-0}
@@ -22,10 +26,18 @@ dualpath_export_common_env() {
     return 2
   fi
   export MEM_FRACTION_STATIC=${MEM_FRACTION_STATIC:-0.55}
+  # SGLang caps in-flight L3 prefetch at 0.8 * (host pool - device pool) tokens.
+  # A ratio-derived host pool ties that budget to GPU KV capacity, and on A100
+  # 40GB it collapses to ~26k tokens, below a single 32K prefix, which silently
+  # skips prefetch for concurrent agents. Size the pool absolutely instead.
+  # 40 GB/rank yields a ~413k token budget, well clear of 4 agents x 32K prefix,
+  # and stays above the device KV pool on both A100 40GB and H100 80GB.
+  # Set to 0 to fall back to HICACHE_RATIO.
+  export HICACHE_SIZE_GB=${HICACHE_SIZE_GB:-40}
   export HICACHE_RATIO=${HICACHE_RATIO:-1.35}
   export PREFILL_HICACHE_MEM_LAYOUT=${PREFILL_HICACHE_MEM_LAYOUT:-layer_first}
   export DECODE_HICACHE_RATIO=${DECODE_HICACHE_RATIO:-1.05}
-  export CONTEXT_LENGTH=${CONTEXT_LENGTH:-65536}
+  export CONTEXT_LENGTH=${CONTEXT_LENGTH:-4096}
   export MOONCAKE_PROTOCOL=${MOONCAKE_PROTOCOL:-rdma}
   export MOONCAKE_DEVICE=${MOONCAKE_DEVICE:-$IB_DEVICE}
   # Mooncake defaults synchronous transfers to 30s. Long-context concurrent
@@ -55,9 +67,11 @@ dualpath_export_common_env() {
   # Retained only as a historical/control switch; disabled for formal runs.
   export FLUSH_LOCAL_CACHE_BETWEEN_TURNS=${FLUSH_LOCAL_CACHE_BETWEEN_TURNS:-0}
   export STORAGE_SETTLE_SECONDS=${STORAGE_SETTLE_SECONDS:-0}
-  export DUALPATH_DECODE_L3_SYNC_RANKS=${DUALPATH_DECODE_L3_SYNC_RANKS:-8}
+  export DUALPATH_DECODE_L3_SYNC_RANKS=${DUALPATH_DECODE_L3_SYNC_RANKS:-${TP_SIZE:-4}}
   export DUALPATH_DECODE_L3_SYNC_TIMEOUT=${DUALPATH_DECODE_L3_SYNC_TIMEOUT:-600}
   export DUALPATH_L3_READ_PATH=${DUALPATH_L3_READ_PATH:-prefill}
+  # Only consulted when DUALPATH_L3_READ_PATH=dynamic.
+  export DUALPATH_DYNAMIC_PATH_POLICY=${DUALPATH_DYNAMIC_PATH_POLICY:-alternate_per_turn}
   # Give every request/turn its own local radix namespace. Lustre page hashes
   # remain token-based, so cross-turn reuse is forced through Lustre instead.
   export DUALPATH_NO_CROSS_TURN_KV_REUSE=${DUALPATH_NO_CROSS_TURN_KV_REUSE:-1}
@@ -66,8 +80,9 @@ dualpath_export_common_env() {
     echo "DUALPATH_NO_CROSS_TURN_KV_REUSE must be 0 or 1" >&2
     return 2
   fi
-  if [[ "$DUALPATH_L3_READ_PATH" != prefill && "$DUALPATH_L3_READ_PATH" != decode ]]; then
-    echo "DUALPATH_L3_READ_PATH must be prefill or decode" >&2
+  if [[ "$DUALPATH_L3_READ_PATH" != prefill && "$DUALPATH_L3_READ_PATH" != decode && \
+        "$DUALPATH_L3_READ_PATH" != dynamic ]]; then
+    echo "DUALPATH_L3_READ_PATH must be prefill, decode or dynamic" >&2
     return 2
   fi
   export MODEL_DIR LOG_DIR CACHE_DIR IB_DEVICE PREFILL_PORT DECODE_PORT
@@ -77,11 +92,12 @@ dualpath_export_common_env() {
   export PREFILL_HICACHE_EVICT_UNLOCKED
   export DUALPATH_PREFILL_BACKUP_TIMEOUT
   export PREFILL_HICACHE_WRITE_POLICY PREFILL_HICACHE_MEM_LAYOUT
+  export HICACHE_SIZE_GB HICACHE_RATIO
   export DUALPATH_DECODE_PD_HOST_STAGING
   export DUALPATH_DECODE_PD_HOST_STAGING_GB DECODE_HICACHE_RATIO
   export FLUSH_LOCAL_CACHE_BETWEEN_TURNS STORAGE_SETTLE_SECONDS
   export DUALPATH_DECODE_L3_SYNC_RANKS DUALPATH_DECODE_L3_SYNC_TIMEOUT
-  export DUALPATH_L3_READ_PATH
+  export DUALPATH_L3_READ_PATH DUALPATH_DYNAMIC_PATH_POLICY
   export DUALPATH_NO_CROSS_TURN_KV_REUSE
   export DUAL_PATH_O_DIRECT_READ
   export DUALPATH_TTFT_TIMING DUALPATH_TTFT_TIMING_DETAIL
@@ -227,7 +243,14 @@ Path(sys.argv[1]).write_text(json.dumps({
     "paper_synthetic_append_tokens": int(sys.argv[14]),
     "cache_policy": "paper-aligned-l3-reload",
     "cache_initial_state": "empty",
-    "storage_backend": "sglang-file-posix-lustre",
+    "storage_backend": "sglang-file-posix",
+    "storage_filesystem_client": os.environ.get("STORAGE_FSTYPE", "unknown"),
+    "storage_topology": os.environ.get(
+        "STORAGE_TOPOLOGY", "g5-xfs-export-g6-nfs"
+    ),
+    "storage_metric_compatibility": (
+        "legacy lustre_* field names measure generic POSIX file reads on pza100"
+    ),
     "artificial_inter_turn_delay": False,
     "per_turn_cache_flush": bool(int(sys.argv[15])),
     "storage_settle_seconds": float(sys.argv[16]),
@@ -239,6 +262,8 @@ Path(sys.argv[1]).write_text(json.dumps({
     "prefill_hicache_mem_layout": os.environ.get(
         "PREFILL_HICACHE_MEM_LAYOUT", "layer_first"
     ),
+    "prefill_hicache_size_gb": int(os.environ.get("HICACHE_SIZE_GB", "0")),
+    "prefill_hicache_ratio": float(os.environ.get("HICACHE_RATIO", "1.35")),
     "pd_ib_device_mapping": pd_ib_device_mapping,
     "prefill_hicache_read_only": bool(int(sys.argv[22])),
     "prefill_hicache_evict_unlocked": bool(int(sys.argv[23])),
@@ -251,12 +276,15 @@ Path(sys.argv[1]).write_text(json.dumps({
         os.environ.get("DUALPATH_DECODE_L3_SYNC_DIR")
     ),
     "decode_l3_completion_sync_ranks": int(
-        os.environ.get("DUALPATH_DECODE_L3_SYNC_RANKS", "8")
+        os.environ.get("DUALPATH_DECODE_L3_SYNC_RANKS", os.environ.get("TP_SIZE", "4"))
     ),
     "decode_l3_completion_sync_timeout_seconds": float(
         os.environ.get("DUALPATH_DECODE_L3_SYNC_TIMEOUT", "600")
     ),
     "l3_read_path": os.environ.get("DUALPATH_L3_READ_PATH", "prefill"),
+    "dynamic_path_policy": os.environ.get(
+        "DUALPATH_DYNAMIC_PATH_POLICY", "alternate_per_turn"
+    ),
     "ttft_timing_v3": bool(int(os.environ.get("DUALPATH_TTFT_TIMING", "1"))),
     "ttft_timing_detail": bool(
         int(os.environ.get("DUALPATH_TTFT_TIMING_DETAIL", "0"))
@@ -279,7 +307,8 @@ PY
 
 dualpath_resolve_dataset() {
   local spec=$1
-  local value
+  local value dataset_name dataset_root
+  local -a dataset_roots
   if [[ "$spec" == *=* ]]; then
     DATASET_LABEL=${spec%%=*}
     DATASET_PATH=${spec#*=}
@@ -290,7 +319,22 @@ dualpath_resolve_dataset() {
       return 2
     fi
     DATASET_LABEL="${value}K"
-    DATASET_PATH="$RUNTIME_HOME/test/dataset/dualpath_fake_${value}k.jsonl"
+    dataset_name="dualpath_fake_${value}k.jsonl"
+    if [[ -n ${DUALPATH_DATASET_ROOT:-} ]]; then
+      dataset_roots=("$DUALPATH_DATASET_ROOT")
+    else
+      dataset_roots=(
+        "$RUNTIME_HOME/dual-test"
+        "$RUNTIME_HOME/test/dataset"
+      )
+    fi
+    DATASET_PATH=${dataset_roots[0]}/$dataset_name
+    for dataset_root in "${dataset_roots[@]}"; do
+      if [[ -f $dataset_root/$dataset_name ]]; then
+        DATASET_PATH=$dataset_root/$dataset_name
+        break
+      fi
+    done
   fi
   value=${DATASET_LABEL%[Kk]}
   if [[ ! "$value" =~ ^[0-9]+$ ]]; then
@@ -346,7 +390,7 @@ dualpath_run_replay() {
   if [[ -n ${DUALPATH_DECODE_L3_SYNC_DIR:-} ]]; then
     sync_args+=(
       --decode-l3-sync-dir "$DUALPATH_DECODE_L3_SYNC_DIR"
-      --decode-l3-sync-ranks "${DUALPATH_DECODE_L3_SYNC_RANKS:-8}"
+      --decode-l3-sync-ranks "${DUALPATH_DECODE_L3_SYNC_RANKS:-${TP_SIZE:-4}}"
       --decode-l3-sync-timeout "${DUALPATH_DECODE_L3_SYNC_TIMEOUT:-600}"
     )
   fi

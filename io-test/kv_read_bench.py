@@ -6,18 +6,21 @@ from __future__ import annotations
 import argparse
 import ctypes
 import json
+import math
 import mmap
 import multiprocessing as mp
 import os
 import queue
 import socket
 import statistics
-import struct
 import sys
 import time
 from pathlib import Path
 from typing import Any
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from cluster_barrier import synchronize, wait_until  # noqa: E402
 
 RESULT_PREFIX = "KVIO_RESULT "
 CACHE_PROBE_PREFIX = "KVIO_CACHE_PROBE "
@@ -29,21 +32,39 @@ def page_path(root: Path, rank: int, page: int) -> Path:
     return root / f"{page:08x}-{rank:02x}-dualpath-kv-page.bin"
 
 
-def allocate_buffer(size: int, buffer_type: str) -> tuple[Any, memoryview]:
+def allocate_buffer(
+    size: int, buffer_type: str, alignment: int = 1
+) -> tuple[Any, memoryview]:
+    """Allocate an I/O target whose address is a multiple of `alignment`.
+
+    O_DIRECT rejects unaligned user buffers, and a plain bytearray lands wherever
+    the allocator put its object header, so the padded slice below is what makes
+    the direct phases runnable outside the Torch path.
+    """
     if buffer_type == "pinned":
         try:
             import torch
 
-            tensor = torch.empty(size, dtype=torch.uint8, pin_memory=True)
-            return tensor, memoryview(tensor.numpy())
+            tensor = torch.empty(size + alignment, dtype=torch.uint8, pin_memory=True)
+            view = memoryview(tensor.numpy())
+            offset = (-buffer_address(view)) % alignment
+            return tensor, view[offset : offset + size]
         except Exception as exc:  # pragma: no cover - depends on runtime image
             raise RuntimeError(
                 "Pinned allocation failed. Run in the benchmark image with a GPU "
                 "assigned, or set BUFFER_TYPE=pageable."
             ) from exc
 
-    target = bytearray(size)
-    return target, memoryview(target)
+    if alignment > 1:
+        # An anonymous mapping is page aligned, and the pad keeps the slice
+        # aligned for alignments larger than one page.
+        owner: Any = mmap.mmap(-1, size + alignment)
+        view = memoryview(owner)
+        offset = (-buffer_address(view)) % alignment
+        return owner, view[offset : offset + size]
+
+    owner = bytearray(size)
+    return owner, memoryview(owner)
 
 
 def write_full(fd: int, data: memoryview) -> None:
@@ -93,6 +114,10 @@ def prepare(args: argparse.Namespace) -> None:
             fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
             try:
                 write_full(fd, chunk)
+                # Dirty pages cannot be evicted by POSIX_FADV_DONTNEED, so a
+                # cold phase would otherwise read the data straight back out of
+                # the page cache this very loop populated.
+                os.fdatasync(fd)
             finally:
                 os.close(fd)
             files_written += 1
@@ -142,6 +167,28 @@ def cleanup(args: argparse.Namespace) -> None:
     print(f"CLEANUP_COMPLETE data_dir={root} files={len(pages)}", flush=True)
 
 
+def drop_cache(args: argparse.Namespace) -> None:
+    """Evict the page files from this node's page cache and report the effect.
+
+    Running this on g5 before a g6 cold phase also drops the NFS server-side
+    cache for the same files, so a g6 cold read really traverses the NVMe.
+    """
+    root = Path(args.data_dir)
+    paths = [
+        page_path(root, rank, page)
+        for rank in range(args.tp_ranks)
+        for page in range(args.pages_per_rank)
+    ]
+    os.sync()
+    advise_drop(paths)
+    resident, total = resident_pages(paths[0])
+    print(
+        f"KVIO_DROP_CACHE host={socket.gethostname().split('.')[0]} "
+        f"files={len(paths)} probe_resident={resident}/{total}",
+        flush=True,
+    )
+
+
 def advise_drop(paths: list[Path]) -> None:
     if not hasattr(os, "posix_fadvise") or not hasattr(os, "POSIX_FADV_DONTNEED"):
         return
@@ -155,6 +202,59 @@ def advise_drop(paths: list[Path]) -> None:
 
 def buffer_address(target: memoryview) -> int:
     return ctypes.addressof(ctypes.c_char.from_buffer(target))
+
+
+def percentile(ordered: list[int], fraction: float) -> float:
+    if not ordered:
+        return 0.0
+    if len(ordered) == 1:
+        return float(ordered[0])
+    position = fraction * (len(ordered) - 1)
+    lower = math.floor(position)
+    upper = math.ceil(position)
+    if lower == upper:
+        return float(ordered[lower])
+    weight = position - lower
+    return ordered[lower] * (1 - weight) + ordered[upper] * weight
+
+
+def describe_ns(samples: list[int]) -> dict[str, Any]:
+    """Latency distribution for one timed step, in nanoseconds."""
+    if not samples:
+        return {"count": 0}
+    ordered = sorted(samples)
+    return {
+        "count": len(ordered),
+        "total_ns": sum(ordered),
+        "mean_ns": statistics.fmean(ordered),
+        "min_ns": ordered[0],
+        "p50_ns": percentile(ordered, 0.50),
+        "p90_ns": percentile(ordered, 0.90),
+        "p99_ns": percentile(ordered, 0.99),
+        "max_ns": ordered[-1],
+        "stdev_ns": statistics.pstdev(ordered) if len(ordered) > 1 else 0.0,
+    }
+
+
+def merge_ns(distributions: list[dict[str, Any]]) -> dict[str, Any]:
+    """Combine per-rank distributions without shipping every raw sample."""
+    present = [item for item in distributions if item.get("count")]
+    if not present:
+        return {"count": 0}
+    total_count = sum(int(item["count"]) for item in present)
+    total_ns = sum(int(item["total_ns"]) for item in present)
+    return {
+        "count": total_count,
+        "total_ns": total_ns,
+        "mean_ns": total_ns / total_count,
+        "min_ns": min(int(item["min_ns"]) for item in present),
+        # Per-rank percentiles are averaged: every rank issues the same number of
+        # identically sized page reads, so the ranks are equally weighted.
+        "p50_ns": statistics.fmean(float(item["p50_ns"]) for item in present),
+        "p90_ns": statistics.fmean(float(item["p90_ns"]) for item in present),
+        "p99_ns": statistics.fmean(float(item["p99_ns"]) for item in present),
+        "max_ns": max(int(item["max_ns"]) for item in present),
+    }
 
 
 def read_page(path: Path, target: memoryview, io_mode: str, alignment: int) -> None:
@@ -187,6 +287,56 @@ def read_page(path: Path, target: memoryview, io_mode: str, alignment: int) -> N
         os.close(fd)
 
 
+def read_page_timed(
+    path: Path, target: memoryview, flags: int
+) -> tuple[int, int, int]:
+    """Same open/readinto/close sequence as read_page, timed per step.
+
+    Returns (open_ns, read_ns, close_ns). The flags are resolved once per phase
+    so the alignment checks stay out of the timed region.
+    """
+    open_started = time.perf_counter_ns()
+    fd = os.open(path, flags)
+    read_started = time.perf_counter_ns()
+    try:
+        offset = 0
+        while offset < len(target):
+            count = os.readv(fd, [target[offset:]])
+            if count == 0:
+                raise RuntimeError(
+                    f"short read: {path} returned {offset}/{len(target)} bytes"
+                )
+            offset += count
+        read_finished = time.perf_counter_ns()
+    finally:
+        os.close(fd)
+    closed = time.perf_counter_ns()
+    return (
+        read_started - open_started,
+        read_finished - read_started,
+        closed - read_finished,
+    )
+
+
+def read_flags(target: memoryview, io_mode: str, alignment: int) -> int:
+    """Validate O_DIRECT alignment once and return the open(2) flags."""
+    flags = os.O_RDONLY
+    if io_mode == "direct":
+        if not hasattr(os, "O_DIRECT"):
+            raise RuntimeError("Python/os does not expose O_DIRECT on this platform")
+        address = buffer_address(target)
+        if address % alignment:
+            raise RuntimeError(
+                f"O_DIRECT target address 0x{address:x} is not {alignment}-byte aligned"
+            )
+        if len(target) % alignment:
+            raise RuntimeError(
+                f"O_DIRECT read length {len(target)} is not {alignment}-byte aligned"
+            )
+        flags |= os.O_DIRECT
+    return flags
+
+
 def resident_pages(path: Path) -> tuple[int, int]:
     size = path.stat().st_size
     system_page = mmap.PAGESIZE
@@ -209,7 +359,9 @@ def cache_probe(args: argparse.Namespace) -> None:
     path = page_path(Path(args.data_dir), args.rank, args.page)
     if not path.is_file():
         raise RuntimeError(f"cache probe page does not exist: {path}")
-    owner, target = allocate_buffer(args.page_bytes, args.buffer_type)
+    owner, target = allocate_buffer(
+        args.page_bytes, args.buffer_type, args.direct_alignment
+    )
     address = buffer_address(target)
     if address % args.direct_alignment:
         raise RuntimeError(
@@ -314,7 +466,11 @@ def reader_worker(
                 ).flatten()
             target = memoryview(target_owner.view(torch.uint8).contiguous().numpy())
         else:
-            target_owner, target = allocate_buffer(page_bytes, buffer_type)
+            target_owner, target = allocate_buffer(
+                page_bytes,
+                buffer_type,
+                direct_alignment if io_mode == "direct" else 1,
+            )
         staging_owner = None
         staging = None
         if copy_to_staging:
@@ -334,18 +490,20 @@ def reader_worker(
                 )
         if drop_cache:
             advise_drop(paths)
+        flags = read_flags(target, io_mode, direct_alignment)
         output.put({"ready": rank})
         start_event.wait()
-        start_ns = start_epoch_ns.value
-        while time.time_ns() < start_ns:
-            remaining = start_ns - time.time_ns()
-            time.sleep(min(remaining / 1e9, 0.01))
+        wait_until(start_epoch_ns.value)
 
         wall_start_ns = time.time_ns()
         perf_start = time.perf_counter()
         bytes_read = 0
         checksum = 0
         layer_bytes = page_bytes // layers
+        open_samples: list[int] = []
+        read_samples: list[int] = []
+        close_samples: list[int] = []
+        scatter_samples: list[int] = []
         for _ in range(passes):
             for page, path in enumerate(paths):
                 if exact_torch:
@@ -354,7 +512,11 @@ def reader_worker(
                     target = memoryview(
                         target_owner.view(torch.uint8).contiguous().numpy()
                     )
-                read_page(path, target, io_mode, direct_alignment)
+                open_ns, read_ns, close_ns = read_page_timed(path, target, flags)
+                open_samples.append(open_ns)
+                read_samples.append(read_ns)
+                close_samples.append(close_ns)
+                scatter_started = time.perf_counter_ns()
                 if exact_torch and staging_owner is not None:
                     index = page * page_tokens
                     staging_owner[:, :, index : index + page_tokens, :, :] = (
@@ -374,15 +536,24 @@ def reader_worker(
                         staging[destination_start : destination_start + layer_bytes] = (
                             target[source_start : source_start + layer_bytes]
                         )
+                if staging_owner is not None or staging is not None:
+                    scatter_samples.append(time.perf_counter_ns() - scatter_started)
                 bytes_read += page_bytes
                 checksum ^= target[0]
         perf_end = time.perf_counter()
         wall_end_ns = time.time_ns()
+        file_io_ns = sum(open_samples) + sum(read_samples) + sum(close_samples)
         output.put(
             {
                 "rank": rank,
                 "bytes": bytes_read,
                 "seconds": perf_end - perf_start,
+                "file_io_seconds": file_io_ns / 1e9,
+                "scatter_seconds": sum(scatter_samples) / 1e9,
+                "open_ns": describe_ns(open_samples),
+                "read_ns": describe_ns(read_samples),
+                "close_ns": describe_ns(close_samples),
+                "scatter_ns": describe_ns(scatter_samples),
                 "wall_start_ns": wall_start_ns,
                 "wall_end_ns": wall_end_ns,
                 "checksum": checksum,
@@ -394,50 +565,6 @@ def reader_worker(
         output.put({"rank": rank, "error": f"{type(exc).__name__}: {exc}"})
 
 
-def coordinate_start(nodes: int, node_index: int, host: str, port: int) -> int:
-    if nodes == 1:
-        return time.time_ns() + 2_000_000_000
-    if not host:
-        raise RuntimeError("--sync-host is required for a multi-node read")
-
-    if node_index == 0:
-        connections = []
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
-            server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            server.bind(("0.0.0.0", port))
-            server.listen(nodes - 1)
-            server.settimeout(300)
-            for _ in range(nodes - 1):
-                connection, _ = server.accept()
-                if connection.recv(5) != b"READY":
-                    connection.close()
-                    raise RuntimeError("invalid synchronization handshake")
-                connections.append(connection)
-            start_ns = time.time_ns() + 3_000_000_000
-            payload = struct.pack("!Q", start_ns)
-            for connection in connections:
-                connection.sendall(payload)
-                connection.close()
-            return start_ns
-
-    deadline = time.monotonic() + 300
-    while True:
-        try:
-            with socket.create_connection((host, port), timeout=5) as connection:
-                connection.sendall(b"READY")
-                payload = b""
-                while len(payload) < 8:
-                    chunk = connection.recv(8 - len(payload))
-                    if not chunk:
-                        raise RuntimeError("synchronization server closed early")
-                    payload += chunk
-                return struct.unpack("!Q", payload)[0]
-        except OSError:
-            if time.monotonic() >= deadline:
-                raise RuntimeError(f"timed out connecting to sync server {host}:{port}")
-            time.sleep(1)
-
-
 def read(args: argparse.Namespace) -> None:
     root = Path(args.data_dir)
     metadata = json.loads((root / "dataset.json").read_text())
@@ -447,6 +574,11 @@ def read(args: argparse.Namespace) -> None:
             raise RuntimeError(
                 f"dataset {key}={metadata[key]}, but reader requested {requested}"
             )
+
+    if args.drop_cache:
+        # POSIX_FADV_DONTNEED silently skips dirty pages; flush once here rather
+        # than from every rank so a cold phase starts with an evictable cache.
+        os.sync()
 
     ctx = mp.get_context("spawn")
     output: mp.Queue = ctx.Queue()
@@ -494,9 +626,10 @@ def read(args: argparse.Namespace) -> None:
         ready.add(message["ready"])
 
     node_index = int(os.environ.get("SLURM_PROCID", "0"))
-    start_epoch_ns.value = coordinate_start(
-        args.nodes, node_index, args.sync_host, args.sync_port
+    handshake = synchronize(
+        args.nodes, node_index, args.sync_host, args.sync_port, lead_ns=2_000_000_000
     )
+    start_epoch_ns.value = handshake["release_epoch_ns"]
     start_event.set()
     rank_results = [output.get() for _ in workers]
     for worker in workers:
@@ -514,6 +647,11 @@ def read(args: argparse.Namespace) -> None:
     wall_end_ns = max(item["wall_end_ns"] for item in rank_results)
     elapsed = (wall_end_ns - wall_start_ns) / 1e9
     rank_rates = [item["bytes"] / item["seconds"] / 2**30 for item in rank_results]
+    offset_ns = handshake["leader_minus_local_ns"]
+    # TP ranks read in parallel, so the critical path of each timed step is the
+    # slowest rank, not the sum across ranks.
+    file_io_seconds = max(item["file_io_seconds"] for item in rank_results)
+    scatter_seconds = max(item["scatter_seconds"] for item in rank_results)
     result = {
         "phase": args.phase,
         "repetition": args.repetition,
@@ -537,13 +675,39 @@ def read(args: argparse.Namespace) -> None:
         "gib": total_bytes / 2**30,
         "seconds": elapsed,
         "gib_s": total_bytes / elapsed / 2**30,
+        "file_io_seconds": file_io_seconds,
+        "scatter_seconds": scatter_seconds,
+        "file_io_gib_s": total_bytes / file_io_seconds / 2**30,
+        "scatter_gib_s": (
+            total_bytes / scatter_seconds / 2**30 if scatter_seconds else None
+        ),
+        "file_io_fraction": file_io_seconds / elapsed,
+        "scatter_fraction": scatter_seconds / elapsed,
+        "open_ns": merge_ns([item["open_ns"] for item in rank_results]),
+        "read_ns": merge_ns([item["read_ns"] for item in rank_results]),
+        "close_ns": merge_ns([item["close_ns"] for item in rank_results]),
+        "scatter_step_ns": merge_ns([item["scatter_ns"] for item in rank_results]),
+        "clock_leader_minus_local_ns": offset_ns,
+        "clock_offset_round_trip_ns": handshake["offset_round_trip_ns"],
+        "wall_start_ns_leader": wall_start_ns + offset_ns,
+        "wall_end_ns_leader": wall_end_ns + offset_ns,
         "rank_gib_s_min": min(rank_rates),
         "rank_gib_s_median": statistics.median(rank_rates),
+        "rank_gib_s_p95": (
+            statistics.quantiles(rank_rates, n=100)[94]
+            if len(rank_rates) > 1
+            else rank_rates[0]
+        ),
         "rank_gib_s_max": max(rank_rates),
         "wall_start_ns": wall_start_ns,
         "wall_end_ns": wall_end_ns,
     }
     print(RESULT_PREFIX + json.dumps(result, sort_keys=True), flush=True)
+    if args.output:
+        # srun splits long labelled output lines, so the file is the
+        # authoritative copy and the log line is for humans.
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
 
 
 def add_layout_arguments(parser: argparse.ArgumentParser) -> None:
@@ -563,6 +727,9 @@ def parse_args() -> argparse.Namespace:
 
     cleanup_parser = subparsers.add_parser("cleanup")
     cleanup_parser.add_argument("--data-dir", required=True)
+
+    drop_parser = subparsers.add_parser("drop-cache")
+    add_layout_arguments(drop_parser)
 
     probe_parser = subparsers.add_parser("cache-probe")
     add_layout_arguments(probe_parser)
@@ -593,6 +760,7 @@ def parse_args() -> argparse.Namespace:
     read_parser.add_argument("--nodes", type=int, required=True)
     read_parser.add_argument("--io-mode", choices=("buffered", "direct"), default="buffered")
     read_parser.add_argument("--direct-alignment", type=int, default=4096)
+    read_parser.add_argument("--output", type=Path)
 
     args = parser.parse_args()
     for name in ("tp_ranks", "pages_per_rank", "page_bytes"):
@@ -612,6 +780,8 @@ def main() -> None:
         prepare(args)
     elif args.command == "cleanup":
         cleanup(args)
+    elif args.command == "drop-cache":
+        drop_cache(args)
     elif args.command == "cache-probe":
         cache_probe(args)
     else:

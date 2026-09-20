@@ -1,8 +1,57 @@
-# GAIA 平台、网络与 Lustre
+# pza100 平台与 GAIA 历史记录
 
 > 返回 [文档索引](README.md)
 
-## 1. Slurm
+## pza100：g5/g6 A100
+
+当前分支的目标平台是 `g5g6`：
+
+```text
+Slurm controller: g5
+分区: run（默认，4h），build（12h）
+节点: g5, g6
+每节点 GPU: 4 × NVIDIA A100 PCIe 40GB
+每节点 CPU: 2 × AMD EPYC 9654
+每节点内存: 约 502 GiB
+Enroot: 4.2.0
+```
+
+常用检查与资源申请：
+
+```bash
+sinfo -Nel
+squeue -u "$USER"
+
+srun -p run -N1 -n1 --gres=gpu:4 --cpus-per-task=32 --mem=0 \
+  --time=01:00:00 --pty bash
+```
+
+g5/g6 的计算网络使用 `mlx5_0`、`mlx5_4`；GPU0/1 邻近 `mlx5_0`，GPU2/3
+邻近 `mlx5_4`。跨节点运行显式设置：
+
+```bash
+export NCCL_IB_HCA=mlx5_0,mlx5_4
+export NCCL_NET_GDR_LEVEL=PIX
+export NCCL_SOCKET_IFNAME=ibs3
+export GLOO_SOCKET_IFNAME=ibs3
+```
+
+共享存储不是 Lustre：g5 的 `/data` 是本地盘，g6 通过 IPoIB NFS 挂载 g5。
+g5 停机或 `ibs3` 中断会同时影响 g6 的代码、镜像、模型和 KV 数据。pza100
+运行根目录为 `/data/home/yongxiao/mydata`。
+
+集群只有两个节点。现有 `P + D + 1 client` 分配模型至少需要三个节点，不能
+原样运行；单节点引擎也必须从 TP8 调整为 TP4。完整限制见
+[pza100 环境](pza100.md#当前限制)。
+
+---
+
+## GAIA DGX H100 + Lustre 历史记录
+
+以下内容来自迁移前 GAIA 环境，仅用于解释既有 Job 和性能数据，不是 pza100
+配置。
+
+### 1. Slurm
 
 登录节点已实测：
 
@@ -126,7 +175,7 @@ dgx-gaia-10,29,30,31,41,44,45,46,51,52,53,54,57,58,60,62,63
 exclude；静态列表只保留本项目已实际触发故障、即使恢复调度后仍需管理员确认的
 节点。提交前应重新运行 `sinfo`，不能把本快照视为永久状态。
 
-## 2. 计算节点硬件
+### 2. 计算节点硬件
 
 实测节点：`dgx-gaia-12`。
 
@@ -169,7 +218,7 @@ free -h
 df -hT /raid
 ```
 
-## 3. InfiniBand 与 NIC
+### 3. InfiniBand 与 NIC
 
 计算节点实测存在 `mlx5_0` 到 `mlx5_11` 共 12 个 IB device。探测时：
 
@@ -291,7 +340,7 @@ Job `67340` 在 `dgx-gaia-09` 上完成。测试使用 8 个 fio job、每 job 1
 此前 `ip route get 192.1.3.230` 只描述到一个 server IP 的普通 IP 路由，不能
 代表 Lustre 全部 LNet 数据路径；HCA 计数器是本次流量归属判断依据。
 
-## 4. Lustre
+### 4. Lustre
 
 Lustre 仅在计算节点可见，登录节点上 `/mnt/lustre` 不存在。
 
@@ -347,7 +396,7 @@ stripe 参数不能凭经验直接固定。先使用 1、4、8 个 OST 和 1 MiB
 
 不应通过删除系统 cache 或影响其他用户的方式制造 cold-cache。若无管理员支持，使用全新文件/key namespace，并在结果中说明其近似性。
 
-## 尚待确认的平台事项
+### 尚待确认的平台事项
 
 1. Lustre quota、inode 限额、stripe 和单/多节点带宽；
 2. 64K context 的容器兼容性和资源余量；

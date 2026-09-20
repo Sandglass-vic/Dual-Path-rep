@@ -15,8 +15,13 @@ PREFILL_PORT=${PREFILL_PORT:-30000}
 BOOTSTRAP_PORT=${BOOTSTRAP_PORT:-8998}
 MEM_FRACTION_STATIC=${MEM_FRACTION_STATIC:-0.75}
 CONTEXT_LENGTH=${CONTEXT_LENGTH:-4096}
+TP_SIZE=${TP_SIZE:-4}
 PD_TRANSFER_BACKEND=${PD_TRANSFER_BACKEND:-mooncake}
 HICACHE_STORAGE_BACKEND=${HICACHE_STORAGE_BACKEND:-file}
+# Absolute Host KV pool size per TP rank. SGLang overrides --hicache-ratio when
+# this is > 0. SGLang also asserts the Host pool is larger than the device KV
+# pool, so raise this when moving to a GPU with more KV capacity.
+HICACHE_SIZE_GB=${HICACHE_SIZE_GB:-0}
 PREFILL_HICACHE_MEM_LAYOUT=${PREFILL_HICACHE_MEM_LAYOUT:-layer_first}
 CHUNKED_PREFILL_SIZE=${CHUNKED_PREFILL_SIZE:-}
 DISABLE_OVERLAP_SCHEDULE=${DISABLE_OVERLAP_SCHEDULE:-0}
@@ -80,12 +85,16 @@ PY
     echo "Unsupported HICACHE_STORAGE_BACKEND=$HICACHE_STORAGE_BACKEND" >&2
     exit 2
   fi
+  if [[ ! $HICACHE_SIZE_GB =~ ^[0-9]+$ ]]; then
+    echo "HICACHE_SIZE_GB must be a non-negative integer number of GB" >&2
+    exit 2
+  fi
   hicache_args=(
     --page-size 64
     --enable-metrics
     --enable-hierarchical-cache
     --hicache-ratio "${HICACHE_RATIO:-1.2}"
-    --hicache-size 0
+    --hicache-size "$HICACHE_SIZE_GB"
     --hicache-mem-layout "$PREFILL_HICACHE_MEM_LAYOUT"
     --hicache-io-backend direct
     --hicache-write-policy write_through
@@ -114,7 +123,7 @@ fi
 
 mkdir -p "$LOG_DIR"
 
-echo "Starting TP8 prefill on $PREFILL_HOST"
+echo "Starting TP${TP_SIZE} prefill on $PREFILL_HOST"
 echo "Streaming Prefill output to console and $PREFILL_LOG"
 set +e
 PYTHONUNBUFFERED=1 python -u -m sglang.launch_server \
@@ -122,7 +131,7 @@ PYTHONUNBUFFERED=1 python -u -m sglang.launch_server \
   --served-model-name qwen2.5-32b \
   --host 0.0.0.0 \
   --port "$PREFILL_PORT" \
-  --tp-size 8 \
+  --tp-size "$TP_SIZE" \
   --dtype bfloat16 \
   --kv-cache-dtype auto \
   --context-length "$CONTEXT_LENGTH" \

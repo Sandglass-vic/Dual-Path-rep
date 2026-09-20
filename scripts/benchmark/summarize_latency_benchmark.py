@@ -120,15 +120,20 @@ def parse_timing_logs(
     v3_values: dict[
         str, dict[str, dict[tuple[str, int], dict[str, Any]]]
     ] = defaultdict(lambda: defaultdict(dict))
+    request_paths: dict[str, set[str]] = defaultdict(set)
     for path in log_dir.rglob("*.log"):
         for line in path.read_text(errors="replace").splitlines():
             marker = line.find(V3_PREFIX)
             if marker >= 0:
                 payload = json.loads(line[marker + len(V3_PREFIX) :])
                 if int(payload.get("schema_version", 0)) == 3:
-                    v3_values[str(payload["rid"])][str(payload["side"])][
+                    rid = str(payload["rid"])
+                    v3_values[rid][str(payload["side"])][
                         (str(payload["engine"]), int(payload["tp_rank"]))
                     ] = payload
+                    resolved_path = str(payload.get("path", ""))
+                    if resolved_path in ("prefill", "decode"):
+                        request_paths[rid].add(resolved_path)
                 continue
             match = REQUEST_PATTERN.search(line)
             if match and match.group("type").lower() == "prefill":
@@ -203,6 +208,12 @@ def parse_timing_logs(
         rid: {name: statistics.median(values) for name, values in fields.items()}
         for rid, fields in request_values.items()
     }
+    for rid, paths in request_paths.items():
+        if len(paths) > 1:
+            raise RuntimeError(
+                f"{rid} has inconsistent resolved L3 paths: {sorted(paths)}"
+            )
+        requests.setdefault(rid, {})["path"] = next(iter(paths), "")
     def reduce_l3(
         values: dict[str, dict[str, dict[int, dict[str, list[float]]]]],
         nodes: dict[str, dict[str, set[str]]],
@@ -443,6 +454,20 @@ def main() -> None:
             prefill_scatter = float(prefill_l3.get("scatter", 0.0))
             decode_lustre_read = float(decode_l3.get("lustre", 0.0))
             decode_scatter = float(decode_l3.get("scatter", 0.0))
+            l3_read_path = str(metadata.get("l3_read_path", "prefill"))
+            resolved_path = l3_read_path
+            if l3_read_path == "dynamic":
+                resolved_path = str(request.get("path", ""))
+                if resolved_path not in ("prefill", "decode"):
+                    raise RuntimeError(
+                        f"Dynamic request {rid} has no resolved L3 path in TTFT logs"
+                    )
+            if resolved_path == "prefill":
+                selected_cached_tokens = int(prefill_l3.get("tokens", 0))
+            elif resolved_path == "decode":
+                selected_cached_tokens = int(decode_l3.get("tokens", 0))
+            else:
+                raise RuntimeError(f"Invalid L3 read path: {l3_read_path}")
             read = prefill_read + decode_read
             prefill = float(request.get("prefill", 0.0))
             ttft = float(item["ttft_seconds"])
@@ -451,6 +476,9 @@ def main() -> None:
                 {
                     **metadata,
                     **item,
+                    "router_reported_cached_tokens": int(item["cached_tokens"]),
+                    "cached_tokens": selected_cached_tokens,
+                    "resolved_l3_read_path": resolved_path,
                     "sch_seconds": sch,
                     "alloc_seconds": alloc,
                     "read_seconds": read,
@@ -485,8 +513,7 @@ def main() -> None:
                         if decode_lustre_read > 0
                         else 0.0
                     ),
-                    "l3_read_tokens_logical": int(prefill_l3.get("tokens", 0))
-                    + int(decode_l3.get("tokens", 0)),
+                    "l3_read_tokens_logical": selected_cached_tokens,
                     "l3_prefetched_tokens_tp0": int(prefill_l3.get("tokens", 0)),
                     "l3_prefetched_tokens_logical": int(prefill_l3.get("tokens", 0)),
                     "l3_prefill_engine_id": prefill_l3.get("engine", ""),
@@ -524,7 +551,7 @@ def main() -> None:
                         else 0.0
                     ),
                     "cache_hit_rate": (
-                        int(item["cached_tokens"]) / int(item["prompt_tokens"])
+                        selected_cached_tokens / int(item["prompt_tokens"])
                         if int(item["prompt_tokens"]) > 0
                         else 0.0
                     ),
@@ -572,8 +599,8 @@ def main() -> None:
                 "residual_mean_seconds": mean(values("residual_seconds")),
                 "prompt_tokens_min": min(int(item["prompt_tokens"]) for item in rounds),
                 "prompt_tokens_max": max(int(item["prompt_tokens"]) for item in rounds),
-                "cached_tokens_min": min(int(item["cached_tokens"]) for item in rounds),
-                "cached_tokens_max": max(int(item["cached_tokens"]) for item in rounds),
+                "cached_tokens_min": min(values("cached_tokens")),
+                "cached_tokens_max": max(values("cached_tokens")),
                 "stream_retry_count": sum(
                     int(item.get("stream_retry_count", 0)) for item in rounds
                 ),
@@ -689,6 +716,10 @@ def main() -> None:
         if bool(item.get("prefill_l3", True))
         and bool(item.get("decode_offload", True))
         and bool(item.get("prefill_hicache_evict_unlocked", False))
+        and str(
+            item.get("resolved_l3_read_path", item.get("l3_read_path", "prefill"))
+        )
+        == "prefill"
     ]
     validation = {
         "runs": len(run_rows),
@@ -742,9 +773,6 @@ def main() -> None:
             int(item.get("stream_retry_count", 0)) for item in merged_rounds
         ),
     }
-    (args.output_dir / "validation.json").write_text(
-        json.dumps(validation, indent=2) + "\n"
-    )
     if validation["request_timing_coverage"] < 0.95:
         raise RuntimeError(f"Low request timing coverage: {validation}")
     # Dynamic full rollout does not pre-populate or wait for Store publication.
@@ -773,6 +801,17 @@ def main() -> None:
         raise RuntimeError(
             f"Unexpected Prefill local-prefix reuse after deferred eviction: {validation}"
         )
+    resolved_paths = {
+        str(item.get("resolved_l3_read_path", item.get("l3_read_path", "prefill")))
+        for item in merged_rounds
+    }
+    validation["resolved_l3_read_paths"] = sorted(resolved_paths)
+    validation["resolved_prefill_requests"] = sum(
+        item.get("resolved_l3_read_path") == "prefill" for item in merged_rounds
+    )
+    validation["resolved_decode_requests"] = sum(
+        item.get("resolved_l3_read_path") == "decode" for item in merged_rounds
+    )
     if validation["l3_read_paths"] == ["prefill"]:
         if validation["decode_l3_read_tokens_total"] != 0:
             raise RuntimeError(
@@ -783,8 +822,31 @@ def main() -> None:
             raise RuntimeError(
                 f"Prefill performed L3 reads on the Decode-read branch: {validation}"
             )
+    elif validation["l3_read_paths"] == ["dynamic"]:
+        invalid_cross_reads = [
+            item
+            for item in merged_rounds
+            if (
+                item["resolved_l3_read_path"] == "prefill"
+                and int(item["decode_l3_read_tokens"]) != 0
+            )
+            or (
+                item["resolved_l3_read_path"] == "decode"
+                and int(item["prefill_l3_read_tokens"]) != 0
+            )
+        ]
+        if invalid_cross_reads:
+            raise RuntimeError(
+                "Dynamic request read from non-owner side: "
+                f"{invalid_cross_reads[0]['request_id']}"
+            )
+        if resolved_paths != {"prefill", "decode"}:
+            raise RuntimeError(f"Dynamic run did not exercise both paths: {validation}")
     else:
         raise RuntimeError(f"Mixed or invalid L3 read paths: {validation}")
+    (args.output_dir / "validation.json").write_text(
+        json.dumps(validation, indent=2) + "\n"
+    )
     print(json.dumps(validation, indent=2))
 
 

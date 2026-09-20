@@ -1,6 +1,10 @@
 # DualPath 复现实验概览
 
-本项目在 GAIA DGX H100 集群上，以 Qwen2.5-32B、SGLang、Mooncake、Slurm/Pyxis/Enroot 和 Lustre 分阶段复现 *DualPath: Breaking the Storage Bandwidth Bottleneck in Agentic LLM Inference* 的关键趋势。目标是验证可复现的性能趋势，不承诺复现论文内部框架和 3FS 的绝对数值。
+本项目当前在 `pza100` 分支上迁移到 g5/g6 A100 集群，以 Qwen2.5-32B、
+SGLang、Mooncake 和 Slurm/Pyxis/Enroot 分阶段复现 *DualPath: Breaking the
+Storage Bandwidth Bottleneck in Agentic LLM Inference* 的关键趋势。目标是验证
+可复现的性能趋势，不承诺复现论文内部框架和 3FS 的绝对数值。GAIA DGX H100 +
+Lustre 的既有结果作为历史基线保留，当前环境见 [pza100 说明](pza100.md)。
 
 ## 复现边界
 
@@ -11,9 +15,11 @@
 
 ## 当前状态
 
-- Qwen2.5-32B base checkpoint 和 SGLang 26.01 基础镜像已固定。
-- Mooncake `0.3.13.post1` + Router 0.3.1 派生镜像已构建；包含当前 SGLang
-  所需的 DFS replica 配置回移。
+- pza100 已固定 SGLang 26.01 基础镜像，并构建 Mooncake
+  `0.3.13.post1` + Router 0.3.1 镜像和当前 DualPath patched 镜像；路径与
+  SHA-256 见 [容器说明](containers.md)。
+- pza100 的 TP4、双节点 1P1D、40GB 显存容量和 RDMA smoke 尚未完成。
+- 以下跨节点 TP8、Lustre 与 GAIA Job 状态均为迁移前历史基线：
 - 1P1D、1P2D、2P2D 跨节点 TP=8 Mooncake RDMA 短请求 smoke 已通过。
 - 32K、48K、64K 各 500 条 length-only fake trajectory 已生成。
 - 离线 fake trajectory replay 已验证并发 agent、精确生成长度和真实输出累积。
@@ -46,11 +52,12 @@
   未锁定 page，禁止跨 turn 本地命中。
 - 独立正确性仍可通过服务重启排除 L1/L2；正式性能路径默认 per-request
   release + L3 reload。
-- 多节点作业提交前核对 [已知故障节点](platform.md#已知故障节点临时排除)。
+- GAIA 历史作业提交前曾需核对故障节点；该列表不适用于 pza100。
 - 每个 client run 使用 `TASK_NAME` 专属日志和结果目录；长期 server 使用
   allocation 级共享 KV namespace。当前流程不自动删除这些目录。
 - 多轮 replay 必须把真实模型输出加入下一轮完整 context，不能将 trajectory 展开成无关请求。
-- 代码和文档在 `/labhome/sezhou/dual-path`；大型运行数据在计算节点可见的 `/mnt/lustre/users/sezhou/dual-path`。
+- pza100 代码和文档在 `/data/home/yongxiao/dual-path`；镜像与运行数据在
+  `/data/home/yongxiao/mydata`，g6 通过 IPoIB NFS 访问。
 
 ## 下一步
 
