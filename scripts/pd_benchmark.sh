@@ -99,7 +99,7 @@ done
   exit 2
 }
 export ALLOC_JOB_ID=$allocation_id
-IMAGE=${IMAGE:-$RUNTIME_HOME/images/sglang-file-l3-dual-staging-69302.sqsh}
+IMAGE=${IMAGE:-$RUNTIME_HOME/images/sglang-file-l3-dual-staging-69327.sqsh}
 ENGINE_GPUS=${ENGINE_GPUS:-8}
 TP_SIZE=${TP_SIZE:-8}
 : "${PREFILL_HOSTS:?PREFILL_HOSTS is required}"

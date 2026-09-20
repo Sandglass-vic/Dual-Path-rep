@@ -6,7 +6,7 @@ set -euo pipefail
 # Default experiment configuration. Override any value for one invocation with
 # NAME=value scripts/pd_alloc.sh P D.
 DEFAULT_RUNTIME_HOME=/mnt/lustre/users/sezhou/dual-path
-DEFAULT_IMAGE_NAME=images/sglang-file-l3-dual-staging-69302.sqsh
+DEFAULT_IMAGE_NAME=images/sglang-file-l3-dual-staging-69327.sqsh
 DEFAULT_PARTITION=GAIA
 DEFAULT_TIME_LIMIT=02:00:00
 DEFAULT_ENGINE_CPUS=112
