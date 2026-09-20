@@ -26,14 +26,17 @@ dualpath_export_common_env() {
     return 2
   fi
   export MEM_FRACTION_STATIC=${MEM_FRACTION_STATIC:-0.55}
-  # SGLang caps in-flight L3 prefetch at 0.8 * (host pool - device pool) tokens.
-  # A ratio-derived host pool ties that budget to GPU KV capacity, and on A100
-  # 40GB it collapses to ~26k tokens, below a single 32K prefix, which silently
-  # skips prefetch for concurrent agents. Size the pool absolutely instead.
-  # 40 GB/rank yields a ~413k token budget, well clear of 4 agents x 32K prefix,
-  # and stays above the device KV pool on both A100 40GB and H100 80GB.
-  # Set to 0 to fall back to HICACHE_RATIO.
-  export HICACHE_SIZE_GB=${HICACHE_SIZE_GB:-40}
+  # SGLang caps in-flight L3 prefetch at 0.8 * (host pool - device pool) tokens,
+  # so the budget is the gap between the two pools, not the host pool itself.
+  # An absolute size protects that gap only where the device pool is small: on
+  # A100 40GB the ratio collapses it to ~26k tokens, below one 32K prefix.
+  # H100 80GB is the opposite case. Job 69338 measured a 1,131,200-token device
+  # pool, so HICACHE_SIZE_GB=40 left a 89,535-token gap and a 71,628-token
+  # budget, and 4 concurrent 32K agents hit it from turn 18 on: 56 prefetch
+  # skips, all reason=rate_limited. The ratio gives 1.35x the device pool,
+  # a 395,920-token gap and a 316,736-token budget, which covers 8 agents.
+  # Set this to an absolute GB/rank on small-KV GPUs; 0 keeps the ratio.
+  export HICACHE_SIZE_GB=${HICACHE_SIZE_GB:-0}
   export HICACHE_RATIO=${HICACHE_RATIO:-1.35}
   export PREFILL_HICACHE_MEM_LAYOUT=${PREFILL_HICACHE_MEM_LAYOUT:-layer_first}
   export DECODE_HICACHE_RATIO=${DECODE_HICACHE_RATIO:-1.05}
