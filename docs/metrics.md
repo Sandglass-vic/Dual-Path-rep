@@ -72,6 +72,36 @@ task 下按 `<DATASET>/agents-<N>/rep-<R>/` 分组；例如
     每个 dataset 一个面板、横轴为 agents、柱高为上述最坏 JCT；不再生成单独的
     `trajectory_jct_max_by_agents.svg`。
 
+#### wall_seconds 比 trajectory_jct 大一个 sync wait
+
+两者不可互换，差值不是噪声。`wait_for_decode_l3()` 在 `turn_ended` 打点之后
+执行，所以 `decode_l3_sync_wait_seconds` 不进入 `turn_wall_seconds`，也就不进
+入由它累加而成的 `trajectory_jct`；但它是真实墙上时间，`wall_seconds` 包含它。
+因此：
+
+```text
+wall_seconds ≈ max_over_agents(elapsed_seconds + Σ decode_l3_sync_wait_seconds)
+```
+
+Job `69341` 的 1P1D TP8、32K、4 agent、O_DIRECT 三个 run 验证该式，残差 0.02 s，
+即真实收尾开销可忽略（实测序列化并写 609 KiB `rounds.jsonl` 到 Lustre 仅 0.03 s）：
+
+| run | max trajectory_jct | + 该 agent sync wait | wall_seconds | 残差 |
+|---|---:|---:|---:|---:|
+| Prefill path | 96.726 | 99.586 | 99.607 | 0.021 |
+| Decode path | 100.851 | 103.770 | 103.788 | 0.017 |
+| Dynamic path | 86.683 | 89.956 | 89.975 | 0.019 |
+
+每 agent 的 sync wait 累计约 2.9--3.7 s（26 turn，每轮约 0.12 s）。两点后果：
+
+- 正式对比一律用 **trajectory_jct**，不要混用 `wall_seconds`，两者相差约 3 s。
+- JCT 最大的 agent 未必是 wall 最大的那个。上表 Dynamic run 中 JCT 最大的是
+  `32k-0001`（86.683），加 sync wait 后最大的却是 `32k-0002`（89.956）。
+
+该口径系统性地把 Decode L3 sync 等待排除在 JCT 之外。保持现状是为了与既有
+JCT 数据可比；若要改为计入，只需把 `turn_ended` 移到 `wait_for_decode_l3()`
+之后，但此后新旧 JCT 不能直接比较。
+
 单轮闭合为：
 
 ```text

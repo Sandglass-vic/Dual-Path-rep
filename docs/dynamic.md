@@ -708,3 +708,54 @@ TTFT V3 记录同时输出 `configured_path`（run 模式）与 `path`（该请�
 
 无法解析的 rid（warmup、`HEALTH_CHECK_*`）回退到 `prefill` 而非 fail-closed——让健康检查
 失败会直接打断 run，代价远大于收益。
+## 16. GAIA TP8 实测：dynamic 用聚合带宽换单请求延迟
+
+Job `69341`，1P1D TP8、32K、4 agent、1 rep、`DUAL_PATH_O_DIRECT_READ=1`、
+`alternate_per_turn`，三种 read path 各一个 run。三者读取的 KV 数据量完全相同
+（1,939,200 tokens = 473.4 GiB，每请求 19,392 tokens），dynamic 精确对半分成
+50/50 个请求，因此是一组干净对照。
+
+带宽口径为 `tokens x 262144 B / lustre_read_seconds / 1e9`，即 **GB/s**（字段名
+`*_effective_bandwidth_gbps` 实为字节，不是 Gbit/s）；分母是纯读取，不含 scatter。
+
+| run / 侧 | 请求数 | 每请求 tokens | 每请求读取 | 该侧 GB/s |
+|---|---:|---:|---:|---:|
+| Prefill path / Prefill 侧 | 100 | 19,392 | 0.674 s | 7.54 |
+| Decode path / Decode 侧 | 100 | 19,392 | 0.698 s | 7.28 |
+| Dynamic / Prefill 侧 | 50 | 19,394 | 0.980 s | 5.19 |
+| Dynamic / Decode 侧 | 50 | 19,389 | 0.901 s | 5.64 |
+
+**单看一侧，dynamic 慢 31%；两侧并行加总，dynamic 快 44%。** dynamic 两侧同时
+读取，聚合带宽 `5.19 + 5.64 = 10.83 GB/s`，相对静态 Prefill 的 7.54 GB/s 为
+1.44x，相对静态 Decode 的 7.28 GB/s 为 1.49x。
+
+原因是单节点带宽对并发度是次线性的。静态模式下 4 个 agent 全压在一个引擎上，
+dynamic 下每侧只剩约 2 个并发，单节点带宽退到 69%（5.19/7.54），但节点数翻倍，
+总吞吐仍然净增。这与 [platform.md](platform.md) 的 Lustre fio 标定一致：8 jobs
+读 10.77 GiB/s、16 jobs 读 19.35 GiB/s，并发翻倍带宽接近翻倍，说明瓶颈在单节点
+的并发深度而非 Lustre 总带宽。这正是 DualPath 论文用两条路径突破单路径存储带宽
+的论点。
+
+端到端因此是 dynamic 最快（trajectory_jct 86.68 s，Prefill 96.73 s，
+Decode 100.85 s）。但 TTFT 的收益并不来自读取：dynamic 的两侧读取合计
+（0.471 + 0.433 = 0.904 s）反而高于任一静态路径的单侧（0.648 / 0.671 s），真正
+的来源是 queue wait 从 0.828 s（Prefill）和 0.976 s（Decode）降到 0.167 s——
+请求分摊到两个引擎后队列深度减半。
+
+| | Prefill path | Decode path | Dynamic |
+|---|---:|---:|---:|
+| trajectory_jct | 96.73 s | 100.85 s | **86.68 s** |
+| TTFT mean | 1.785 s | 1.949 s | **1.406 s** |
+| TTFT p90 | 3.614 s | 3.871 s | **1.726 s** |
+| TTFT p99 | **4.006 s** | 4.301 s | 5.612 s |
+| queue wait | 0.828 s | 0.976 s | **0.167 s** |
+
+未解释项：dynamic 的 p99 反而最差（5.612 s），p90 很低但尾部翘起，尚未定位到是
+哪一侧的慢请求造成。
+
+注意该结论与 pza100 相反（见 [debug.md](debug.md) §10：dynamic 6.471 s 接近静态
+Decode 6.771 s，明显劣于静态 Prefill 1.874 s）。pza100 是 TP4、两节点、client 与
+Decode 共置、g5 本地 XFS 经 NFS 导出给 g6；该拓扑下 Decode 侧读取要穿 NFS，两侧
+并不对等，分摊反而放大了慢的一侧。GAIA 上两侧都直连 Lustre，单侧读取成本几乎
+相同（7.54 vs 7.28 GB/s），分摊才有收益。**dynamic 是否获益取决于两条路径的存储
+对称性，不是策略本身的属性。**
