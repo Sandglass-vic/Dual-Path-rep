@@ -12,7 +12,7 @@ from collections import defaultdict
 from pathlib import Path
 
 from plot_style import add_title_suffix
-from ttft_components import components_for_path, normalize_ttft_row, path_from_row
+from ttft_components import components_for_rows, normalize_ttft_row
 
 
 TITLE_SUFFIX = ""
@@ -204,7 +204,7 @@ def write_breakdown(rounds_path: Path, output: Path) -> dict[str, float]:
                     "kv_read_overhead_seconds",
                 )
             )
-    components = components_for_path(path_from_row(rows[0]))
+    components = components_for_rows(rows)
     means = {
         field: statistics.fmean(float(row[field]) for row in rows)
         for field, _, _ in components
