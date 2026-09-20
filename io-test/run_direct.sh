@@ -2,17 +2,17 @@
 # Compare Decode-style buffered and O_DIRECT Lustre reads on one compute node.
 set -euo pipefail
 
-CODE_HOME=${CODE_HOME:-/data/home/yongxiao/dual-path}
-RUNTIME_HOME=${RUNTIME_HOME:-/data/home/yongxiao/mydata}
-IMAGE=${IMAGE:-$RUNTIME_HOME/images/sglang:26.01-py3-mooncake0.3.13.post1-dualpath-patched.sqsh}
-CONTAINER_MOUNTS=${CONTAINER_MOUNTS:-/data:/data,$CODE_HOME:/workspace/dual-path:ro}
-TP_RANKS=${TP_RANKS:-4}
+CODE_HOME=${CODE_HOME:-/labhome/sezhou/dual-path}
+RUNTIME_HOME=${RUNTIME_HOME:-/mnt/lustre/users/sezhou/dual-path}
+IMAGE=${IMAGE:-$RUNTIME_HOME/images/sglang-file-l3-dual-staging-69054.sqsh}
+CONTAINER_MOUNTS=${CONTAINER_MOUNTS:-/mnt/lustre:/mnt/lustre,$CODE_HOME:/workspace/dual-path}
+TP_RANKS=${TP_RANKS:-8}
 PAGES_PER_RANK=${PAGES_PER_RANK:-512}
-PAGE_BYTES=${PAGE_BYTES:-4194304}
+PAGE_BYTES=${PAGE_BYTES:-2097152}
 PASSES=${PASSES:-1}
 REPETITIONS=${REPETITIONS:-3}
 BUFFER_TYPE=${BUFFER_TYPE:-pinned}
-CPUS_PER_NODE=${CPUS_PER_NODE:-32}
+CPUS_PER_NODE=${CPUS_PER_NODE:-112}
 COPY_TO_STAGING=${COPY_TO_STAGING:-1}
 TORCH_THREADS=${TORCH_THREADS:-1}
 DIRECT_ALIGNMENT=${DIRECT_ALIGNMENT:-4096}

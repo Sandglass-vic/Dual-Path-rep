@@ -31,8 +31,8 @@ if [[ $requested_role != auto && $requested_role != server && \
   exit 2
 fi
 
-CODE_HOME=${CODE_HOME:-/data/home/yongxiao/dual-path}
-RUNTIME_HOME=${RUNTIME_HOME:-/data/home/yongxiao/mydata}
+CODE_HOME=${CODE_HOME:-/labhome/sezhou/dual-path}
+RUNTIME_HOME=${RUNTIME_HOME:-/mnt/lustre/users/sezhou/dual-path}
 current_host=${DUALPATH_HOSTNAME:-$(hostname -s)}
 allocation_id=${ALLOC_JOB_ID:-${SLURM_JOB_ID:-}}
 if [[ -z $allocation_id ]]; then
@@ -99,9 +99,9 @@ done
   exit 2
 }
 export ALLOC_JOB_ID=$allocation_id
-IMAGE=${IMAGE:-$RUNTIME_HOME/images/sglang:26.01-py3-mooncake0.3.13.post1-dualpath-patched.sqsh}
-ENGINE_GPUS=${ENGINE_GPUS:-4}
-TP_SIZE=${TP_SIZE:-4}
+IMAGE=${IMAGE:-$RUNTIME_HOME/images/sglang-file-l3-dual-staging-69302.sqsh}
+ENGINE_GPUS=${ENGINE_GPUS:-8}
+TP_SIZE=${TP_SIZE:-8}
 : "${PREFILL_HOSTS:?PREFILL_HOSTS is required}"
 : "${DECODE_HOSTS:?DECODE_HOSTS is required}"
 if [[ -n ${TASK_NAME:-} && ! $TASK_NAME =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]]; then
@@ -208,7 +208,7 @@ if [[ $role == client ]]; then
 else
   runtime_role=$engine_role
   runtime_id=$engine_id
-  cpus=${ENGINE_CPUS:-192}
+  cpus=${ENGINE_CPUS:-112}
   gres="gpu:$ENGINE_GPUS"
 fi
 [[ $cpus =~ ^[1-9][0-9]*$ ]] || { echo "Invalid CPU count: $cpus" >&2; exit 2; }
@@ -220,8 +220,10 @@ flashinfer_workspace=$runtime_cache_root/flashinfer
 triton_cache_dir=$runtime_cache_root/triton
 torch_extensions_dir=$runtime_cache_root/torch-extensions
 torchinductor_cache_dir=$runtime_cache_root/torchinductor
-mkdir -p "$runtime_home" "$xdg_cache_home" "$flashinfer_workspace" \
-  "$triton_cache_dir" "$torch_extensions_dir" "$torchinductor_cache_dir"
+if [[ ${PD_DRY_RUN:-0} != 1 ]]; then
+  mkdir -p "$runtime_home" "$xdg_cache_home" "$flashinfer_workspace" \
+    "$triton_cache_dir" "$torch_extensions_dir" "$torchinductor_cache_dir"
+fi
 
 if [[ $role == client ]]; then
   threads_per_process=${OMP_NUM_THREADS:-$cpus}
@@ -246,7 +248,7 @@ command=(
   --nodes=1 --ntasks=1 --nodelist="$current_host"
   --cpus-per-task="$cpus" --gres="$gres" --mpi=none
   --container-image="$IMAGE"
-  --container-mounts="$RUNTIME_HOME:$RUNTIME_HOME,$CODE_HOME:/workspace/dual-path"
+  --container-mounts="${CONTAINER_MOUNTS:-/mnt/lustre:/mnt/lustre},$CODE_HOME:/workspace/dual-path"
   --container-workdir=/workspace/dual-path --no-container-mount-home
   env CODE_HOME=/workspace/dual-path
   HOME="$runtime_home"

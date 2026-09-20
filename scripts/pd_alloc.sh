@@ -1,18 +1,19 @@
 #!/usr/bin/env bash
-# Allocate P+D engine nodes, with Router/replay colocated on Decode by default.
+# Allocate P+D engine nodes plus one Router/replay client node. Set
+# CLIENT_PLACEMENT=decode to colocate the client on the last Decode node.
 set -euo pipefail
 
 # Default experiment configuration. Override any value for one invocation with
 # NAME=value scripts/pd_alloc.sh P D.
-DEFAULT_RUNTIME_HOME=/data/home/yongxiao/mydata
-DEFAULT_IMAGE_NAME=images/sglang:26.01-py3-mooncake0.3.13.post1-dualpath-patched.sqsh
-DEFAULT_PARTITION=run
+DEFAULT_RUNTIME_HOME=/mnt/lustre/users/sezhou/dual-path
+DEFAULT_IMAGE_NAME=images/sglang-file-l3-dual-staging-69302.sqsh
+DEFAULT_PARTITION=GAIA
 DEFAULT_TIME_LIMIT=02:00:00
-DEFAULT_ENGINE_CPUS=192
+DEFAULT_ENGINE_CPUS=112
 DEFAULT_CLIENT_CPUS=8
-DEFAULT_ENGINE_GPUS=4
-DEFAULT_TP_SIZE=4
-DEFAULT_CLIENT_PLACEMENT=decode
+DEFAULT_ENGINE_GPUS=8
+DEFAULT_TP_SIZE=8
+DEFAULT_CLIENT_PLACEMENT=separate
 DEFAULT_EXCLUDE=
 
 write_allocation_config() {
@@ -55,7 +56,7 @@ run_allocation_shell() {
   : "${SLURM_JOB_NODELIST:?SLURM_JOB_NODELIST is required}"
   : "${PREFILL_NODES:?PREFILL_NODES is required}"
   : "${DECODE_NODES:?DECODE_NODES is required}"
-  CODE_HOME=${CODE_HOME:-/data/home/yongxiao/dual-path}
+  CODE_HOME=${CODE_HOME:-/labhome/sezhou/dual-path}
   RUNTIME_HOME=${RUNTIME_HOME:-$DEFAULT_RUNTIME_HOME}
 
   local expected client_host host index
@@ -128,7 +129,7 @@ run_allocation_shell() {
   printf '  cd %s && DATASET=32K AGENTS=1 REPETITION=1 DUALPATH_L3_READ_PATH=<prefill|decode> scripts/pd_benchmark.sh client\n' \
     "$CODE_HOME"
   printf '\nKeep this shell open until every node-local srun has stopped.\n'
-  printf '\nShared run root: %q\n' "$RUNTIME_HOME/test/$ALLOC_JOB_ID"
+  printf '\nLustre run root: %q\n' "$RUNTIME_HOME/test/$ALLOC_JOB_ID"
   printf '  task logs/results: %q/<TASK_NAME>/logs\n' "$RUNTIME_HOME/test/$ALLOC_JOB_ID"
   printf '\nCold-cache cleanup for this allocation (run only after stopping Prefill/Decode and releasing the allocation):\n'
   printf '  rm -rf %q\n\n' "$RUNTIME_HOME/test/$ALLOC_JOB_ID/pd-servers/kv-cache"
@@ -153,7 +154,7 @@ usage() {
   cat <<'EOF'
 Usage: scripts/pd_alloc.sh [PREFILL_NODES] [DECODE_NODES]
 
-Defaults: 1P1D TP4, Decode-colocated client, Prefill L3 read, pza100 image.
+Defaults: 1P1D TP8, separate client node, Prefill L3 read, current image.
 Workload settings belong to the client command, for example:
   DATASET=64K AGENTS=8 REPETITION=2 scripts/pd_benchmark.sh client
 
@@ -185,7 +186,7 @@ for name in PREFILL_NODES DECODE_NODES; do
   }
 done
 
-CODE_HOME=${CODE_HOME:-/data/home/yongxiao/dual-path}
+CODE_HOME=${CODE_HOME:-/labhome/sezhou/dual-path}
 RUNTIME_HOME=${RUNTIME_HOME:-$DEFAULT_RUNTIME_HOME}
 IMAGE=${IMAGE:-$RUNTIME_HOME/$DEFAULT_IMAGE_NAME}
 PARTITION=${PARTITION:-$DEFAULT_PARTITION}

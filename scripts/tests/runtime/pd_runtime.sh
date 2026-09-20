@@ -11,7 +11,7 @@ fi
 [[ $role_id =~ ^[0-9]+$ ]] || { echo "Invalid engine ID: $role_id" >&2; exit 2; }
 
 CODE_HOME=${CODE_HOME:-/workspace/dual-path}
-RUNTIME_HOME=${RUNTIME_HOME:-/data/home/yongxiao/mydata}
+RUNTIME_HOME=${RUNTIME_HOME:-/mnt/lustre/users/sezhou/dual-path}
 : "${PREFILL_HOSTS:?PREFILL_HOSTS is required}"
 : "${DECODE_HOSTS:?DECODE_HOSTS is required}"
 read -r -a prefill_hosts <<<"$PREFILL_HOSTS"
@@ -24,7 +24,7 @@ export MODEL_DIR=${MODEL_DIR:-$RUNTIME_HOME/models/Qwen2.5-32B}
 export PREFILL_PORT=${PREFILL_PORT:-30000} DECODE_PORT=${DECODE_PORT:-30000}
 export BOOTSTRAP_PORT=${BOOTSTRAP_PORT:-8998} ROUTER_PORT=${ROUTER_PORT:-8000}
 export SERVER_TIMEOUT=${SERVER_TIMEOUT:-1200}
-export TP_SIZE=${TP_SIZE:-4}
+export TP_SIZE=${TP_SIZE:-8}
 export JOB_RUNTIME_DIR=${JOB_RUNTIME_DIR:-$RUNTIME_HOME/test/$ALLOC_JOB_ID}
 export SERVER_CACHE_DIR=${SERVER_CACHE_DIR:-$JOB_RUNTIME_DIR/pd-servers/kv-cache/file}
 : "${DUALPATH_L3_READ_PATH:?Set DUALPATH_L3_READ_PATH=prefill or decode for every role}"
@@ -165,7 +165,7 @@ if [[ $role == prefill || $role == decode ]]; then
   printf 'Server configuration: role=%s l3_read=%s log_dir=%s cache_dir=%s\n' \
     "$role" "$DUALPATH_L3_READ_PATH" "$LOG_DIR" "$CACHE_DIR"
   printf '  storage_fstype=%s storage_topology=%s\n' \
-    "$STORAGE_FSTYPE" "${STORAGE_TOPOLOGY:-g5-xfs-export-g6-nfs}"
+    "$STORAGE_FSTYPE" "${STORAGE_TOPOLOGY:-gaia-lustre-shared}"
   printf '  dual_path_o_direct_read=%s\n' "$DUAL_PATH_O_DIRECT_READ"
   printf '  ttft_timing_v3=%s detail=%s\n' \
     "$DUALPATH_TTFT_TIMING" "$DUALPATH_TTFT_TIMING_DETAIL"

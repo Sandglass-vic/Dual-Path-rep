@@ -16,7 +16,7 @@ common=(
 
 output=$(env "${common[@]}" DUALPATH_HOSTNAME=p1 "$ROOT/scripts/pd_benchmark.sh" server)
 grep -q 'role=prefill id=1' <<<"$output"
-grep -q -- '--gres=gpu:4' <<<"$output"
+grep -q -- '--gres=gpu:8' <<<"$output"
 grep -q -- '--quit-on-interrupt' <<<"$output"
 
 output=$(env "${common[@]}" DUALPATH_HOSTNAME=d0 "$ROOT/scripts/pd_benchmark.sh" server)
@@ -51,9 +51,9 @@ fi
 
 output=$(env PD_DRY_RUN=1 TASK_NAME=test-alloc DATASET=32K AGENTS=2 \
   "$ROOT/scripts/pd_alloc.sh" 1 2)
-grep -q 'Requesting 1P2D, client=decode: 3 nodes, TP=4, GPUs/engine=4' <<<"$output"
-grep -q -- '--nodes=3' <<<"$output"
-grep -q -- '--gres=gpu:4' <<<"$output"
+grep -q 'Requesting 1P2D, client=separate: 4 nodes, TP=8, GPUs/engine=8' <<<"$output"
+grep -q -- '--nodes=4' <<<"$output"
+grep -q -- '--gres=gpu:8' <<<"$output"
 grep -q -- 'pd_alloc.sh' <<<"$output"
 if env PD_DRY_RUN=1 ENGINE_GPUS=2 TP_SIZE=4 \
   "$ROOT/scripts/pd_alloc.sh" 1 1 >/dev/null 2>&1; then

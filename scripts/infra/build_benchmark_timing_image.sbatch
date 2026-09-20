@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=sglang-mooncake013-image
-#SBATCH --partition=run
+#SBATCH --partition=GAIA
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=48
 #SBATCH --mem=0
 #SBATCH --time=00:30:00
-#SBATCH --output=timing-image-%j.out
+#SBATCH --exclude=dgx-gaia-10,dgx-gaia-12,dgx-gaia-18,dgx-gaia-30,dgx-gaia-35,dgx-gaia-38,dgx-gaia-46,dgx-gaia-53
+#SBATCH --output=/labhome/sezhou/dual-path/timing-image-%j.out
 
 set -euo pipefail
 

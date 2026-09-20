@@ -67,7 +67,7 @@ dualpath_export_common_env() {
   # Retained only as a historical/control switch; disabled for formal runs.
   export FLUSH_LOCAL_CACHE_BETWEEN_TURNS=${FLUSH_LOCAL_CACHE_BETWEEN_TURNS:-0}
   export STORAGE_SETTLE_SECONDS=${STORAGE_SETTLE_SECONDS:-0}
-  export DUALPATH_DECODE_L3_SYNC_RANKS=${DUALPATH_DECODE_L3_SYNC_RANKS:-${TP_SIZE:-4}}
+  export DUALPATH_DECODE_L3_SYNC_RANKS=${DUALPATH_DECODE_L3_SYNC_RANKS:-${TP_SIZE:-8}}
   export DUALPATH_DECODE_L3_SYNC_TIMEOUT=${DUALPATH_DECODE_L3_SYNC_TIMEOUT:-600}
   export DUALPATH_L3_READ_PATH=${DUALPATH_L3_READ_PATH:-prefill}
   # Only consulted when DUALPATH_L3_READ_PATH=dynamic.
@@ -246,10 +246,10 @@ Path(sys.argv[1]).write_text(json.dumps({
     "storage_backend": "sglang-file-posix",
     "storage_filesystem_client": os.environ.get("STORAGE_FSTYPE", "unknown"),
     "storage_topology": os.environ.get(
-        "STORAGE_TOPOLOGY", "g5-xfs-export-g6-nfs"
+        "STORAGE_TOPOLOGY", "gaia-lustre-shared"
     ),
     "storage_metric_compatibility": (
-        "legacy lustre_* field names measure generic POSIX file reads on pza100"
+        "lustre_* field names measure generic POSIX file reads on any backend"
     ),
     "artificial_inter_turn_delay": False,
     "per_turn_cache_flush": bool(int(sys.argv[15])),
@@ -276,7 +276,7 @@ Path(sys.argv[1]).write_text(json.dumps({
         os.environ.get("DUALPATH_DECODE_L3_SYNC_DIR")
     ),
     "decode_l3_completion_sync_ranks": int(
-        os.environ.get("DUALPATH_DECODE_L3_SYNC_RANKS", os.environ.get("TP_SIZE", "4"))
+        os.environ.get("DUALPATH_DECODE_L3_SYNC_RANKS", os.environ.get("TP_SIZE", "8"))
     ),
     "decode_l3_completion_sync_timeout_seconds": float(
         os.environ.get("DUALPATH_DECODE_L3_SYNC_TIMEOUT", "600")
@@ -390,7 +390,7 @@ dualpath_run_replay() {
   if [[ -n ${DUALPATH_DECODE_L3_SYNC_DIR:-} ]]; then
     sync_args+=(
       --decode-l3-sync-dir "$DUALPATH_DECODE_L3_SYNC_DIR"
-      --decode-l3-sync-ranks "${DUALPATH_DECODE_L3_SYNC_RANKS:-${TP_SIZE:-4}}"
+      --decode-l3-sync-ranks "${DUALPATH_DECODE_L3_SYNC_RANKS:-${TP_SIZE:-8}}"
       --decode-l3-sync-timeout "${DUALPATH_DECODE_L3_SYNC_TIMEOUT:-600}"
     )
   fi
