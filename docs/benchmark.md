@@ -267,7 +267,7 @@ rm -rf /mnt/lustre/users/sezhou/dual-path/test/<allocation-id>/pd-servers/kv-cac
 （`REPO_RESULT_DIR`，勿与 Lustre `RESULT_DIR` 混淆）。
 
 数据路径、实际 chunk 传输边界和 `ABLATION_PROFILE` 一键配置见
-[当前数据流与消融开关](dataflow-and-ablation.md)。
+[当前数据流与消融开关](hicache-and-dualpath.md#当前数据流与消融开关)。
 
 ## Benchmark 与观测
 
@@ -299,7 +299,7 @@ python -m sglang.bench_serving \
 ### 观测范围
 
 当前已自动采集的客户端、cache 和服务端 timing，以及尚未接入的 IB/Lustre/GPU
-硬件计数器，统一列在 [指标规范](metrics.md#7-当前自动采集流水线) 和
+硬件计数器，统一列在 [指标规范](metrics.md#7-当前独立采集流水线) 和
 [有效性检查](metrics.md#9-有效性检查)。环境与复现元数据见
 [复现与安全](reproducibility-and-security.md)。
 

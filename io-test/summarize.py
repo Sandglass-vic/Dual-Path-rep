@@ -129,6 +129,8 @@ def main() -> None:
             else None
         ),
         "drop_cache": sorted(drops_cache),
+        "io_mode": sorted({record.get("io_mode", "buffered") for record in records}),
+        "copy_to_staging": sorted({record["copy_to_staging"] for record in records}),
         "diagnosis": diagnosis,
     }
     rendered = json.dumps(summary, indent=2, sort_keys=True)

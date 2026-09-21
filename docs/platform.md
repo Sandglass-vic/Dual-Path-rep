@@ -1,55 +1,8 @@
-# pza100 平台与 GAIA 历史记录
+# GAIA 平台、网络与 Lustre
 
 > 返回 [文档索引](README.md)
 
-## pza100：g5/g6 A100
-
-当前分支的目标平台是 `g5g6`：
-
-```text
-Slurm controller: g5
-分区: run（默认，4h），build（12h）
-节点: g5, g6
-每节点 GPU: 4 × NVIDIA A100 PCIe 40GB
-每节点 CPU: 2 × AMD EPYC 9654
-每节点内存: 约 502 GiB
-Enroot: 4.2.0
-```
-
-常用检查与资源申请：
-
-```bash
-sinfo -Nel
-squeue -u "$USER"
-
-srun -p run -N1 -n1 --gres=gpu:4 --cpus-per-task=32 --mem=0 \
-  --time=01:00:00 --pty bash
-```
-
-g5/g6 的计算网络使用 `mlx5_0`、`mlx5_4`；GPU0/1 邻近 `mlx5_0`，GPU2/3
-邻近 `mlx5_4`。跨节点运行显式设置：
-
-```bash
-export NCCL_IB_HCA=mlx5_0,mlx5_4
-export NCCL_NET_GDR_LEVEL=PIX
-export NCCL_SOCKET_IFNAME=ibs3
-export GLOO_SOCKET_IFNAME=ibs3
-```
-
-共享存储不是 Lustre：g5 的 `/data` 是本地盘，g6 通过 IPoIB NFS 挂载 g5。
-g5 停机或 `ibs3` 中断会同时影响 g6 的代码、镜像、模型和 KV 数据。pza100
-运行根目录为 `/data/home/yongxiao/mydata`。
-
-集群只有两个节点。现有 `P + D + 1 client` 分配模型至少需要三个节点，不能
-原样运行；单节点引擎也必须从 TP8 调整为 TP4。完整限制见
-[pza100 环境](pza100.md#当前限制)。
-
----
-
-## GAIA DGX H100 + Lustre 历史记录
-
-以下内容来自迁移前 GAIA 环境，仅用于解释既有 Job 和性能数据，不是 pza100
-配置。
+## 1. Slurm
 
 ### 1. Slurm
 

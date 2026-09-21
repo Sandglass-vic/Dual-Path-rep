@@ -161,6 +161,41 @@ g6 在 `DROP_PEER_CACHE=1` 下的四象限，即 g5 也清掉缓存、读请求�
 
 # GAIA 历史基线（DGX H100 + Lustre）
 
+## 2026-09-21: O_DIRECT 双节点聚合扩展 Job 69346（direct）与 Job 69347（buffered）
+
+问题：O_DIRECT 下两个节点的聚合带宽是不是单节点的 2 倍。
+
+节点 `dgx-gaia-09` / `dgx-gaia-10`（exclusive），`io-test/run.sh`，TP8、每 rank 一个
+独立进程、2 MiB/page、每节点每相 8 GiB、3 轮、每轮前 `DONTNEED`。与 Job 68967 的
+区别是这次**只测文件 I/O**：`USE_CONTAINER=0 BUFFER_TYPE=pageable
+COPY_TO_STAGING=0`，不带 pinned DRAM 和 torch staging 拷贝，因此不需要镜像和 GPU。
+两个节点读的是同一批 page 文件，与 68967 一致。
+
+| io_mode | 单节点 GiB/s | 双节点聚合 GiB/s | aggregate scaling | per-node retention | 单页 read p50 |
+|---|---:|---:|---:|---:|---:|
+| `direct` | 6.973 | 13.606 | **1.935x** | 97.5% | 1.835 → 1.875 ms |
+| `buffered` | 3.995 | 8.015 | **1.988x** | 102.8% | 3.522 → 3.549 ms |
+
+均为 3 轮中位数；scaling 逐轮为 direct `1.935 / 1.983 / 1.918`、buffered
+`1.988 / 1.998 / 1.958`。
+
+**结论：是 2 倍。** O_DIRECT 下双节点聚合 `1.935x`，每节点保持率 97.5%，单页读
+p50 从 1.835 ms 只涨到 1.875 ms（+2.2%），第二个 reader 既没有抢走带宽也没有制造
+排队。buffered 对照给出同样的形状（`1.988x`），说明这个线性度不是 O_DIRECT 特有的，
+而是这段区间里 Lustre 后端对两个 client 还远未饱和。
+
+两节点合计 13.6 GiB/s 仍低于 Job 67340 在单节点用 fio（8 job × iodepth 16、4 MiB）
+打到的 22.98 GiB/s 读取峰值，也就是说 TP8 × 队列深度 1 的逐页访问形态本身才是限制，
+不是 Lustre 的总吞吐。因此在这个量级上继续加 Decode 节点仍能线性拿到带宽。
+
+O_DIRECT 相对 buffered 快 `1.75x`（6.973 vs 3.995），比 Job 68987 同节点同配置测到
+的 `1.529x` 更高——那次带 pinned buffer 和 torch staging 拷贝，端到端里掺了 CPU
+开销。纯文件 I/O 口径下 O_DIRECT 的收益更干净。
+
+范围限制：两节点读同一批文件，OSS 侧缓存可能为第二个 reader 提供帮助，本实验不能
+区分"两份独立带宽"和"一份被共享但尚未饱和的带宽"；`DONTNEED` 也只清客户端缓存。
+要证伪需要让两节点读互不相交的文件集重跑。
+
 ## 2026-09-15: Hot page cache versus O_DIRECT Job 68988
 
 在 `dgx-gaia-17` 上对同一批 8 GiB KV page 重复执行以下顺序：

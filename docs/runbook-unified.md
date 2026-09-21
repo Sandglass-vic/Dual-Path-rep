@@ -2,10 +2,6 @@
 
 > 返回 [文档索引](README.md)
 
-> **pza100 状态：待迁移验证。** 本页的 8×H100、TP8、GAIA 和 Lustre 命令属于
-> 历史环境。g5/g6 单节点只有 4×A100 40GB，应改用 `run` 分区、`gpu:4`、TP4
-> 和 `/data/home/yongxiao/mydata`；镜像见 [pza100 环境](pza100.md)。
-
 ## Phase 0：当前镜像与模型准备
 
 目的：不引入 PD、HiCache 和 Mooncake，只验证镜像与 Qwen2.5-32B。

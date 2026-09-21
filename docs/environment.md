@@ -2,46 +2,7 @@
 
 > 返回 [文档索引](README.md)
 
-## pza100 当前目录
-
-```text
-/data/home/yongxiao/dual-path/       Git 根目录
-├── docs/
-├── scripts/
-└── results/                         仓库侧图表/汇总（gitignore）
-
-/data/home/yongxiao/mydata/          g5 本地、g6 经 IPoIB NFS 共享
-├── images/
-├── models/
-├── test/<allocation-id>/
-├── traces/
-└── dual-test/                      fake trajectory 数据集
-```
-
-```bash
-export CODE_HOME=/data/home/yongxiao/dual-path
-export RUNTIME_HOME=/data/home/yongxiao/mydata
-export IMAGE_DIR=$RUNTIME_HOME/images
-export MODEL_DIR=$RUNTIME_HOME/models/Qwen2.5-32B
-export DATASET_DIR=$RUNTIME_HOME/dual-test
-export TRACE_DIR=$RUNTIME_HOME/traces
-export REPO_RESULT_DIR=$CODE_HOME/results
-```
-
-g5 是 NFS 源和登录/计算节点；g6 的共享目录依赖 g5 与 `ibs3`。不要把 GAIA
-Lustre 的带宽、stripe 或失效隔离假设套用到该 NFS 路径。
-
-`DATASET=32K` 等短名优先从 `$RUNTIME_HOME/dual-test` 解析；可在单次 run 中用
-`DUALPATH_DATASET_ROOT` 覆盖。脚本仍回退检查历史 `$RUNTIME_HOME/test/dataset`，
-因此迁回 Lustre 时不需要改数据集布局。
-
-2026-09-17 实测 g5 的 `/data` 为 XFS，g6 的 `/data` 为从
-`192.168.10.5:/data` 挂载的 NFSv4.1。当前 L3 使用通用 POSIX `file` backend；
-patched runtime 中保留的 `lustre_*` 字段仅是历史兼容命名。pza100 不使用
-Lustre stripe/LNet 配置。`DUAL_PATH_O_DIRECT_READ=1` 使用实际 cache 目录上的
-O_DIRECT read probe，不再根据 `statfs` 类型硬编码排除 NFS。
-
-## GAIA 历史目录划分
+## 目录划分
 
 项目分为“随时可见的 Git 代码仓库”和“仅计算节点可见的运行数据目录”：
 
@@ -103,7 +64,7 @@ Prefill/Decode 日志位于 `test/<allocation-id>/pd-servers/`，不会复制到
 
 所有代码和小型配置必须放在 `/labhome/sezhou/dual-path` 的子目录并由 Git 管理，确保登录节点随时可读。镜像、模型权重、SWE-bench checkout/sandbox、KV-cache、大型 trace 和原始结果放在 Lustre，不提交 Git。登录节点不能依赖 `/mnt/lustre` 或 `/labhome/sezhou/lustre` 可见；访问和生成运行数据时必须进入计算节点。
 
-## GAIA 历史环境变量
+## 推荐环境变量
 
 ```bash
 export CODE_HOME=/labhome/sezhou/dual-path

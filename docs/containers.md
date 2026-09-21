@@ -2,42 +2,7 @@
 
 > 返回 [文档索引](README.md)
 
-## pza100 当前镜像
-
-g5/g6 使用 Enroot 4.2.0 + Pyxis。镜像统一位于
-`/data/home/yongxiao/mydata/images`：
-
-```text
-sglang:26.01-py3.sqsh
-  SHA-256: 4c5b0508cd3142148f7f6ab000cf29bc1ee957ee862013561f05185c2aae4486
-
-sglang:26.01-py3-mooncake0.3.13.post1.sqsh
-  SHA-256: d10e4933d6ce7b7c6adf6022dc64907dcb46f6e7f93a433edc8e83c0c6e62acc
-
-sglang:26.01-py3-mooncake0.3.13.post1-dualpath-patched.sqsh
-  SHA-256: 7d8025e412e6797ecb8fdf38b1da2e7b242a1ece446c7737c873d187ce079ef2
-```
-
-两个派生镜像通过 `srun`、`--container-writable` 和 `--container-save` 分阶段
-构建；pip 安装与 patch 均发生在容器内。Mooncake 版本为
-`mooncake-transfer-engine-cuda13==0.3.13.post1`，Router 为
-`sglang-router==0.3.1`。patched 镜像已通过构建期 import、compile 和 marker
-检查。构建 Job `439` 生成的候选镜像已通过 2026-09-17 的 pza100 TP4 双节点
-GPU smoke：Job `440` 验证 Decode/NFS O_DIRECT，Job `441` 验证 Prefill/XFS
-O_DIRECT。2026-09-18 构建 Job `451` 进一步隔离 prefetch worker 与 scheduler
-的 TP progress collective。随后发现 Job `452` 的 Prefill chunked request 会被
-后续 chunk 的空 timing 覆盖，Job `453` 的 Decode offload 又错误使用 Router 聚合
-`cached_tokens` 作为 durable prefix，导致持久化链在 2368 tokens 处断裂。构建
-Job `455` 生成并验证 cachechain-v6：Job `457`--`460` 覆盖 Prefill/Decode path
-与 buffered/O_DIRECT 四种 32K、1 agent、1 repetition、26 turn 场景。四组
-selected-path L3 read 均为 485,632 tokens，turn 8--26 hit rate 最低 92.01%，
-末轮 98.41%，request/L3/PD timing coverage 均为 100%。验证后 v6 候选镜像
-被提升到上述默认路径；v5 回退镜像保留为
-`sglang:26.01-py3-mooncake0.3.13.post1-dualpath-patched-odirect-fullfix-v5.sqsh`。
-
-## GAIA 历史镜像与验证
-
-以下路径、SHA、Job ID、H100 和 Lustre 结论均来自迁移前 GAIA 环境。
+## 基础镜像
 
 计算节点已实测 Enroot 3.2.0，Pyxis 已集成到 `srun`。正式作业使用 Lustre 上 `.sqsh` 的绝对路径，显式挂载代码和运行目录，默认不启用 writable root，也不自动挂载 home。
 

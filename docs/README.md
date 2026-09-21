@@ -1,32 +1,29 @@
-# DualPath 文档索引
+# DualPath 复现文档索引
 
 建议按以下顺序阅读：
 
-1. [pza100 环境](pza100.md)：g5/g6 A100、路径、镜像、网络和迁移限制。
-2. [项目概览](intro.md)：目标、边界、当前状态和下一步。
-3. [论文对齐、模型与 KV-cache](paper-and-model.md)：论文统计、模型选择、容量和 block 格式。
-4. [目录与环境约定](environment.md)：pza100 路径、`RESULT_DIR` vs `REPO_RESULT_DIR`。
-5. [平台记录](platform.md)：当前 g5/g6 A100 与历史 GAIA H100/Lustre。
-6. [容器与派生镜像](containers.md)：SGLang、Enroot、Mooncake 和 Router。
-7. [Unified 运行手册](runbook-unified.md)：模型准备与单节点基线。
-8. [PD 运行手册](runbook-pd.md)：1P1D、1P2D、2P2D 和已验证结果。
-9. [HiCache 与 DualPath](hicache-and-dualpath.md)：L3 命中语义、测试清理和 DE-read 设计。
-10. [Mooncake Store 与 Lustre POSIX DFS](mooncake-store.md)：版本、原子发布、配置、实测和限制。
-11. [Fake 数据集](fake_dataset.md)：length-only 轨迹合成、格式和 replay 要求。
-12. [Benchmark 规范](benchmark.md)：论文式动态 rollout 和实验矩阵。
-13. [指标规范](metrics.md)：唯一 metric 来源——**trajectory_jct**、
+1. [项目概览](intro.md)：目标、边界、当前状态和下一步。
+2. [论文对齐、模型与 KV-cache](paper-and-model.md)：论文统计、模型选择、容量和 block 格式。
+3. [目录与环境约定](environment.md)：代码/Lustre 路径、`RESULT_DIR` vs `REPO_RESULT_DIR`。
+4. [GAIA 平台](platform.md)：Slurm、H100、IB/NIC 和 Lustre。
+5. [容器与派生镜像](containers.md)：SGLang、Enroot、Mooncake 和 Router。
+6. [Unified 运行手册](runbook-unified.md)：模型准备与单节点基线。
+7. [PD 运行手册](runbook-pd.md)：1P1D、1P2D、2P2D 和已验证结果。
+8. [HiCache 与 DualPath](hicache-and-dualpath.md)：L3 命中语义、数据流与消融开关。
+9. [Mooncake Store 与 Lustre POSIX DFS](mooncake-store.md)：版本、原子发布、配置、实测和限制。
+10. [Fake 数据集](fake_dataset.md)：length-only 轨迹合成、格式和 replay 要求。
+11. [Benchmark 规范](benchmark.md)：论文式动态 rollout 和实验矩阵。
+12. [指标规范](metrics.md)：唯一 metric 来源——**trajectory_jct**、
     per-agent mean TTFT/TPOT（agent 内先平均）、代表轨迹 vs 全量 fullchain、
-    task/dataset/agents/rep 产物布局。
-14. [TTFT Timing V3](ttft-timing-v3.md)：正式 breakdown 时间线、边界、重叠归属和 TP 聚合。
-15. [当前数据流与消融开关](dataflow-and-ablation.md)：L3、P→D、chunk 传输边界和一键 profile。
-16. [Dynamic L3 Read Path](dynamic.md)：request-scoped path 决策、Prefill/Decode 协调和交替策略设计。
-17. [四轮延迟结果](latency-results.md)：历史 Job `65032`（诊断口径）。
-18. [TTFT 全链路历史测例](ttft-fullchain.md)：历史 Job `65144` 数值。
-19. [完整轨迹历史测例](trajectory-metrics.md)：历史 Job `65502` KV/带宽现象。
-20. [里程碑与风险](milestones-and-risks.md)：完成标准、风险和执行顺序。
-21. [复现与安全](reproducibility-and-security.md)：结果元数据、Git 和凭据规则。
-22. [参考资料](references.md)：论文和官方文档链接。
-23. [当前任务交接](task-handoff-2026-09-19.md)：pza100、镜像、最近实验结果和下一步修复点。
+    TTFT Timing V3 分解、task/dataset/agents/rep 产物布局。
+13. [Dynamic L3 Read Path](dynamic.md)：request-scoped path 决策与交替策略设计。
+14. [三条 read path 对比](dualpath-path-comparison.md)：GAIA TP8 实测的 JCT/TTFT/TPOT、
+    Lustre 聚合带宽和排队机制。
+15. [已修复缺陷的根因](dualpath-fixes.md)：五个 L3 路径缺陷的根因与防回归断言。
+16. [pza100 异平台参考](pza100.md)：g5/g6 A100 的差异，以及存储不对称如何反转 dynamic 结论。
+17. [里程碑与风险](milestones-and-risks.md)：完成标准、风险和执行顺序。
+18. [复现与安全](reproducibility-and-security.md)：结果元数据、Git 和凭据规则。
+19. [参考资料](references.md)：论文和官方文档链接。
 
 ## 信息唯一来源
 
@@ -37,8 +34,10 @@
 - Fake trace 算法和统计：`fake_dataset.md`
 - KV-cache 层次语义：`hicache-and-dualpath.md`
 - Mooncake Store/Lustre backend：`mooncake-store.md`
-- 指标、字段、trajectory_jct / per-agent mean / 代表轨迹 / full-chain 与产物：
+- 指标、字段、trajectory_jct / per-agent mean / 代表轨迹 / full-chain / Timing V3：
   `metrics.md`（唯一 metric 来源；见其中「口径速查」）
+- 三条 read path 的性能结论：`dualpath-path-comparison.md`
+- 已修复缺陷的根因：`dualpath-fixes.md`
 
 ## 脚本布局（摘要）
 

@@ -18,6 +18,12 @@ DROP_CACHE=${DROP_CACHE:-1}
 COPY_TO_STAGING=${COPY_TO_STAGING:-1}
 COPY_IMPLEMENTATION=${COPY_IMPLEMENTATION:-torch}
 TORCH_THREADS=${TORCH_THREADS:-1}
+IO_MODE=${IO_MODE:-buffered}
+DIRECT_ALIGNMENT=${DIRECT_ALIGNMENT:-4096}
+# The pinned buffer and the torch staging copy are the only parts that need the
+# benchmark image. A pure file-I/O run (pageable target, no staging) only uses
+# the standard library, so it can skip the per-step squashfs mount.
+USE_CONTAINER=${USE_CONTAINER:-1}
 KEEP_DATA=${KEEP_DATA:-0}
 INCLUDE_PEER_SINGLE=${INCLUDE_PEER_SINGLE:-0}
 LAYERS=${LAYERS:-64}
@@ -55,6 +61,20 @@ done
   echo "INCLUDE_PEER_SINGLE must be 0 or 1" >&2
   exit 2
 }
+[[ $IO_MODE == buffered || $IO_MODE == direct ]] || {
+  echo "IO_MODE must be buffered or direct" >&2
+  exit 2
+}
+[[ $USE_CONTAINER == 0 || $USE_CONTAINER == 1 ]] || {
+  echo "USE_CONTAINER must be 0 or 1" >&2
+  exit 2
+}
+if [[ $USE_CONTAINER == 0 ]]; then
+  if [[ $BUFFER_TYPE == pinned || $COPY_IMPLEMENTATION == torch ]]; then
+    echo "USE_CONTAINER=0 has no torch: set BUFFER_TYPE=pageable and COPY_IMPLEMENTATION=python" >&2
+    exit 2
+  fi
+fi
 
 RUN_ROOT=${RUN_ROOT:-$RUNTIME_HOME/io-test/$SLURM_JOB_ID}
 DATA_DIR=${DATA_DIR:-$RUN_ROOT/kv-pages}
@@ -64,12 +84,17 @@ SUMMARY_JSON=${SUMMARY_JSON:-$LOCAL_RESULT_DIR/summary.json}
 mkdir -p "$LOCAL_RESULT_DIR"
 : >"$RESULT_LOG"
 
-container_args=(
-  --container-image="$IMAGE"
-  --container-mounts="$CONTAINER_MOUNTS"
-  --container-workdir=/workspace/dual-path
-  --no-container-mount-home
-)
+container_args=()
+bench_script=$CODE_HOME/io-test/kv_read_bench.py
+if [[ $USE_CONTAINER == 1 ]]; then
+  container_args=(
+    --container-image="$IMAGE"
+    --container-mounts="$CONTAINER_MOUNTS"
+    --container-workdir=/workspace/dual-path
+    --no-container-mount-home
+  )
+  bench_script=/workspace/dual-path/io-test/kv_read_bench.py
+fi
 
 run_python() {
   local nodes=$1
@@ -79,7 +104,7 @@ run_python() {
     --nodes="$nodes" --ntasks="$nodes" --ntasks-per-node=1 \
     --nodelist="$hosts" --cpus-per-task="$CPUS_PER_NODE" \
     --gres="$GRES" --mpi=none "${container_args[@]}" \
-    python3 /workspace/dual-path/io-test/kv_read_bench.py "$@"
+    python3 "$bench_script" "$@"
 }
 
 echo "DualPath Decode-style Lustre read mini bench"
@@ -89,7 +114,8 @@ echo "  data_dir=$DATA_DIR"
 echo "  local_result_dir=$LOCAL_RESULT_DIR"
 echo "  tp_ranks=$TP_RANKS pages_per_rank=$PAGES_PER_RANK page_bytes=$PAGE_BYTES"
 echo "  bytes_per_node=$((TP_RANKS * PAGES_PER_RANK * PAGE_BYTES)) repetitions=$REPETITIONS"
-echo "  buffer_type=$BUFFER_TYPE drop_local_cache=$DROP_CACHE"
+echo "  buffer_type=$BUFFER_TYPE drop_local_cache=$DROP_CACHE io_mode=$IO_MODE"
+echo "  use_container=$USE_CONTAINER"
 echo "  copy_to_layer_first_staging=$COPY_TO_STAGING implementation=$COPY_IMPLEMENTATION"
 echo "  torch_threads_per_rank=$TORCH_THREADS layers=$LAYERS page_tokens=$PAGE_TOKENS head_dim=$HEAD_DIM"
 
@@ -133,6 +159,7 @@ run_read_phase() {
     --layers "$LAYERS" --page-tokens "$PAGE_TOKENS" --head-dim "$HEAD_DIM" \
     --sync-host "$sync_host" --sync-port "$SYNC_PORT" \
     --phase "$phase" --repetition "$repetition" --nodes "$nodes" \
+    --io-mode "$IO_MODE" --direct-alignment "$DIRECT_ALIGNMENT" \
     | tee -a "$RESULT_LOG"
 }
 

@@ -324,7 +324,24 @@ READER_HOSTS="dgx-gaia-21 dgx-gaia-22" io-test/run.sh
 BUFFER_TYPE=pageable io-test/run.sh
 COPY_TO_STAGING=0 io-test/run.sh
 COPY_IMPLEMENTATION=python io-test/run.sh
+IO_MODE=direct io-test/run.sh
 ```
+
+`IO_MODE=direct` 让 single/dual 两相都用 `O_DIRECT` 打开 page 文件，用来回答
+"O_DIRECT 下双节点聚合带宽是不是单节点的 2 倍"。只关心文件 I/O 时可以去掉 pinned
+DRAM 和 torch staging 拷贝，这样整条链路只用标准库，不进容器也不需要 GPU：
+
+```bash
+salloc -p GAIA -N2 --ntasks-per-node=1 --cpus-per-task=32 --mem=0 \
+  --exclusive --time=01:00:00
+
+USE_CONTAINER=0 BUFFER_TYPE=pageable COPY_IMPLEMENTATION=python \
+  COPY_TO_STAGING=0 GRES=none CPUS_PER_NODE=32 \
+  IO_MODE=direct REPETITIONS=3 io-test/run.sh
+```
+
+`USE_CONTAINER=0` 时镜像里的 torch 不可用，脚本会拒绝 `BUFFER_TYPE=pinned` 和
+`COPY_IMPLEMENTATION=torch`。结果见 [RESULTS.md](RESULTS.md) 的 Job 69346/69347。
 
 ## O_DIRECT 验证
 
