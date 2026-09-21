@@ -20,6 +20,13 @@ COLORS = {
     # Light neutral for queue wait. Stays a shade darker than the near-white
     # "gray" used for Misc so the two remain distinguishable.
     "lightgray": "#C9CDD2",
+    # Dark counterparts. The dynamic-path breakdown shows the Prefill and
+    # Decode copies of the same stage side by side, so each pair shares a hue
+    # and differs in lightness: Prefill light, Decode dark.
+    "darkpurple": "#3F3161",
+    "darkorange": "#A85C00",
+    "darkbrown": "#5C3F10",
+    "darkblue": "#00456B",
 }
 
 

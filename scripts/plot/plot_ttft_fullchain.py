@@ -9,7 +9,7 @@ import json
 from pathlib import Path
 
 from plot_style import add_title_suffix
-from ttft_components import components_for_path, normalize_ttft_row, path_from_row
+from ttft_components import components_for_rows, normalize_ttft_row
 
 
 def text(x: float, y: float, value: str, size: int = 12, anchor: str = "middle") -> str:
@@ -43,7 +43,7 @@ def main() -> None:
                     "kv_read_overhead_seconds",
                 )
             )
-    components = components_for_path(path_from_row(rows[0]))
+    components = components_for_rows(rows)
 
     width, height = 600, 470
     plot_left, plot_right = 75.0, 540.0
