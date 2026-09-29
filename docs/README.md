@@ -2,7 +2,9 @@
 
 建议按以下顺序阅读：
 
-1. [pza100 环境](pza100.md)：g5/g6 A100、路径、镜像、网络和迁移限制。
+1. [pza100 环境](pza100.md)：g5/g6 A100、路径、镜像、网络和迁移限制；g6 KV cache
+   的 NFS/RDMA 挂载（`scripts/pza100-nfsrdma.sh`、`DUALPATH_NFS_RDMA`）；L3 默认读法
+   与引擎内限速 `DUALPATH_L3_READ_BPS`。
 2. [项目概览](intro.md)：目标、边界、当前状态和下一步。
 3. [论文对齐、模型与 KV-cache](paper-and-model.md)：论文统计、模型选择、容量和 block 格式。
 4. [目录与环境约定](environment.md)：pza100 路径、`RESULT_DIR` vs `REPO_RESULT_DIR`。
@@ -27,6 +29,8 @@
 21. [复现与安全](reproducibility-and-security.md)：结果元数据、Git 和凭据规则。
 22. [参考资料](references.md)：论文和官方文档链接。
 23. [当前任务交接](task-handoff-2026-09-19.md)：pza100、镜像、最近实验结果和下一步修复点。
+24. [IB VL 流量隔离](vl-traffic-isolation.md)：论文 §5.1 在 g5/g6 上的 SL/VL 映射、SM 配置、存储分离和验证矩阵。
+25. [NIC 完成 H2D/D2H](nic-h2d.md)：`DUAL_PATH_CUDAMEMCPY=hicache|nic` 开关设计、mini bench 与实测。
 
 ## 信息唯一来源
 

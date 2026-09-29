@@ -5,7 +5,8 @@
 > **pza100 状态：尚未完成运行入口迁移。** 本页现有 `P + D + 1 client`、TP8、
 > GAIA 节点和 Lustre 命令是历史流程。g5/g6 只有两个四卡节点，不能原样执行。
 > 当前路径、镜像和限制见 [pza100 环境](pza100.md)；应先实现 TP4 与 client
-> 共置，再进行双节点 1P1D smoke。
+> 共置，再进行双节点 1P1D smoke。不要用外层 srun 包住 `pd_benchmark.sh`，
+> 原因见 [pza100 启动方式](pza100.md#启动方式不要嵌套-srun)。
 
 当前正式入口为 `scripts/pd_benchmark.sh`。先用 `pd_alloc.sh` 申请 P+D+1 个节点，
 再 SSH 到每个节点：P/D 节点分别运行 `prefill`/`decode`，额外节点运行

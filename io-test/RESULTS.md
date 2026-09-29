@@ -7,6 +7,88 @@
 
 # pza100（g5 / g6）
 
+## 2026-09-29: H2D/D2H 路径 mini bench（Job 597 / 598 / 599，g5）
+
+`io-test/run_h2d_path_bench.sh`，设计见 [docs/nic-h2d.md](../docs/nic-h2d.md)。原始数据
+和完整表格在 `io-test/results/597-h2d-path/`（`REPORT.md`、`summary.json`）。Job 597
+跑完了 A1 的 GPU0 部分以及 A2 的 1/2 GPU 并发；Job 598 补跑 4 GPU 并发和 SL2；
+Job 599 补跑 GPU2/`mlx5_4` 的 A1 和 A4。
+
+### A1：perftest 同网卡回环（`ib_write_bw`，4 s）
+
+| 路径 | GPU0 / `mlx5_0` | GPU2 / `mlx5_4` | 说明 |
+|---|---:|---:|---|
+| h2d（host → GPU，NIC 写 GPU） | 17.9 GB/s | 18.4 GB/s | 4 KiB–4 MiB、QP 1/4/16 全部相同 |
+| d2h（GPU → host，NIC 读 GPU） | 9.5–14.2 GB/s | 10.9–14.5 GB/s | 4 KiB 且 1 QP 时最高，其余约 10–11 GB/s |
+| h2h（host → host） | 54.6 GB/s | 54.6 GB/s | 4 KiB 时只有 22.7 GB/s（包速率受限） |
+| 两块 GPU 共享一块 HCA，h2d | 28.7 GB/s（合计） | 28.7 GB/s（合计） | 每块 GPU 约 14.3 GB/s |
+| 两块 GPU 共享一块 HCA，d2h | 27.7 GB/s（合计） | — | |
+| `ib_write_lat --write_with_imm` | 3.0 / 5.9 / 21.7 µs | — | 4 KiB / 32 KiB / 256 KiB |
+
+- h2h 达到 NIC 的 Gen5 x16 上限，所以 h2d 停在约 18 GB/s 并不是网卡本身的瓶颈，
+  而是 NIC 对 A100 显存做 P2P 写的上限（A100 的 Gen4 x16，拷贝引擎能跑到约
+  26.8 GB/s）。NIC 读显存（d2h）更慢。
+- SL 2 与 SL 0 的结果相同。SM 当前没有启用 QoS，这符合预期。
+- **计数器**：所有回环 case 的 `hw.rx_write_requests` 都与请求数一致，
+  `port_rcv_data`/`port_rcv_packets` 随数据量增长，而 `port_xmit_*` 增量为 0。
+  即数据在 HCA 内部回环，没有经过交换机。经过 GPU 的 case，dmon 积分的 PCIe 字节
+  与数据量之比为 0.77–1.08（1 s 采样的边界误差）；h2h 为 0。
+
+### A2：Qwen2.5-32B TP4 形状（每 rank 每次 512 页 × 64 层 = 2 GiB，bf16）
+
+单 GPU（GPU0），每块 GPU 的 GB/s：
+
+| host 布局 | 页分布 | 方向 | hicache（direct） | hicache-kernel | nic（Mooncake） | nic / hicache |
+|---|---|---|---:|---:|---:|---:|
+| layer_first | 连续 | h2d | **26.8** | 12.7 | 16.0 | 0.60 |
+| layer_first | 连续 | d2h | **26.2** | 12.7 | 10.0 | 0.38 |
+| layer_first | 随机 | h2d | 8.8 | 12.7 | **13.0** | 1.48 |
+| layer_first | 随机 | d2h | 9.5 | **11.8** | 8.9 | 0.94 |
+| page_first_direct | 连续/随机 | h2d | 6.4 | — | **13.0** | 2.04 |
+| page_first_direct | 连续/随机 | d2h | 7.2 | — | **8.9** | 1.24 |
+
+- hicache（direct）每个连续段调用一次 `cudaMemcpyAsync`。连续的 `layer_first` 每层
+  只有两段，因此能打满 GPU 链路；一旦每页一段（随机页，或 Decode 使用的
+  `page_first_direct`，每层 1024 段），每层耗时升到 3.8–5.3 ms，提交几乎全部花在
+  CPU 上（提交耗时约等于总耗时）。
+- nic 的每层耗时与段数关系不大：`page_first_direct` 每层 2.58 ms，
+  `layer_first` 连续时 2.09 ms。对比 perftest 的 h2d 上限，32 MiB 每层的理想时间是
+  1.87 ms，即 Mooncake 对 1024 个 32 KiB 请求约有 0.7 µs/请求的额外开销。
+- nic 的 CPU 时间约 0.4–0.6 s/次（2 GiB），比 hicache 连续时的 0.08 s 高；这部分
+  主要花在 Mooncake 的 worker 线程上。
+- 并发：GPU0+GPU1 共享 `mlx5_0` 时，nic 每块 GPU 为 11.7–13.3 GB/s；4 块 GPU 同时
+  运行时，nic 每块约 11.6 GB/s（h2d，合计约 47 GB/s），hicache `page_first_direct`
+  每块约 6.2 GB/s。4 块 GPU 的 worker 都绑定在各自的 NUMA 节点上。
+- 所有 case 的首轮数据校验都通过；nic 的 case 全部判定为经过 HCA，hicache 全部判定
+  为未经过 HCA。
+- `MC_IB_SL=2` 的结果与 SL 0 相同（QoS 未启用）。
+
+### A4：H2D 负载下的 TP4 all-reduce（4 GPU 同时 H2D，`layer_first` 连续，30 s）
+
+| 负载 | 8 KiB 延迟 | 1 MiB 延迟 | 64 MiB busbw |
+|---|---:|---:|---:|
+| 空闲 | 45 µs | 180 µs | 14.2 GB/s |
+| hicache | 51 µs | 158 µs | 19.8 GB/s |
+| nic（SL 0） | **118 µs** | **313 µs** | 13.4 GB/s |
+
+nic 负载使小消息 all-reduce 延迟升到空闲时的 1.7–2.6 倍，因为 TP4 的跨对 NCCL
+流量（`NET/IB`）与 KV 回环共用同一块 CX8，而当前没有 VL 隔离。hicache 负载下
+64 MiB 的 busbw 反而高于空闲，原因未查明，可能是 GPU 频率或电源状态的差异。
+每组只测了一次，且 probe 与负载的重叠时间靠 15 s 延迟估计，所以这一节只作为
+方向性证据。
+
+### 决策门槛与结论
+
+- 门槛（单 GPU；nic 时间 ≤ 1.2 × hicache 或带宽 ≥ 0.8 × hicache，且经过 HCA、
+  校验通过）：`page_first_direct` 的 h2d/d2h 以及 `layer_first` 随机页全部通过；
+  `layer_first` 连续页的 h2d（0.60×）和 d2h（0.38×）不通过。
+- 实现载体：第一版采用 Mooncake TE。它在连续 h2d 上达到 perftest 上限的 90%，在
+  32 KiB 散页上达到 73%。自研 verbs 扩展在 Decode 散页场景最多还能提升约 38%，
+  列为后续优化。
+- nic 路径本身不能减少对 NCCL 的干扰，反而把干扰集中到了网卡上。只有在 SM 启用
+  VL QoS、KV 使用低优先级 SL 之后，它才有意义。所以 `DUAL_PATH_CUDAMEMCPY=nic`
+  应该与 [VL 方案](../docs/vl-traffic-isolation.md) 一起评估，不单独作为性能优化。
+
 ## 环境与理论上限
 
 2026-09-18 从 sysfs 采集，`io-test/capture_io_state.py` 会把同样的内容写进每次
@@ -139,14 +221,15 @@ block size 的影响只在低并发、且主要对 O_DIRECT：
 
 ### 待验证的改动
 
-按预期收益排序，均未实测：
+按预期收益排序；第 3 项已于 2026-09-29 实测（见下面 Job 563），其余未测：
 
 1. `nconnect=8` 或 `16`（内核 5.3+，最大 16；g6 是 6.12）。挂载时选项，**按服务器
    生效且第一个挂载点说了算**，所以要把 g6 上挂自 `192.168.10.5` 的 `/data` 和
    `/home/pengzhi` 全部卸掉再重挂。预期低并发点几乎不变、高并发点显著上抬；若连
    高并发点也不动，则瓶颈在别处（如服务器端 nfsd 线程池或 IPoIB 收包路径）。
 2. IPoIB 切 connected 模式，MTU 2044 → 65520，包数降约 32 倍。
-3. `proto=rdma`，彻底绕开内核 TCP/IP 栈。卡与 OFED 均支持。
+3. `proto=rdma`，彻底绕开内核 TCP/IP 栈。卡与 OFED 均支持。**已实测**：读带宽提升
+   1.8–2.0 倍，大文件读打满 NVMe。
 
 A/B 方式：改动前后用**完全相同**的命令重跑 `run_odirect_sweep.sh`，对比两份
 `REPORT.md`。Job 446 就是改动前的基线。
@@ -155,7 +238,88 @@ A/B 方式：改动前后用**完全相同**的命令重跑 `run_odirect_sweep.s
 
 g6 在 `DROP_PEER_CACHE=1` 下的四象限，即 g5 也清掉缓存、读请求一路打到 NVMe。按
 现有数据预测该档与 2.027 GiB/s 接近——网络已比盘慢三倍以上，盘的 6.4 GiB/s 藏在
-网络后面露不出来。
+网络后面露不出来。（Job 559 已在 `ibs4` 上部分回答：逐页 O_DIRECT 冷热只差 3%。）
+
+## 2026-09-29: `ibs4` 上的 Decode 逐页读复现 Job 559
+
+g6 的 NFS 挂载已从 `ibs3`（CX8）迁到 `ibs4`（CX7，`192.168.11.5:/data`），仍为
+NFSv4.1/TCP、`rsize=wsize=1 MiB`、`nconnect=1`、datagram MTU 2044。
+`scripts/smoke/g6_decode_read_repro.sbatch`：TP4、每 rank 324 页（真实 Decode 请求
+median）× 4 MiB page 文件、每次 5.4 GB，O_DIRECT + pinned + torch staging，与引擎
+相同；`hot` 为 g5 server cache 热，`cold` 为读前在 g5 上 `fsync` + `DONTNEED`。3 轮：
+
+| server cache | 端到端 GB/s | 文件 I/O GB/s | 每 rank GB/s | 单页读 p50 | 各轮 GB/s |
+|---|---:|---:|---:|---:|---|
+| cold | 2.038 | 2.134 | 0.511 | 7.63 ms | 2.038, 2.049, 2.026 |
+| hot | 2.095 | 2.196 | 0.525 | 7.61 ms | 2.079, 2.095, 2.097 |
+
+- 与 Job 442（`ibs3`，cold-direct 2.027 GiB/s、7.27 ms/页）同一水平，迁移到 CX7
+  没有让这种读法变慢。
+- 同日 Allocation 557 的真实 Decode path 为 1.23 GB/s、13.6 ms/页（四个 rank 一致），
+  mini bench 复现不了，差异只出现在真实负载下，原因未定。
+- 逐页形态只拿到同路径大文件顺序读（Job 555：4 进程 3.575 GB/s）的约 58%。每页
+  多出的 2.5–3 ms 不来自 open/close（合计 0.5%）和 g5 盘（冷热差 3%），见上节
+  "与四象限的差距"。
+
+结果：`io-test/results/g6-decode-read-repro-559/`。
+
+## 2026-09-29: NFS/TCP 与 NFS/RDMA A/B Job 563
+
+g6 额外挂载同一导出的 NFS/RDMA 视图：`192.168.11.5:/data` →
+`/mnt/nfsrdma`，`vers=3,proto=rdma,port=20049`，由 `scripts/pza100-nfsrdma.sh`
+管理。必须用 v3：v4.1 会把新挂载合并到已有 `/data` 的 TCP 会话（session
+trunking），`/proc/mounts` 显示 `proto=tcp`。`/proc/self/mountstats` 中 `xprt: rdma`
+确认传输。
+
+`scripts/smoke/g6_nfs_rdma_ab.sbatch`，宿主机运行、不进容器；g5 准备数据，g6 交替
+读 `/data` 与 `/mnt/nfsrdma` 下的同一批文件，每次读前清 g5 server cache，3 轮 median：
+
+| 读法 | TCP | RDMA | 提升 | 单次读 p50 |
+|---|---:|---:|---:|---:|
+| 逐页：4 rank × 324 × 4 MiB 文件，O_DIRECT | 3.237 GB/s | 5.824 GB/s | 1.8× | 5.20 → 2.79 ms |
+| 大文件：8 进程 × 4 MiB block，O_DIRECT | 3.443 GB/s | 6.931 GB/s | 2.0× | 9.91 → 4.66 ms |
+
+- RDMA 大文件读等于 g5 NVMe 本地上限（Job 555：6.95 GB/s），瓶颈从单条 TCP 连接
+  转到盘。
+- 本组缓冲为 pageable 内存、无 staging 拷贝，TCP 逐页 3.237 GB/s 高于 Job 559 的
+  2.04 GB/s（pinned + staging），两组 TCP 数值不能直接比较；pinned 内存在 RDMA
+  上的表现未单独测。
+- 4 进程大文件一组因脚本循环变量被 `drop_all` 覆盖而未运行，脚本已修复。
+- 本组每次读前都清 g5 server cache，只代表"读 NVMe"。真实负载中 Decode 读的是
+  刚经 NFS 写回、仍在 g5 page cache 中的 KV（nfsd buffered 读，客户端 O_DIRECT
+  无法绕过），见下面 Job 584。在 TCP 下（Job 559）冷热只差 3%，是因为 TCP 本身
+  更慢，掩盖了 server cache 的作用；这一结论不能推广到 RDMA。
+
+结果：`io-test/results/g6-nfs-rdma-ab-563/`。PD 运行接入方式（`DUALPATH_NFS_RDMA`）
+见 [docs/pza100.md](../docs/pza100.md)。
+
+## 2026-09-29: g5 page cache 热读 Job 584
+
+`scripts/smoke/g5_g6_hot_read.sbatch`：引擎同款读法（TP4 × 324 页 × 4 MiB = 5.4 GB，
+pinned + torch staging）。两套互不重叠的数据都在 g5 上准备并以 buffered 读预热进
+g5 page cache；g5 本地 buffered 读、不清 cache，g6 经 `/mnt/nfsrdma` O_DIRECT 读，
+即 nfsd 从 g5 page cache 返回。同时读两端经 `--sync-host g5` 握手对齐。3 轮 median：
+
+| 场景 | 节点 | 端到端 GB/s | 文件 I/O GB/s | 单页读 p50 | 各轮端到端 GB/s |
+|---|---|---:|---:|---:|---|
+| 单独 | g5 | 24.149 | 51.910 | 0.29 ms | 23.864, 24.153, 24.149 |
+| 单独 | g6 | 13.680 | 21.539 | 0.63 ms | 13.011, 13.815, 13.680 |
+| 同时 | g5 | 22.730 | 48.049 | 0.31 ms | 22.197, 22.730, 23.204 |
+| 同时 | g6 | 13.550 | 21.693 | 0.63 ms | 13.887, 13.458, 13.550 |
+
+同时读合计 36.1 / 36.2 / 36.8 GB/s。
+
+- 引擎的 L3 读带宽只计文件读（不含 scatter/staging），对应"文件 I/O"列：g6 的
+  21.5 GB/s 与 Job 581/582 真实 Decode 的 20.0–20.4 GB/s 一致，证实 Decode 读的是
+  g5 page cache。
+- g5 buffered 热读的文件 I/O 为 51.9 GB/s，约为 O_DIRECT 读 NVMe（Job 431：
+  7.5 GiB/s）的 6.5 倍；端到端差距较小是因为 staging 拷贝约占 g5 一半时间。
+- g6 的 21.5 GB/s 约为 CX7 400G 线速（50 GB/s）的 43%，限制在 RDMA/nfsd 路径而
+  不是内存；两端同时读互相影响只有 1–6%。
+- 每次读仅 0.24–0.40 s：同时读的重叠覆盖了 g5 全程，但只覆盖 g6 约 60%，g6 的
+  干扰可能被低估。更长的测量可把 `PAGES_PER_RANK` 调到约 1500（约 25 GB/次）。
+
+结果：`io-test/results/g5-g6-hot-read-584/`。
 
 ---
 

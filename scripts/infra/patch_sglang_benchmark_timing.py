@@ -102,6 +102,53 @@ def decode_capable() -> bool:
     print(f"Wrote: {path}")
 
 
+def write_l3_throttle_helper(path: Path) -> None:
+    path.write_text(
+        '''"""Engine-wide DualPath L3 read-rate limit (DUALPATH_L3_READ_BPS).
+
+The value is the L3 read rate of one engine in bytes per second, matching the
+per-request L3 bandwidth metric (all TP ranks' bytes over the read window).
+Each TP rank is its own process and paces its reads at BPS / tp_size. 0 or
+unset disables the limit.
+
+Pacing is a virtual clock that grants at most SLACK_NS of credit, enough to
+absorb sleep wake-up latency; a request arriving after an idle gap therefore
+cannot burst above the limit for longer than that. The sleep happens
+inside the timed storage read, so reported L3 read bandwidth reflects it
+whether the page came from disk, a local page cache, NFS/TCP or NFS/RDMA.
+"""
+
+from __future__ import annotations
+
+import os
+import threading
+import time
+
+ENGINE_BPS = int(os.environ.get("DUALPATH_L3_READ_BPS", "0") or 0)
+if ENGINE_BPS < 0:
+    raise ValueError("DUALPATH_L3_READ_BPS must be a nonnegative integer")
+
+SLACK_NS = 2_000_000
+_lock = threading.Lock()
+_next_free_ns = 0
+
+
+def pace(nbytes: int, tp_size: int, started_ns: int) -> None:
+    """Sleep until a read of nbytes that began at started_ns fits the limit."""
+    global _next_free_ns
+    if ENGINE_BPS <= 0 or nbytes <= 0:
+        return
+    cost_ns = int(nbytes * 1_000_000_000 * max(1, tp_size) / ENGINE_BPS)
+    with _lock:
+        _next_free_ns = max(started_ns - SLACK_NS, _next_free_ns) + cost_ns
+        deadline_ns = _next_free_ns
+    delay_ns = deadline_ns - time.monotonic_ns()
+    if delay_ns > 0:
+        time.sleep(delay_ns / 1_000_000_000)
+'''
+    )
+
+
 def write_ttft_v3_helper(path: Path) -> None:
     path.write_text(
         '''"""Low-overhead request-scoped DualPath TTFT timing helpers."""
@@ -262,9 +309,8 @@ def gate_logger_call(source: str, marker: str) -> str:
             raise RuntimeError(f"Cannot locate logger call end for {marker}")
         call_end = close + len(f"\n{indent})\n")
         block = source[line_start:call_end]
-        if source[max(0, line_start - len(indent) - 40):line_start].endswith(
-            f"{indent}if DUALPATH_TTFT_DETAIL:\n"
-        ):
+        previous_line_start = source.rfind("\n", 0, max(0, line_start - 1)) + 1
+        if source[previous_line_start:line_start].strip() == "if DUALPATH_TTFT_DETAIL:":
             search_from = call_end
             continue
         gated = (
@@ -625,6 +671,56 @@ def patch_prefill_o_direct_reusable_buffer(path: Path) -> None:
         "        )\n"
     )
     source = source[:function_end] + "\n" + buffered_log + source[function_end:]
+    path.write_text(source)
+    print(f"Patched: {path}")
+
+
+def patch_l3_read_throttle(path: Path) -> None:
+    """Pace L3 page reads to DUALPATH_L3_READ_BPS inside the timed read.
+
+    Runs after the TTFT V3 rewrite of _generic_page_get: the pace call sits
+    between the storage read and the lustre_read accumulator, so the limit
+    shows up in the reported L3 read bandwidth.
+    """
+    source = path.read_text()
+    marker = "DUALPATH_L3_READ_BPS"
+    if marker in source:
+        print(f"Already patched: {path}")
+        return
+    source = replace_once(
+        source,
+        "from sglang.srt.utils.dualpath_ttft import (",
+        "# DUALPATH_L3_READ_BPS\n"
+        "from sglang.srt.utils.dualpath_l3_throttle import pace as dualpath_l3_pace\n"
+        "from sglang.srt.utils.dualpath_ttft import (",
+        "import L3 read throttle",
+    )
+    direct_get = "                page_data = self.storage_backend.get(hash_value, data_page)\n"
+    source = replace_once(
+        source,
+        direct_get,
+        "                dualpath_pace_start_ns = time.monotonic_ns()\n"
+        + direct_get
+        + "                dualpath_l3_pace(\n"
+        "                    data_page.numel() * data_page.element_size(),\n"
+        "                    getattr(self, \"tp_world_size\", 1),\n"
+        "                    dualpath_pace_start_ns,\n"
+        "                )\n",
+        "pace O_DIRECT page reads",
+    )
+    batch_get = "        page_data = self.storage_backend.batch_get(hash_values, dummy_page_dst)\n"
+    source = replace_once(
+        source,
+        batch_get,
+        "        dualpath_pace_start_ns = time.monotonic_ns()\n"
+        + batch_get
+        + "        dualpath_l3_pace(\n"
+        "            sum(page.numel() * page.element_size() for page in dummy_page_dst),\n"
+        "            getattr(self, \"tp_world_size\", 1),\n"
+        "            dualpath_pace_start_ns,\n"
+        "        )\n",
+        "pace buffered batch reads",
+    )
     path.write_text(source)
     print(f"Patched: {path}")
 
@@ -5316,6 +5412,7 @@ def main() -> None:
     srt = args.site_packages / "sglang/srt"
     write_read_path_helper(srt / "utils/dualpath_read_path.py")
     write_ttft_v3_helper(srt / "utils/dualpath_ttft.py")
+    write_l3_throttle_helper(srt / "utils/dualpath_l3_throttle.py")
     patch_hicache_file_o_direct_read(srt / "mem_cache/hicache_storage.py")
     patch_prefill_o_direct_reusable_buffer(
         srt / "managers/cache_controller.py"
@@ -5355,6 +5452,7 @@ def main() -> None:
         srt / "managers/scheduler_output_processor_mixin.py"
     )
     patch_ttft_v3_cache_controller(srt / "managers/cache_controller.py")
+    patch_l3_read_throttle(srt / "managers/cache_controller.py")
     patch_ttft_v3_hiradix(srt / "mem_cache/hiradix_cache.py")
     patch_ttft_v3_scheduler(srt / "managers/scheduler.py")
     patch_ttft_v3_prefill(srt / "disaggregation/prefill.py")

@@ -14,6 +14,15 @@ as a compatibility alias for either engine role.
 Common client workload settings:
   DATASET=32K AGENTS=1 REPETITION=1
 
+NFS/RDMA view of the KV cache on NFS client hosts (g6), default auto:
+  DUALPATH_NFS_RDMA=auto  use /mnt/nfsrdma when scripts/pza100-nfsrdma.sh mount is active
+  DUALPATH_NFS_RDMA=1     require it; DUALPATH_NFS_RDMA=0 keeps the TCP /data mount
+
+Engine-wide L3 read limit (same value on every role; default 0 = unlimited):
+  DUALPATH_L3_READ_BPS=6000000000   bytes/s, integer in [0, 20000000000]
+  Requires an image built with scripts/infra/patch_sglang_benchmark_timing.py
+  that includes sglang/srt/utils/dualpath_l3_throttle.py.
+
 DUALPATH_L3_READ_PATH is a required per-role launch parameter. The same value
 must be supplied on every Prefill, Decode, and client invocation:
   DUALPATH_L3_READ_PATH=prefill|decode|dynamic scripts/pd_benchmark.sh prefill|decode|client
@@ -61,7 +70,9 @@ runtime_override_names=(
   PREFILL_PORT DECODE_PORT BOOTSTRAP_PORT ROUTER_PORT IB_DEVICE
   DUALPATH_TTFT_TIMING DUALPATH_TTFT_TIMING_DETAIL
   DUALPATH_L3_READ_PATH DUALPATH_DYNAMIC_PATH_POLICY
-  DUAL_PATH_O_DIRECT_READ STORAGE_TOPOLOGY
+  DUAL_PATH_O_DIRECT_READ DUALPATH_L3_READ_BPS STORAGE_TOPOLOGY
+  DUAL_PATH_CUDAMEMCPY DUAL_PATH_NIC_DEVICE
+  DUALPATH_NFS_RDMA
   DUALPATH_RUNTIME_CACHE_ROOT DUALPATH_DATASET_ROOT
   ENGINE_THREADS_PER_RANK
   TASK_NAME DATASET AGENTS REPETITION MAX_TURNS TRAJECTORY_OFFSET
@@ -94,12 +105,18 @@ done
   echo "DUALPATH_L3_READ_PATH must be prefill, decode or dynamic" >&2
   exit 2
 }
+export DUALPATH_L3_READ_BPS=${DUALPATH_L3_READ_BPS:-0}
+if [[ ! $DUALPATH_L3_READ_BPS =~ ^(0|[1-9][0-9]*)$ ]] ||
+   (( DUALPATH_L3_READ_BPS > 20000000000 )); then
+  echo "DUALPATH_L3_READ_BPS must be an integer in [0, 20000000000] bytes/s" >&2
+  exit 2
+fi
 [[ ${ALLOC_JOB_ID:-$allocation_id} == "$allocation_id" ]] || {
   echo "Allocation environment belongs to Job $ALLOC_JOB_ID, expected $allocation_id" >&2
   exit 2
 }
 export ALLOC_JOB_ID=$allocation_id
-IMAGE=${IMAGE:-$RUNTIME_HOME/images/sglang:26.01-py3-mooncake0.3.13.post1-dualpath-patched.sqsh}
+IMAGE=${IMAGE:-$RUNTIME_HOME/images/sglang:26.01-py3-mooncake0.3.13.post1-dualpath-patched-l3bps-20260929.sqsh}
 ENGINE_GPUS=${ENGINE_GPUS:-4}
 TP_SIZE=${TP_SIZE:-4}
 : "${PREFILL_HOSTS:?PREFILL_HOSTS is required}"
@@ -213,6 +230,19 @@ else
 fi
 [[ $cpus =~ ^[1-9][0-9]*$ ]] || { echo "Invalid CPU count: $cpus" >&2; exit 2; }
 
+# Launching from inside a smaller step of the same allocation makes Slurm warn
+# "--cpus-per-task value exceeds that of job" and then still run the engine
+# on the outer step's CPUs; Jobs 573/574 decoded ~25x slower that way.
+if [[ ${SLURM_JOB_ID:-} == "$allocation_id" && ${SLURM_CPUS_PER_TASK:-} =~ ^[0-9]+$ ]] &&
+   (( SLURM_CPUS_PER_TASK < cpus )); then
+  echo "Refusing to launch $runtime_role: this shell belongs to a Slurm step of allocation" \
+    "$allocation_id with only $SLURM_CPUS_PER_TASK CPUs, but the $runtime_role step needs $cpus." >&2
+  echo "Run scripts/pd_benchmark.sh from the allocation shell or the g5 login shell" \
+    "(DUALPATH_HOSTNAME=<node> for remote roles), or give the outer srun" \
+    "--cpus-per-task=$cpus." >&2
+  exit 2
+fi
+
 runtime_cache_root=${DUALPATH_RUNTIME_CACHE_ROOT:-$RUNTIME_HOME/runtime-cache}
 runtime_home=$runtime_cache_root/home
 xdg_cache_home=$runtime_cache_root/xdg
@@ -237,6 +267,66 @@ fi
   exit 2
 }
 
+container_mounts="$RUNTIME_HOME:$RUNTIME_HOME,$CODE_HOME:/workspace/dual-path"
+
+# On an NFS client of g5's /data, bind the KV cache tree from the NFS/RDMA
+# view (scripts/pza100-nfsrdma.sh) over the same container path. Every role
+# on this host must share one view: Decode writes kv-cache/l3-sync markers
+# that the co-located client polls, and two NFS client caches on one node do
+# not see each other's fresh files promptly.
+nfs_rdma_mode=${DUALPATH_NFS_RDMA:-auto}
+[[ $nfs_rdma_mode == auto || $nfs_rdma_mode == 0 || $nfs_rdma_mode == 1 ]] || {
+  echo "DUALPATH_NFS_RDMA must be auto, 0 or 1" >&2
+  exit 2
+}
+nfs_rdma_mount=/mnt/nfsrdma
+nfs_export_root=/data
+kv_cache_root=${SERVER_CACHE_DIR:-$RUNTIME_HOME/test/$allocation_id/pd-servers/kv-cache/file}
+kv_cache_root=${kv_cache_root%/file}
+
+# Mount state is node-local, and roles are often launched from g5 with
+# DUALPATH_HOSTNAME=<node>; probe the node that will run the step.
+on_role_host() {
+  if [[ $current_host == "$(hostname -s)" ]]; then
+    "$@"
+  else
+    srun --jobid="$allocation_id" --overlap --nodes=1 --ntasks=1 \
+      --nodelist="$current_host" --cpus-per-task=1 --gres=none --mpi=none "$@"
+  fi
+}
+
+role_host_storage=
+if [[ $nfs_rdma_mode != 0 ]]; then
+  role_host_storage=$(on_role_host bash -c \
+    'printf "%s " "$(stat -f -c %T "$1")"; "$2" status >/dev/null 2>&1 && echo rdma || echo none' \
+    _ "$RUNTIME_HOME" "$CODE_HOME/scripts/pza100-nfsrdma.sh") || {
+    echo "Cannot probe NFS/RDMA state on $current_host" >&2
+    exit 2
+  }
+fi
+if [[ $role_host_storage == nfs\ * ]]; then
+  if [[ $role_host_storage == "nfs rdma" ]]; then
+    [[ $kv_cache_root == "$nfs_export_root"/* ]] || {
+      echo "KV cache $kv_cache_root is outside the $nfs_export_root export" >&2
+      exit 2
+    }
+    rdma_kv_cache_root=$nfs_rdma_mount/${kv_cache_root#"$nfs_export_root"/}
+    on_role_host mkdir -p "$rdma_kv_cache_root"
+    container_mounts+=",$rdma_kv_cache_root:$kv_cache_root"
+    export STORAGE_TOPOLOGY=${STORAGE_TOPOLOGY:-g5-xfs-export-g6-nfs-rdma}
+    printf '  nfs_rdma=on kv_cache=%s via %s\n' "$kv_cache_root" "$rdma_kv_cache_root"
+  elif [[ $nfs_rdma_mode == 1 ]]; then
+    echo "DUALPATH_NFS_RDMA=1 but $nfs_rdma_mount is not an RDMA mount; run scripts/pza100-nfsrdma.sh mount" >&2
+    exit 2
+  else
+    printf '  nfs_rdma=off (%s not mounted on %s; KV cache uses NFS/TCP)\n' \
+      "$nfs_rdma_mount" "$current_host"
+  fi
+elif [[ $nfs_rdma_mode == 1 && $role_host_storage != xfs\ * ]]; then
+  echo "DUALPATH_NFS_RDMA=1 but $current_host storage probe returned '$role_host_storage'" >&2
+  exit 2
+fi
+
 step_sharing=--exclusive
 if [[ $role == client ]]; then
   step_sharing=--overlap
@@ -246,7 +336,7 @@ command=(
   --nodes=1 --ntasks=1 --nodelist="$current_host"
   --cpus-per-task="$cpus" --gres="$gres" --mpi=none
   --container-image="$IMAGE"
-  --container-mounts="$RUNTIME_HOME:$RUNTIME_HOME,$CODE_HOME:/workspace/dual-path"
+  --container-mounts="$container_mounts"
   --container-workdir=/workspace/dual-path --no-container-mount-home
   env CODE_HOME=/workspace/dual-path
   HOME="$runtime_home"
@@ -260,10 +350,10 @@ command=(
   bash scripts/tests/runtime/pd_runtime.sh "$runtime_role" "$runtime_id"
 )
 
-printf 'allocation=%s host=%s role=%s id=%s task=%s tp=%s l3_read=%s o_direct=%s\n' \
+printf 'allocation=%s host=%s role=%s id=%s task=%s tp=%s l3_read=%s o_direct=%s l3_read_bps=%s\n' \
   "$allocation_id" "$current_host" "$runtime_role" "$runtime_id" \
   "${TASK_NAME:-<client-default>}" "$TP_SIZE" "$DUALPATH_L3_READ_PATH" \
-  "${DUAL_PATH_O_DIRECT_READ:-0}"
+  "${DUAL_PATH_O_DIRECT_READ:-0}" "$DUALPATH_L3_READ_BPS"
 printf '  cpus=%s threads_per_process=%s runtime_cache=%s\n' \
   "$cpus" "$threads_per_process" "$runtime_cache_root"
 if [[ ${PD_DRY_RUN:-0} == 1 ]]; then

@@ -25,6 +25,19 @@ dualpath_export_common_env() {
     echo "DUAL_PATH_O_DIRECT_READ must be 0 or 1" >&2
     return 2
   fi
+  # HiCache H2D/D2H engine; nic needs an image patched by patch_sglang_nic_h2d.py.
+  export DUAL_PATH_CUDAMEMCPY=${DUAL_PATH_CUDAMEMCPY:-hicache}
+  if [[ $DUAL_PATH_CUDAMEMCPY != hicache && $DUAL_PATH_CUDAMEMCPY != nic ]]; then
+    echo "DUAL_PATH_CUDAMEMCPY must be hicache or nic" >&2
+    return 2
+  fi
+  # Engine-wide L3 read limit in bytes/s; 0 disables it.
+  export DUALPATH_L3_READ_BPS=${DUALPATH_L3_READ_BPS:-0}
+  if [[ ! $DUALPATH_L3_READ_BPS =~ ^(0|[1-9][0-9]*)$ ]] ||
+     (( DUALPATH_L3_READ_BPS > 20000000000 )); then
+    echo "DUALPATH_L3_READ_BPS must be an integer in [0, 20000000000] bytes/s" >&2
+    return 2
+  fi
   export MEM_FRACTION_STATIC=${MEM_FRACTION_STATIC:-0.55}
   # SGLang caps in-flight L3 prefetch at 0.8 * (host pool - device pool) tokens.
   # A ratio-derived host pool ties that budget to GPU KV capacity, and on A100
@@ -99,7 +112,7 @@ dualpath_export_common_env() {
   export DUALPATH_DECODE_L3_SYNC_RANKS DUALPATH_DECODE_L3_SYNC_TIMEOUT
   export DUALPATH_L3_READ_PATH DUALPATH_DYNAMIC_PATH_POLICY
   export DUALPATH_NO_CROSS_TURN_KV_REUSE
-  export DUAL_PATH_O_DIRECT_READ
+  export DUAL_PATH_O_DIRECT_READ DUAL_PATH_CUDAMEMCPY
   export DUALPATH_TTFT_TIMING DUALPATH_TTFT_TIMING_DETAIL
   export MOONCAKE_DEVICE
 }
@@ -292,6 +305,8 @@ Path(sys.argv[1]).write_text(json.dumps({
     "dual_path_o_direct_read": bool(
         int(os.environ.get("DUAL_PATH_O_DIRECT_READ", "0"))
     ),
+    "l3_read_bps": int(os.environ.get("DUALPATH_L3_READ_BPS", "0") or 0),
+    "dual_path_cudamemcpy": os.environ.get("DUAL_PATH_CUDAMEMCPY", "hicache"),
     "kv_buffer_semantics": (
         "DualPath paper: staging/GPU buffers released after each request; "
         "cross-turn reuse via L3 only. SGLang approximation: after successful "

@@ -245,6 +245,11 @@ assert "DUALPATH_TTFT_V3_CACHE_CONTROLLER" in cache_controller
 assert "dualpath_before_read_start_ns" in cache_controller
 assert "dualpath_lustre_read_ns" in cache_controller
 assert "dualpath_scatter_ns" in cache_controller
+# L3 read pacing must sit inside the timed read on both the O_DIRECT and the
+# buffered path, or DUALPATH_L3_READ_BPS would not show in L3 bandwidth.
+assert "DUALPATH_L3_READ_BPS" in cache_controller
+assert cache_controller.count("dualpath_l3_pace(") == 2
+assert (root / "utils/dualpath_l3_throttle.py").exists()
 assert "DUALPATH_TTFT_V3_HIRADIX" in hiradix
 assert "dualpath_completed_prefetch_timing" in hiradix
 assert "DUALPATH_TTFT_V3_SCHEDULER" in scheduler
