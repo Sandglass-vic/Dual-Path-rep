@@ -3993,6 +3993,98 @@ def patch_mooncake_decode_l3_reverse(path: Path) -> None:
     print(f"Patched: {path}")
 
 
+def patch_mooncake_control_socket_safety(path: Path) -> None:
+    # CommonKVManager._connect caches one ZMQ PUSH socket per endpoint.
+    # Upstream only sends from the endpoint's transfer worker, but the Decode L3
+    # reverse fetch is sent from the scheduler thread, so frames can interleave.
+    source = path.read_text()
+    marker = "class _DualPathLockedSocket"
+    if marker in source:
+        print(f"Already patched: {path}")
+        return
+
+    source = replace_once(
+        source,
+        "class MooncakeKVManager(CommonKVManager):\n",
+        "class _DualPathLockedSocket:\n"
+        "    def __init__(self, socket, lock):\n"
+        "        self._socket = socket\n"
+        "        self._lock = lock\n"
+        "\n"
+        "    def send_multipart(self, frames):\n"
+        "        with self._lock:\n"
+        "            return self._socket.send_multipart(frames)\n"
+        "\n"
+        "\n"
+        "class MooncakeKVManager(CommonKVManager):\n",
+        "define locked control socket",
+    )
+    source = replace_once(
+        source,
+        "    DECODE_L3_REVERSE_COMPLETE_HEADER = b\"DUALPATH_DECODE_L3_DONE\"\n",
+        "    DECODE_L3_REVERSE_COMPLETE_HEADER = b\"DUALPATH_DECODE_L3_DONE\"\n"
+        "    _dualpath_send_lock = threading.Lock()\n"
+        "\n"
+        "    def _connect(self, endpoint: str, is_ipv6: bool = False):\n"
+        "        with self._dualpath_send_lock:\n"
+        "            socket = super()._connect(endpoint, is_ipv6=is_ipv6)\n"
+        "        return _DualPathLockedSocket(socket, self._dualpath_send_lock)\n",
+        "serialize control socket sends",
+    )
+    source = replace_once(
+        source,
+        "                if msg[0] == self.DECODE_L3_REVERSE_FETCH_HEADER:\n"
+        "                    self._handle_decode_l3_reverse_fetch(msg)\n"
+        "                    continue\n"
+        "\n"
+        "                (bootstrap_room, status, prefill_rank) = msg\n",
+        "                if msg[0] == self.DECODE_L3_REVERSE_FETCH_HEADER:\n"
+        "                    if len(msg) != 7:\n"
+        "                        logger.error(\n"
+        "                            \"Dropping malformed Decode L3 reverse-fetch \"\n"
+        "                            \"message with %d frames\",\n"
+        "                            len(msg),\n"
+        "                        )\n"
+        "                        continue\n"
+        "                    try:\n"
+        "                        self._handle_decode_l3_reverse_fetch(msg)\n"
+        "                    except Exception:\n"
+        "                        logger.exception(\n"
+        "                            \"Decode L3 reverse-fetch handler failed\"\n"
+        "                        )\n"
+        "                    continue\n"
+        "                if len(msg) != 3:\n"
+        "                    logger.error(\n"
+        "                        \"Dropping malformed KV status message with %d \"\n"
+        "                        \"frames\",\n"
+        "                        len(msg),\n"
+        "                    )\n"
+        "                    continue\n"
+        "\n"
+        "                (bootstrap_room, status, prefill_rank) = msg\n",
+        "keep Decode control thread alive on malformed messages",
+    )
+    source = replace_once(
+        source,
+        "                    == self.DECODE_L3_REVERSE_COMPLETE_HEADER\n"
+        "                ):\n"
+        "                    reverse_room = int(waiting_req_bytes[1].decode(\"ascii\"))\n",
+        "                    == self.DECODE_L3_REVERSE_COMPLETE_HEADER\n"
+        "                ):\n"
+        "                    if len(waiting_req_bytes) != 4:\n"
+        "                        logger.error(\n"
+        "                            \"Dropping malformed Decode L3 reverse-done \"\n"
+        "                            \"message with %d frames\",\n"
+        "                            len(waiting_req_bytes),\n"
+        "                        )\n"
+        "                        continue\n"
+        "                    reverse_room = int(waiting_req_bytes[1].decode(\"ascii\"))\n",
+        "validate Decode L3 reverse completion on Prefill",
+    )
+    path.write_text(source)
+    print(f"Patched: {path}")
+
+
 DUALPATH_READ_PATH_IMPORT = (
     "from sglang.srt.utils.dualpath_read_path import (\n"
     "    is_decode_read as dualpath_is_decode_read,\n"
@@ -5469,6 +5561,9 @@ def main() -> None:
     # decisions, after every other patch has settled their surrounding code.
     for rel in DYNAMIC_READ_PATH_SITES:
         patch_dynamic_read_path_file(srt / rel, rel)
+    patch_mooncake_control_socket_safety(
+        srt / "disaggregation/mooncake/conn.py"
+    )
 
 
 if __name__ == "__main__":
