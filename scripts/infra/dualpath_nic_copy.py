@@ -7,25 +7,30 @@ on the HCA paired with the GPU, instead of ``cudaMemcpyAsync``. The NIC reads
 one side over PCIe and writes the other with GPUDirect RDMA, so the copy
 engine never touches the data. ``hicache`` (default) leaves SGLang unchanged.
 
-Copies are synchronous in the calling thread:
+Every copy is ordered on the caller's current stream, so anything recorded on
+that stream afterwards (``LayerDoneCounter`` events, ``finish_event``)
+observes the copied data. Two submission modes:
 
-1. synchronize the caller's current stream, so everything ordered before the
-   copy on the GPU (including the stream's waits on the compute stream) has
-   finished before the NIC reads or overwrites the buffers;
-2. post the RDMA writes and wait for their completion;
-3. read 4 bytes back from the destination, which forces the NIC's posted
-   PCIe writes to land before the call returns.
+``stream`` (default)
+    ``batch_transfer_write_on_cuda`` enqueues the transfer on the stream as a
+    native host function: the call returns at once, the transfer starts when
+    the stream reaches it (after all earlier work, including the stream's
+    waits on the compute stream) and later stream work waits for it. A
+    4-byte ``batch_transfer_read_on_cuda`` of the destination follows as a
+    flush, forcing the NIC's posted PCIe writes to land first. No Python
+    thread is involved, so nothing needs the GIL while the GPU waits.
 
-Anything the caller records on the stream afterwards (``LayerDoneCounter``
-events, ``finish_event``) therefore observes the copied data.
+``sync``
+    The calling thread synchronizes the stream, runs the transfer and the
+    flush with the blocking API, and only then returns.
 
-An asynchronous variant that lets the stream wait on a host flag set by a
-Python thread deadlocks: a CUDA call in another thread that blocks on the GPU
-while holding the GIL (e.g. a caching-allocator cudaMalloc) keeps the flag
-writer from running. Asynchrony needs a native completion path.
+A variant in which the stream waits on a host flag set by a Python thread
+deadlocks: a CUDA call that blocks on the GPU while holding the GIL (e.g. a
+caching-allocator cudaMalloc) keeps the flag writer from running.
 
 Environment:
   DUAL_PATH_CUDAMEMCPY   hicache | nic
+  DUAL_PATH_NIC_SUBMIT   stream (default) | sync
   DUAL_PATH_NIC_DEVICE   HCA to use; otherwise the GPU's entry in the JSON map
                          in IB_DEVICE / MOONCAKE_DEVICE / DUALPATH_PZA100_IB_DEVICE_MAP
   DUAL_PATH_NIC_HOST     loopback address for the Mooncake handshake (127.0.0.1)
@@ -49,6 +54,9 @@ MODE = os.environ.get("DUAL_PATH_CUDAMEMCPY", "hicache")
 if MODE not in ("hicache", "nic"):
     raise ValueError(f"DUAL_PATH_CUDAMEMCPY must be hicache or nic, got {MODE!r}")
 ENABLED = MODE == "nic"
+SUBMIT = os.environ.get("DUAL_PATH_NIC_SUBMIT", "stream")
+if SUBMIT not in ("stream", "sync"):
+    raise ValueError(f"DUAL_PATH_NIC_SUBMIT must be stream or sync, got {SUBMIT!r}")
 
 SUPPORTED_LAYOUTS = ("layer_first", "page_first_direct")
 FLUSH_BYTES = 4
@@ -147,8 +155,8 @@ class NicCopyEngine:
         self._register([(self.scratch.data_ptr(), _nbytes(self.scratch))])
         self._self_test()
         logger.info(
-            "DUAL_PATH_CUDAMEMCPY=nic gpu=%d hca=%s session=%s flush=%s",
-            self.gpu, self.hca, self.session, self.flush_enabled,
+            "DUAL_PATH_CUDAMEMCPY=nic gpu=%d hca=%s session=%s flush=%s submit=%s",
+            self.gpu, self.hca, self.session, self.flush_enabled, SUBMIT,
         )
 
     def _register(self, regions) -> None:
@@ -197,16 +205,25 @@ class NicCopyEngine:
         stream = torch.cuda.current_stream()
         self._transfer([(src.data_ptr(), gpu.data_ptr(), size)], gpu.data_ptr(), stream)
         self._transfer([(gpu.data_ptr(), back.data_ptr(), size)], back.data_ptr(), stream)
+        stream.synchronize()
         if not torch.equal(src, back):
             raise RuntimeError("DUAL_PATH_CUDAMEMCPY=nic self-test: data mismatch")
         self.engine.batch_unregister_memory([p for p, _ in regions])
         self.registered -= set(regions)
 
     def _transfer(self, requests, flush_addr: int, stream) -> None:
-        stream.synchronize()
         src = [r[0] for r in requests]
         dst = [r[1] for r in requests]
         lengths = [r[2] for r in requests]
+        if SUBMIT == "stream":
+            handle = stream.cuda_stream
+            self.engine.batch_transfer_write_on_cuda(self.session, src, dst, lengths, handle)
+            if self.flush_enabled:
+                self.engine.batch_transfer_read_on_cuda(
+                    self.session, [self.scratch.data_ptr()], [flush_addr], [FLUSH_BYTES], handle
+                )
+            return
+        stream.synchronize()
         with self.lock:
             if self.engine.batch_transfer_sync_write(self.session, src, dst, lengths) < 0:
                 raise RuntimeError("DUAL_PATH_CUDAMEMCPY=nic: Mooncake batch write failed")

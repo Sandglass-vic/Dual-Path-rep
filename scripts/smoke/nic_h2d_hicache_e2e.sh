@@ -16,7 +16,7 @@ set -euo pipefail
 
 CODE_HOME=${CODE_HOME:-/data/home/yongxiao/dual-path}
 RUNTIME_HOME=${RUNTIME_HOME:-/data/home/yongxiao/mydata}
-IMAGE=${IMAGE:-$RUNTIME_HOME/images/sglang:26.01-py3-mooncake0.3.13.post1-dualpath-patched-l3bps-20260929-nich2d.sqsh}
+IMAGE=${IMAGE:-$RUNTIME_HOME/images/sglang:26.01-py3-mooncake0.3.13.post1-dualpath-patched-l3bps-20260929-nich2d-async-kvtrans.sqsh}
 MODEL=${MODEL:-/data/models/Qwen/Qwen3-0.6B}
 MODES=${MODES:-"hicache nic"}
 LAYOUTS=${LAYOUTS:-"page_first_direct layer_first"}

@@ -4007,13 +4007,18 @@ def patch_mooncake_control_socket_safety(path: Path) -> None:
         source,
         "class MooncakeKVManager(CommonKVManager):\n",
         "class _DualPathLockedSocket:\n"
-        "    def __init__(self, socket, lock):\n"
+        "    # ZMQ sockets are not thread-safe; one lock per endpoint keeps a\n"
+        "    # slow peer (HWM back-pressure) from stalling sends to other peers.\n"
+        "    def __init__(self, socket):\n"
         "        self._socket = socket\n"
-        "        self._lock = lock\n"
+        "        self._lock = threading.Lock()\n"
         "\n"
-        "    def send_multipart(self, frames):\n"
+        "    def send_multipart(self, frames, *args, **kwargs):\n"
         "        with self._lock:\n"
-        "            return self._socket.send_multipart(frames)\n"
+        "            return self._socket.send_multipart(frames, *args, **kwargs)\n"
+        "\n"
+        "    def __getattr__(self, name):\n"
+        "        return getattr(self._socket, name)\n"
         "\n"
         "\n"
         "class MooncakeKVManager(CommonKVManager):\n",
@@ -4023,13 +4028,25 @@ def patch_mooncake_control_socket_safety(path: Path) -> None:
         source,
         "    DECODE_L3_REVERSE_COMPLETE_HEADER = b\"DUALPATH_DECODE_L3_DONE\"\n",
         "    DECODE_L3_REVERSE_COMPLETE_HEADER = b\"DUALPATH_DECODE_L3_DONE\"\n"
-        "    _dualpath_send_lock = threading.Lock()\n"
+        "    _dualpath_socket_guard = threading.Lock()\n"
         "\n"
         "    def _connect(self, endpoint: str, is_ipv6: bool = False):\n"
-        "        with self._dualpath_send_lock:\n"
-        "            socket = super()._connect(endpoint, is_ipv6=is_ipv6)\n"
-        "        return _DualPathLockedSocket(socket, self._dualpath_send_lock)\n",
-        "serialize control socket sends",
+        "        key = (endpoint, is_ipv6)\n"
+        "        sockets = self.__dict__.get(\"_dualpath_sockets\")\n"
+        "        locked = sockets.get(key) if sockets is not None else None\n"
+        "        if locked is not None:\n"
+        "            return locked\n"
+        "        # The guard only covers creation; sends never hold it.\n"
+        "        with self._dualpath_socket_guard:\n"
+        "            sockets = self.__dict__.setdefault(\"_dualpath_sockets\", {})\n"
+        "            locked = sockets.get(key)\n"
+        "            if locked is None:\n"
+        "                locked = _DualPathLockedSocket(\n"
+        "                    super()._connect(endpoint, is_ipv6=is_ipv6)\n"
+        "                )\n"
+        "                sockets[key] = locked\n"
+        "        return locked\n",
+        "serialize control socket sends per endpoint",
     )
     source = replace_once(
         source,
@@ -4039,7 +4056,7 @@ def patch_mooncake_control_socket_safety(path: Path) -> None:
         "\n"
         "                (bootstrap_room, status, prefill_rank) = msg\n",
         "                if msg[0] == self.DECODE_L3_REVERSE_FETCH_HEADER:\n"
-        "                    if len(msg) != 7:\n"
+        "                    if len(msg) < 7:\n"
         "                        logger.error(\n"
         "                            \"Dropping malformed Decode L3 reverse-fetch \"\n"
         "                            \"message with %d frames\",\n"
@@ -4071,7 +4088,7 @@ def patch_mooncake_control_socket_safety(path: Path) -> None:
         "                    reverse_room = int(waiting_req_bytes[1].decode(\"ascii\"))\n",
         "                    == self.DECODE_L3_REVERSE_COMPLETE_HEADER\n"
         "                ):\n"
-        "                    if len(waiting_req_bytes) != 4:\n"
+        "                    if len(waiting_req_bytes) < 4:\n"
         "                        logger.error(\n"
         "                            \"Dropping malformed Decode L3 reverse-done \"\n"
         "                            \"message with %d frames\",\n"

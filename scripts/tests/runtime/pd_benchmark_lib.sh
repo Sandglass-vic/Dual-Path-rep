@@ -7,6 +7,16 @@ dualpath_export_common_env() {
   export NCCL_NET_GDR_LEVEL=${NCCL_NET_GDR_LEVEL:-PIX}
   export NCCL_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME:-ibs3}
   export GLOO_SOCKET_IFNAME=${GLOO_SOCKET_IFNAME:-ibs3}
+  # 1: TP NCCL skips NVLink/PCIe P2P and SHM, so every peer goes through NET/IB
+  # on the CX8 (same-HCA pairs loop back inside the HCA). See docs/nccl-control.md.
+  export DUAL_PATH_NCCL_FORCE_NIC=${DUAL_PATH_NCCL_FORCE_NIC:-1}
+  if [[ $DUAL_PATH_NCCL_FORCE_NIC != 0 && $DUAL_PATH_NCCL_FORCE_NIC != 1 ]]; then
+    echo "DUAL_PATH_NCCL_FORCE_NIC must be 0 or 1" >&2
+    return 2
+  fi
+  if [[ $DUAL_PATH_NCCL_FORCE_NIC == 1 ]]; then
+    export NCCL_P2P_DISABLE=1 NCCL_SHM_DISABLE=1
+  fi
   export ENABLE_BENCHMARK_TIMING=1
   export DUALPATH_TTFT_TIMING=${DUALPATH_TTFT_TIMING:-1}
   export DUALPATH_TTFT_TIMING_DETAIL=${DUALPATH_TTFT_TIMING_DETAIL:-0}
@@ -29,6 +39,18 @@ dualpath_export_common_env() {
   export DUAL_PATH_CUDAMEMCPY=${DUAL_PATH_CUDAMEMCPY:-hicache}
   if [[ $DUAL_PATH_CUDAMEMCPY != hicache && $DUAL_PATH_CUDAMEMCPY != nic ]]; then
     echo "DUAL_PATH_CUDAMEMCPY must be hicache or nic" >&2
+    return 2
+  fi
+  export DUAL_PATH_NIC_SUBMIT=${DUAL_PATH_NIC_SUBMIT:-stream}
+  if [[ $DUAL_PATH_NIC_SUBMIT != stream && $DUAL_PATH_NIC_SUBMIT != sync ]]; then
+    echo "DUAL_PATH_NIC_SUBMIT must be stream or sync" >&2
+    return 2
+  fi
+  # KV transfer shape for both paths. Needs an image patched by
+  # patch_sglang_kvtrans.py; older images ignore it.
+  export DUAL_PATH_KVTRANS=${DUAL_PATH_KVTRANS:-full}
+  if [[ $DUAL_PATH_KVTRANS != layer && $DUAL_PATH_KVTRANS != full ]]; then
+    echo "DUAL_PATH_KVTRANS must be layer or full" >&2
     return 2
   fi
   # Engine-wide L3 read limit in bytes/s; 0 disables it.
@@ -112,7 +134,8 @@ dualpath_export_common_env() {
   export DUALPATH_DECODE_L3_SYNC_RANKS DUALPATH_DECODE_L3_SYNC_TIMEOUT
   export DUALPATH_L3_READ_PATH DUALPATH_DYNAMIC_PATH_POLICY
   export DUALPATH_NO_CROSS_TURN_KV_REUSE
-  export DUAL_PATH_O_DIRECT_READ DUAL_PATH_CUDAMEMCPY
+  export DUAL_PATH_O_DIRECT_READ DUAL_PATH_CUDAMEMCPY DUAL_PATH_NIC_SUBMIT
+  export DUAL_PATH_NCCL_FORCE_NIC
   export DUALPATH_TTFT_TIMING DUALPATH_TTFT_TIMING_DETAIL
   export MOONCAKE_DEVICE
 }
@@ -307,6 +330,13 @@ Path(sys.argv[1]).write_text(json.dumps({
     ),
     "l3_read_bps": int(os.environ.get("DUALPATH_L3_READ_BPS", "0") or 0),
     "dual_path_cudamemcpy": os.environ.get("DUAL_PATH_CUDAMEMCPY", "hicache"),
+    "dual_path_nic_submit": os.environ.get("DUAL_PATH_NIC_SUBMIT", "stream"),
+    "dual_path_kvtrans": os.environ.get("DUAL_PATH_KVTRANS", "full"),
+    "dual_path_nccl_force_nic": bool(
+        int(os.environ.get("DUAL_PATH_NCCL_FORCE_NIC", "1"))
+    ),
+    "nccl_p2p_disable": os.environ.get("NCCL_P2P_DISABLE"),
+    "nccl_shm_disable": os.environ.get("NCCL_SHM_DISABLE"),
     "kv_buffer_semantics": (
         "DualPath paper: staging/GPU buffers released after each request; "
         "cross-turn reuse via L3 only. SGLang approximation: after successful "

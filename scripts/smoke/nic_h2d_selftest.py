@@ -182,7 +182,7 @@ def main() -> int:
                         "layout": layout, "direction": direction, "mode": mode, "rep": rep,
                         "mismatched_elements": bad, "gpu_seconds": seconds,
                         "gbytes_s": bytes_per_rep / seconds / 1e9, "submit_ms": submit * 1e3,
-                        "hca": nic.get_engine().hca,
+                        "hca": nic.get_engine().hca, "submit": nic.SUBMIT,
                     }), flush=True)
         torch.cuda.synchronize()
     print("SELFTEST " + ("PASS" if failures == 0 else f"FAIL cases={failures}"), flush=True)

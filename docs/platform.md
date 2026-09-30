@@ -36,6 +36,8 @@ export NCCL_SOCKET_IFNAME=ibs3
 export GLOO_SOCKET_IFNAME=ibs3
 ```
 
+PD 测试脚本还默认设置 `DUAL_PATH_NCCL_FORCE_NIC=1`，即 `NCCL_P2P_DISABLE=1` 加 `NCCL_SHM_DISABLE=1`，让 TP 内的 NCCL 通信全部走 CX8、不走 NVLink。说明见 [nccl-control.md](nccl-control.md)。
+
 共享存储不是 Lustre：g5 的 `/data` 是本地盘，g6 通过 IPoIB NFS 挂载 g5。
 g5 停机或 `ibs3` 中断会同时影响 g6 的代码、镜像、模型和 KV 数据。pza100
 运行根目录为 `/data/home/yongxiao/mydata`。

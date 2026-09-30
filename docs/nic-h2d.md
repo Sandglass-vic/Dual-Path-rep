@@ -6,7 +6,7 @@
 与 GPU KV pool 之间的拷贝，从 CUDA 拷贝引擎改为由 GPU 配对的 CX8 以 RDMA
 完成，让网卡成为 GPU PCIe 流量唯一的 QoS 仲裁点（见
 [VL 流量隔离](vl-traffic-isolation.md)）。mini bench 结论见 §2.1（完整数据见
-[io-test/RESULTS.md](../io-test/RESULTS.md)），开关已实现为同步版本并构建了镜像，
+[io-test/RESULTS.md](../io-test/RESULTS.md)），开关已实现（异步 `stream` 与同步 `sync` 两种提交方式）并构建了镜像，
 用法与验证见 §3。
 
 ## 1. 现有 HiCache 拷贝路径
@@ -85,13 +85,17 @@ RUN_INTERFERENCE=1 io-test/run_h2d_path_bench.sh
 |---|---|---|---|
 | `DUAL_PATH_CUDAMEMCPY` | `hicache` / `nic` | `hicache` | `hicache` 完全保持原有行为；`nic` 让 HiCache 的 H2D/D2H 改走 CX8 RDMA |
 | `DUAL_PATH_NIC_DEVICE` | HCA 名 | 空 | 显式指定网卡；为空时按 GPU 编号查 `IB_DEVICE` / `MOONCAKE_DEVICE` / `DUALPATH_PZA100_IB_DEVICE_MAP` 的 JSON 映射（GPU0/1 为 `mlx5_0`，GPU2/3 为 `mlx5_4`） |
+| `DUAL_PATH_NIC_SUBMIT` | `stream` / `sync` | `stream` | `stream`：用 Mooncake 的 `batch_transfer_write_on_cuda` 把传输挂到调用方 stream 上，异步执行；`sync`：调用线程同步完成（第一版的行为） |
 | `DUAL_PATH_NIC_HOST` | IP | `127.0.0.1` | Mooncake 回环握手地址 |
 | `DUAL_PATH_NIC_FLUSH` | `0` / `1` | `1` | 每次传输后回读 4 字节，确保网卡的 PCIe 写已落地 |
 
-- 镜像：`sglang:26.01-py3-mooncake0.3.13.post1-dualpath-patched-l3bps-20260929-nich2d.sqsh`
-  （SHA-256 `5a09b0306ba30721ff2e39377b6a3cf7bb0af9e3bd6df4dba2d55ab125a8ca57`），
-  由 `scripts/infra/build_nic_h2d_image.sh` 在当前默认的 l3bps 镜像之上叠加补丁得到。
-  默认值为 `hicache`，因此不设置开关时，行为与 l3bps 镜像完全相同。
+- 镜像（均由 `scripts/infra/build_nic_h2d_image.sh` 在当前默认的 l3bps 镜像之上叠加补丁得到；
+  `DUAL_PATH_CUDAMEMCPY` 默认为 `hicache`，不设置时行为与 l3bps 镜像完全相同）：
+
+  | 镜像 | SHA-256 | NIC 提交方式 |
+  |---|---|---|
+  | `sglang:26.01-py3-mooncake0.3.13.post1-dualpath-patched-l3bps-20260929-nich2d-async.sqsh` | `da34ffde62d5132290557c08117af3e69e8001b0892af9282e32bd19ac825902` | 默认 `stream`，可用 `DUAL_PATH_NIC_SUBMIT=sync` 回退到同步 |
+  | `sglang:26.01-py3-mooncake0.3.13.post1-dualpath-patched-l3bps-20260929-nich2d.sqsh` | `5a09b0306ba30721ff2e39377b6a3cf7bb0af9e3bd6df4dba2d55ab125a8ca57` | 只有同步方式（Job 608–610 使用） |
 - PD 实验：`IMAGE=<上面的镜像> DUAL_PATH_CUDAMEMCPY=nic scripts/pd_benchmark.sh ...`。
   Prefill、Decode 和 client 三端必须一致；两个变量已加入 `pd_benchmark.sh` 的透传列表，
   并由 `pd_benchmark_lib.sh` 校验和导出，取值记录在结果元数据的
@@ -129,56 +133,61 @@ staging 的 `stage_received_kv_to_device`）都在“当前 stream”上调用�
 - **请求规划**：把 token 索引划分成 host、device 两侧都连续的段，按层加上偏移，
   得到每个请求的地址和长度。H2D 的规划结果在同一批次的 64 层之间复用。
 
-### 3.3 同步方式：同步阻塞调用线程
+### 3.3 提交方式
 
-每次调用在调用线程中依次完成：
+两种方式都让拷贝排在调用方当前 stream 的序列里：调用方之后在该 stream 上记录的逐层
+事件和 `finish_event` 都能看到完整数据，`LayerDoneCounter` 与 `HiCacheAck` 的语义不变。
 
-1. `stream.synchronize()` 调用方当前的 stream。这保证 stream 上排在前面的工作（包括
-   `load_stream` 对计算流 `start_event` 的等待）都已完成，网卡才开始读写；
+**`stream`（默认，2026-09-30 起）**
+
+1. `batch_transfer_write_on_cuda(session, src, dst, len, stream_ptr)`：Mooncake 用
+   `cudaLaunchHostFunc` 把传输作为原生 host 回调挂到 stream 上。Python 调用立即返回；
+   stream 执行到回调时，前序工作（包括 `load_stream` 对计算流 `start_event` 的等待）
+   已经完成；回调结束前，后续 stream 工作不会开始。
+2. 紧接着对目的地址做一次 4 字节的 `batch_transfer_read_on_cuda`，作为 flush。
+
+整个过程不需要 Python 线程，也不需要 GIL，因此不会出现下面提到的死锁；H2D 恢复了
+逐层提交、与计算重叠的形态。
+
+**`sync`（第一版，Job 608–610 使用）**
+
+1. `stream.synchronize()` 调用方的 stream；
 2. `batch_transfer_sync_write` 完成全部请求；
 3. flush：对目的地址做 4 字节 RDMA READ。
 
-返回之后，调用方在 stream 上记录的逐层事件和 `finish_event` 自然都能看到完整数据，
-`LayerDoneCounter` 和 `HiCacheAck` 的语义不变。
+代价是调用线程被阻塞：H2D 失去与计算的重叠，开始拷贝前要等调用方 stream 的前序
+工作完成，在 overlap scheduler 下可能要等上一批 forward 结束。
 
-设计阶段计划的异步方案（Python 后台线程提交传输，stream 用 `cuStreamWaitValue32`
-等待 host-pinned 标志）实测会**死锁**：另一个线程中的 CUDA 调用（例如
-caching allocator 的 cudaMalloc）在持有 GIL 的情况下阻塞，等待 GPU；GPU 在等标志；
-写标志的 worker 却拿不到 GIL。SGLang 的 scheduler 线程随时可能发生这种阻塞，因此
-异步版本必须由原生代码完成“等待传输完成并写标志”这一步（即 verbs 扩展），不能依赖
-Python 线程。
-
-同步方式的代价是调用线程被阻塞：
-
-- H2D 按层阻塞，失去 layerwise 拷贝与计算的重叠；
-- 开始拷贝前要等调用方 stream 的前序工作完成，在 overlap scheduler 下可能要等上一批
-  forward 结束。
-
-另一方面，Decode 使用的 `page_first_direct` 布局下，hicache direct 本来就要花大约
-总耗时的 CPU 时间逐页提交 `cudaMemcpyAsync`（§2.1），所以对这个布局而言，同步 nic
-占用 scheduler 线程的时间反而更短。
+**被放弃的方案**：Python 后台线程提交传输，stream 用 `cuStreamWaitValue32` 等待
+host-pinned 标志。这个方案会**死锁**：另一个线程中的 CUDA 调用（例如 caching
+allocator 的 cudaMalloc）在持有 GIL 的情况下阻塞等待 GPU，GPU 在等标志，而写标志的
+worker 拿不到 GIL。
 
 ### 3.4 验证
 
 | 验证 | 结果 |
 |---|---|
-| `scripts/smoke/nic_h2d_selftest.py`：真实 `MHATokenToKVPoolHost` + Qwen2.5-32B TP4 形状 device pool，512 个随机页 × 64 层，两种布局、两个方向、nic 与 hicache 各两轮；consumer stream 只按逐层事件等待后立即比对 | 新镜像中全部 0 个不一致元素，`SELFTEST PASS`；H2D nic 10.7 GB/s，hicache 6.1–8.5 GB/s；D2H nic 6.6–10.5 GB/s，hicache 6.5–8.1 GB/s |
-| `scripts/smoke/nic_h2d_hicache_e2e.sh`（Job 607）：Qwen3-0.6B TP1，显存池 16384 token，`write_through`；8843 token 的请求被 4 个请求挤出显存后再次发送 | 两种布局都命中 8832/8843 个 token（来自 host pool）；贪心输出与第一次相同，nic 与 hicache 逐 token 一致；网卡写请求 hicache 为 0，nic 为 148 万；`E2E PASS` |
+| `scripts/smoke/nic_h2d_selftest.py`：真实 `MHATokenToKVPoolHost` + Qwen2.5-32B TP4 形状 device pool，512 个随机页 × 64 层，两种布局、两个方向、nic 与 hicache 各两轮；consumer stream 只按逐层事件等待后立即比对，并在 NIC 传输挂起期间分配显存 | `sync` 与 `stream` 都是 0 个不一致元素，`SELFTEST PASS`，无死锁。H2D nic 10.7–11.8 GB/s，hicache 6.1–8.5 GB/s；D2H nic 6.4–10.9 GB/s，hicache 6.1–8.1 GB/s。64 层的提交耗时：`stream` 19–31 ms，`sync` 约 200 ms，hicache 250–370 ms |
+| `scripts/smoke/nic_h2d_hicache_e2e.sh`：Qwen3-0.6B TP1，显存池 16384 token，`write_through`；8843 token 的请求被 4 个请求挤出显存后再次发送。`sync` 为 Job 607，`stream` 为之后在 async 镜像上的重跑 | 两种提交方式、两种布局都命中 8832/8843 个 token（来自 host pool）；贪心输出与第一次相同，nic 与 hicache 逐 token 一致；网卡写请求 hicache 为 0，nic 为 148 万；`E2E PASS` |
+| PD 1P1D，32K、8 agents（Job 608–610，`sync`） | 完成 208/208 turns；与 hicache（Job 590–592）相比 JCT 增加 1.4–5.7%。NIC H2D 约 12 GB/s，hicache 为 19–23 GB/s；Prefill H2D 原本被重叠掉的约 48 ms/turn 全部落在关键路径上 |
 
-尚未验证：PD 1P1D 的完整 replay（TTFT/TPOT/JCT）、TP4 多 rank，以及 Decode PD
-staging 路径。
+尚未验证：`stream` 方式下的 PD 1P1D replay。
 
 ## 4. 风险与待确认
 
-- 同步阻塞会增加 scheduler 线程的停顿，需要用 PD replay 量化 TTFT/TPOT 的影响；
-  Prefill `layer_first` 页连续时 nic 本身也慢于 hicache（0.60× / 0.38×）。
-- 真正的异步需要 verbs C++ 扩展：由原生线程等待 CQ 完成，写 host 标志，stream 用
-  `cuStreamWaitValue32` 等待，整个过程不经过 GIL。
+- `stream` 方式依赖 CUDA host 回调：同一进程的所有 host 回调在同一个驱动线程上串行
+  执行，每层 NIC 传输约 2–3 ms，可能拖慢其他 stream 上的回调；回调里 Mooncake 也不能
+  调用 CUDA API。目前的测试没有发现问题，仍需在 PD replay 中观察。
+- `*_on_cuda` 接口返回 `None`，传输失败只会体现在日志里；自检和数据校验只覆盖启动时。
+- NIC H2D 带宽约 12 GB/s，低于拷贝引擎的 19–27 GB/s；Decode PD staging 路径本来就是
+  同步的，异步提交对它没有帮助。Prefill `layer_first` 页连续时 nic 也慢于 hicache
+  （0.60× / 0.38×）。
 - Mooncake 的 SL 由进程级的 `MC_IB_SL` 决定，会同时作用于同一进程里的 PD 传输；
   两者都属于 KV 流量，应该用同一个 SL。
 - 同网卡回环不经过交换机（`port_xmit_data` 不变），所以 H2D 只受 HCA 自身发送调度的
   约束。它能否获得 VL 仲裁，要看 HCA 内部回环是否经过端口仲裁器，需要在 QoS 启用后，
-  用 [VL 流量隔离](vl-traffic-isolation.md) 的 E3/E5 验证。
+  用 [VL 流量隔离](vl-traffic-isolation.md) 的 E3/E5 验证。异步后 H2D 会与 NCCL
+  真正重叠，干扰预计比同步方式更明显。
 - 多平面 CX8 上，回环流量如何在 4 个平面之间分配，尚未观测。
 - SGLang 用 `cudaHostRegister` 锁页 host pool 且从不注销；同一进程里释放后重建 host
   pool 会失败。生产代码不会这样做，但测试脚本要注意。
