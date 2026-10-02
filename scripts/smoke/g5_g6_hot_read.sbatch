@@ -20,7 +20,7 @@ set -euo pipefail
 
 CODE_HOME=${CODE_HOME:-/data/home/yongxiao/dual-path}
 RUNTIME_HOME=${RUNTIME_HOME:-/data/home/yongxiao/mydata}
-IMAGE=${IMAGE:-$RUNTIME_HOME/images/sglang:26.01-py3-mooncake0.3.13.post1-dualpath-patched-l3bps-20260929-nich2d-async-kvtrans.sqsh}
+IMAGE=${IMAGE:-$RUNTIME_HOME/images/sglang:26.01-py3-mooncake0.3.13.post1-dualpath-patched-l3bps-20260929-nich2d-async-kvtrans-hostpin.sqsh}
 RDMA_MOUNT=${RDMA_MOUNT:-/mnt/nfsrdma}
 EXPORT_ROOT=${EXPORT_ROOT:-/data}
 TP_RANKS=${TP_RANKS:-4}

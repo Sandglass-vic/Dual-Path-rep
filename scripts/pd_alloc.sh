@@ -5,7 +5,7 @@ set -euo pipefail
 # Default experiment configuration. Override any value for one invocation with
 # NAME=value scripts/pd_alloc.sh P D.
 DEFAULT_RUNTIME_HOME=/data/home/yongxiao/mydata
-DEFAULT_IMAGE_NAME=images/sglang:26.01-py3-mooncake0.3.13.post1-dualpath-patched-l3bps-20260929-nich2d-async-kvtrans.sqsh
+DEFAULT_IMAGE_NAME=images/sglang:26.01-py3-mooncake0.3.13.post1-dualpath-patched-l3bps-20260929-nich2d-async-kvtrans-hostpin.sqsh
 DEFAULT_PARTITION=run
 DEFAULT_TIME_LIMIT=02:00:00
 DEFAULT_ENGINE_CPUS=192

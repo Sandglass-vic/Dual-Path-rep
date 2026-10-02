@@ -150,6 +150,10 @@ HIRADIX_METHODS = '''    def dualpath_full_preload(self, req, token_budget: int)
         node = req.last_host_node
         if req.host_hit_length <= 0 or not node.evicted:
             return True
+        # A host-only prefix has no device lock until admission, so any
+        # evict_host() in between (e.g. another request's cache release)
+        # would drop it and force a full recompute.
+        self._dualpath_full_pin(req.rid, node)
         # Preloaded prefixes stay locked until admission, so bound them to
         # one batch worth of tokens to keep the queue from pinning HBM.
         held = sum(e[3] for e in self.dualpath_full_loads.values())
@@ -214,9 +218,24 @@ HIRADIX_METHODS = '''    def dualpath_full_preload(self, req, token_budget: int)
             if ok:
                 entry[2] = True
 
+    def _dualpath_full_pin(self, rid: str, node: TreeNode):
+        pinned = self.dualpath_full_pins.get(rid)
+        if pinned is node:
+            return
+        if pinned is not None:
+            pinned.release_host()
+        node.protect_host()
+        self.dualpath_full_pins[rid] = node
+
+    def _dualpath_full_unpin(self, rid: str):
+        pinned = self.dualpath_full_pins.pop(rid, None)
+        if pinned is not None:
+            pinned.release_host()
+
     def dualpath_full_admitted(self, req, admitted: bool):
         if not admitted:
             return
+        self._dualpath_full_unpin(req.rid)
         entry = self.dualpath_full_loads.pop(req.rid, None)
         if entry is None:
             return
@@ -230,6 +249,7 @@ HIRADIX_METHODS = '''    def dualpath_full_preload(self, req, token_budget: int)
             req.dualpath_h2d_event_pairs.append(timing_events)
 
     def dualpath_full_release(self, rid: str):
+        self._dualpath_full_unpin(rid)
         entry = self.dualpath_full_loads.pop(rid, None)
         if entry is not None:
             self.dec_lock_ref(entry[0])
@@ -243,7 +263,9 @@ def patch_hiradix(source: str) -> str:
         "        self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)\n",
         "        self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)\n"
         "        # rid -> [node, finish_event, ready_on_all_ranks, tokens, timing]\n"
-        "        self.dualpath_full_loads = {}\n",
+        "        self.dualpath_full_loads = {}\n"
+        "        # rid -> host-only prefix node protected until admission\n"
+        "        self.dualpath_full_pins = {}\n",
         "hiradix full-load state",
     )
     source = replace_once(

@@ -13,7 +13,7 @@ set -euo pipefail
 CODE_HOME=${CODE_HOME:-/data/home/yongxiao/dual-path}
 RUNTIME_HOME=${RUNTIME_HOME:-/data/home/yongxiao/mydata}
 BASE_IMAGE=${BASE_IMAGE:-$RUNTIME_HOME/images/sglang:26.01-py3-mooncake0.3.13.post1-dualpath-patched-l3bps-20260929-nich2d-async.sqsh}
-OUTPUT_IMAGE=${OUTPUT_IMAGE:-${BASE_IMAGE%.sqsh}-kvtrans.sqsh}
+OUTPUT_IMAGE=${OUTPUT_IMAGE:-${BASE_IMAGE%.sqsh}-kvtrans-hostpin.sqsh}
 NODE=${NODE:-g5}
 
 [[ -f $BASE_IMAGE ]] || { echo "Missing base image: $BASE_IMAGE" >&2; exit 2; }
@@ -35,7 +35,8 @@ import sglang.srt.utils.dualpath_kvtrans as kvtrans
 root = Path(kvtrans.__file__).resolve().parents[1]
 conn = (root / "disaggregation/mooncake/conn.py").read_text()
 assert "_dualpath_sockets" in conn and "_dualpath_send_layerwise" in conn
-assert "dualpath_full_preload" in (root / "mem_cache/hiradix_cache.py").read_text()
+hiradix = (root / "mem_cache/hiradix_cache.py").read_text()
+assert "dualpath_full_preload" in hiradix and "dualpath_full_pins" in hiradix
 assert "dualpath_remote_flags" in (root / "managers/tp_worker.py").read_text()
 assert (kvtrans.PREFILL_MODE, kvtrans.DECODE_MODE) == ("layer", "full")
 print("kvtrans patch verified")

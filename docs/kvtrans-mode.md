@@ -2,8 +2,8 @@
 
 状态：已实现并通过 32K / 8 agents 的四组完整 replay（Job 638–641，见第 11 节）。
 **运行脚本默认 `DUAL_PATH_KVTRANS=full`**，默认镜像为
-`sglang:26.01-py3-mooncake0.3.13.post1-dualpath-patched-l3bps-20260929-nich2d-async-kvtrans.sqsh`
-（sha256 `608bb7e1…`）。补丁 `scripts/infra/patch_sglang_kvtrans.py`，运行时模块
+`sglang:26.01-py3-mooncake0.3.13.post1-dualpath-patched-l3bps-20260929-nich2d-async-kvtrans-hostpin.sqsh`
+（sha256 `a4af7ec9…`，含第 12 节的修复；修复前的 `-kvtrans.sqsh` 为 `608bb7e1…`）。补丁 `scripts/infra/patch_sglang_kvtrans.py`，运行时模块
 `scripts/infra/dualpath_kvtrans.py`（装到 `sglang/srt/utils/`），镜像由
 `scripts/infra/build_kvtrans_image.sh` 基于
 `sglang:26.01-py3-mooncake0.3.13.post1-dualpath-patched-l3bps-20260929-nich2d-async.sqsh` 构建。
@@ -110,6 +110,7 @@ get_new_batch_prefill
   - `add_one_req` 在准入时会对 `req.last_node` 加自己的锁，之后才释放 preload lock。
   - 准入失败（NO_TOKEN 等）时保留 preload lock，下一轮直接准入，不会退化成按层加载。
   - 请求在 waiting queue 里被 abort 时，`release_aborted_request` 释放 preload lock。
+- **host 前缀保护**：前缀只在 host 上、还没有预加载时，节点上没有任何锁，任何 `evict_host`（例如别的请求结束时的 `DUALPATH_PREFILL_CACHE_RELEASE`）都能把它清掉。所以门控第一次看到这样的前缀就对最深的 host 节点 `protect_host()`，记在 `dualpath_full_pins` 里，准入成功或 abort 时 `release_host()`。`evict_host` 只驱逐叶子，保护最深节点就能保住整条前缀。见第 12 节。
 - **HBM 上限，防止死锁**：已预加载但尚未准入的前缀都被锁住，不可驱逐。所以同时持有的预加载 token 总数不超过 `max_prefill_tokens`（至少允许一个）。否则排队请求可能占满 HBM，队首请求因为 NO_TOKEN 永远进不去。
 - **TP 一致**：待定预加载列表按开始顺序排列，各 rank 的调度是确定性的，列表一致；每轮只做一次 gloo MIN，与待定数量无关。
 - **回退**：命中太短（低于 `load_back_threshold`）或 HBM 不够时，`dualpath_full_preload` 返回 True，交给原来的按层路径处理，不丢请求。
@@ -196,19 +197,19 @@ Prefill: 收到 COMPLETE -> ack 该 room；sender.clear() 时释放标志槽（�
 | `scripts/infra/dualpath_kvtrans.py`（新增） | 模式解析、`RemoteLayerFlags`（memfd 标志区、槽位与隔离期、看门狗子进程）、`LayerSendConstants`、`wait_remote_layer` |
 | `scripts/infra/patch_sglang_kvtrans.py`（新增） | 幂等补丁，必须在 `patch_sglang_benchmark_timing.py` 之后执行 |
 | ↳ `managers/cache_controller.py` | `LayerDoneCounter` 远端标志等待；`dualpath_full_load` |
-| ↳ `mem_cache/hiradix_cache.py` | `dualpath_full_preload` / `_poll` / `_admitted` / `_release` |
+| ↳ `mem_cache/hiradix_cache.py` | `dualpath_full_preload` / `_poll` / `_admitted` / `_release`，host 前缀保护 `dualpath_full_pins` |
 | ↳ `managers/scheduler.py` | 准入门控 |
 | ↳ `managers/tp_worker.py` | 每个 batch 设置标志列表 |
 | ↳ `disaggregation/mooncake/conn.py` | 标志槽分配、REVERSE_FETCH 追加帧、首层就绪、专用发送线程、按层发送与 flush、失败解除、超时检查 |
 | ↳ `disaggregation/prefill.py`、`decode.py`、`scheduler_output_processor_mixin.py` | 准入时启动看门狗计时、首层计时 |
 | `scripts/infra/patch_sglang_benchmark_timing.py` | 控制 socket 锁修复（第 6 节） |
-| `scripts/infra/build_kvtrans_image.sh`（新增） | 基于 nich2d-async 镜像构建 `-kvtrans` 镜像 |
+| `scripts/infra/build_kvtrans_image.sh`（新增） | 基于 nich2d-async 镜像构建 `-kvtrans-hostpin` 镜像 |
 | `scripts/tests/runtime/pd_benchmark_lib.sh`、`scripts/pd_benchmark.sh` | `DUAL_PATH_KVTRANS` 校验、export、透传，metadata 字段 `dual_path_kvtrans` |
 
 用法（`pd_alloc.sh` / `pd_benchmark.sh` 的默认镜像已经是 kvtrans 镜像）：
 
 ```bash
-scripts/infra/build_kvtrans_image.sh              # 重新构建时使用，输出 ...-nich2d-async-kvtrans.sqsh
+scripts/infra/build_kvtrans_image.sh              # 重新构建时使用，输出 ...-nich2d-async-kvtrans-hostpin.sqsh
 scripts/pd_benchmark.sh ...                       # 默认 DUAL_PATH_KVTRANS=full
 DUAL_PATH_KVTRANS=layer scripts/pd_benchmark.sh ...
 ```
@@ -266,3 +267,12 @@ TTFT 分解（关键路径均值，秒）：
 - **Decode `layer` 的收益被抵消**：关键路径上的 D→P 省了约 62 ms，但按层同步发送让 D→P 总时长从 64 ms 涨到 105 ms，Prefill 计算慢了约 45 ms（按层 RDMA 写 GPU 与 TP 通信重叠）。D-layer 比 D-full 快的 0.22 s TTFT 主要来自 `queue_wait`，只跑了一次，不能算作 `layer` 的收益。汇总脚本还没有区分形态，表里 D-layer 的 D→P 0.103 s 包含了与计算重叠的部分。
 - **Decode `layer` 的 TPOT 上升**：TPOT p10 四组相同（约 26.6 ms），没有其他请求在传输时 decode step 都是约 27 ms，差异只出现在“有请求在预分配或传输”的时段。可能的原因是按层发送每请求 192 次 Mooncake 调用，每次返回都要重新拿 GIL，打断 Decode 调度线程；未验证。
 - **结论**：运行脚本默认使用 `full`。`layer` 保留为可选项，要让它有收益，需要按层组发送（减少调用次数），并在 L3 不是瓶颈的场景下重新评估。
+
+## 12. Job 644：Prefill `full` 前缀在准入前被清掉（已修复）
+
+配置：`DUAL_PATH_KVTRANS=full`、`DUAL_PATH_NCCL_FORCE_NIC=1`，其余同第 11 节。Prefill path（643）、dynamic（644）、Decode path（645）的 JCT 分别为 281.4 s、294.6 s、285.9 s。
+
+- **现象**：dynamic 的 cache hit 从 0.947 降到 0.926。只有 3 个请求丢了命中（`32k-0000-turn-24`、`32k-0001-turn-23`、`32k-0002-turn-22`）：L3 读到约 3 万 token，但命中为 0，Prefill 计算 8.7–9.0 s，TTFT 13–16 s。三者都是轨迹的最后一轮，直接拉长 JCT。643 和 645 逐请求与 620 对比，没有丢命中。
+- **原因**：`max_prefill_tokens=16384` 小于一个满长前缀，已有预加载时后来的请求都会被 HBM 上限挡住。被挡住的请求的前缀已插进 host pool，但节点上没有锁；别的请求结束时的 `DUALPATH_PREFILL_CACHE_RELEASE` 会执行 `evict_host(1 << 60)`，清空所有未加锁的 host 节点。dynamic 里走 Decode path 的请求也在 Prefill 上结束，结束时刻与 Prefill 的预加载队列无关，所以更容易撞上这段空窗。单独 Prefill path 理论上也会遇到，只是空窗更短；单独 Decode path 不经过这条路径。
+- **修复**：第 4 节的 host 前缀保护，镜像 `-kvtrans-hostpin`（Job 646 构建）。每个请求只多两次引用计数操作。
+- 643–645 三组的计算和 TPOT 都高于 NVLINK 时期（Prefill 计算 0.38 s 对 0.31 s，TPOT 33.6–35.2 ms 对 30.7–32.7 ms），来自 `DUAL_PATH_NCCL_FORCE_NIC=1`，与此 bug 无关。

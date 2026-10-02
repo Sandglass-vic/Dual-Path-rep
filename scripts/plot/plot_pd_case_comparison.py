@@ -281,8 +281,8 @@ def main() -> None:
     )
     parser.add_argument("--name", default="pd-case-comparison")
     args = parser.parse_args()
-    if not 2 <= len(args.case) <= 4:
-        parser.error("pass between two and four --case JOB_ID TASK_NAME arguments")
+    if not 2 <= len(args.case) <= 6:
+        parser.error("pass between two and six --case JOB_ID TASK_NAME arguments")
     cases = [load_case(args.code_home, job_id, task) for job_id, task in args.case]
     output_dir = args.output_dir or args.code_home / "results" / "pd-case-comparison"
     output_dir.mkdir(parents=True, exist_ok=True)
