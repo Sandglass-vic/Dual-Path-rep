@@ -17,6 +17,9 @@ dualpath_export_common_env() {
   if [[ $DUAL_PATH_NCCL_FORCE_NIC == 1 ]]; then
     export NCCL_P2P_DISABLE=1 NCCL_SHM_DISABLE=1
   fi
+  # DUAL_PATH_VL_*: validated here, mapped to NCCL_IB_SL/MC_IB_SL per role in
+  # pd_prefill.sh / pd_decode.sh. See docs/vl-traffic-isolation.md.
+  dualpath_resolve_ib_vl || return 2
   export ENABLE_BENCHMARK_TIMING=1
   export DUALPATH_TTFT_TIMING=${DUALPATH_TTFT_TIMING:-1}
   export DUALPATH_TTFT_TIMING_DETAIL=${DUALPATH_TTFT_TIMING_DETAIL:-0}
@@ -337,6 +340,18 @@ Path(sys.argv[1]).write_text(json.dumps({
     ),
     "nccl_p2p_disable": os.environ.get("NCCL_P2P_DISABLE"),
     "nccl_shm_disable": os.environ.get("NCCL_SHM_DISABLE"),
+    "dual_path_vl": (
+        {
+            name.removeprefix("DUAL_PATH_VL_").lower(): int(os.environ[name])
+            for name in (
+                "DUAL_PATH_VL_P_NCCL", "DUAL_PATH_VL_D_NCCL",
+                "DUAL_PATH_VL_P2D", "DUAL_PATH_VL_D2P",
+                "DUAL_PATH_VL_P_NIC_H2D", "DUAL_PATH_VL_D_NIC_H2D",
+            )
+        }
+        if os.environ.get("DUAL_PATH_VL_ENABLED") == "1"
+        else None
+    ),
     "kv_buffer_semantics": (
         "DualPath paper: staging/GPU buffers released after each request; "
         "cross-turn reuse via L3 only. SGLang approximation: after successful "

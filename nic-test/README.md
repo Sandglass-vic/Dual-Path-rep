@@ -86,6 +86,55 @@ python3 nic-test/analyze_real_d2p.py $R/32k-a8-r1-decode-l3bps8g-nfsrdma-nic-str
 
 ---
 
+# VL 隔离对照（Job 649 / 650，2026-10-01）
+
+**结论：把 KV 流量放到另一条 VL，Decode 侧 D→P 的干扰几乎消失（30 倍 → 1.1 倍）；
+Prefill 侧和 NIC 回环 H2D 不受影响。**
+
+两组除 SL 以外完全相同：`DUAL_PATH_NCCL_FORCE_NIC=0`，场景 d2p 和 nic_h2d，
+档位 0/10/20/100%，每个 case 25 s。SM 未改动，当前 SL0 → VL0、SL1 → VL1，
+两条 VL 在 low 表里按 160:112 加权轮转，没有优先级
+（见 [docs/vl-traffic-isolation.md](../docs/vl-traffic-isolation.md) §4.5）。
+
+- Job 649（`results/649-allreduce-interference/`）：不设 SL，全部在 VL0。
+- Job 650（`results/650-allreduce-interference/`）：`PROBE_SL=0 TRAFFIC_SL=1`，TP4 探针在 VL0，Mooncake 流量在 VL1。
+
+平均通信时间倍数（相对同组 0% 负载）：
+
+| 方案 | 节点 | 10%：无 VL → 有 VL | 20% | 100%（跑满，约 20%～26%） |
+|---|---|---|---|---|
+| D→P | Decode（g6） | 1.97 → **1.06** | 30.6 → **1.11** | 32.2 → **1.12** |
+| D→P | Prefill（g5） | 1.58 → 1.51 | 3.91 → 3.77 | 4.09 → 3.58 |
+| NIC 回环 H2D | Decode | 1.38 → 1.39 | 2.17 → 2.21 | 3.72 → 3.90 |
+| NIC 回环 H2D | Prefill | 1.22 → 1.32 | 1.42 → 1.74 | 1.43 → 1.82 |
+
+两组的实际流量相同（D→P 约 20%、NIC 回环约 20%～26%），0% 基线也一致
+（Prefill 约 123 ms，Decode 约 7.7 ms）。
+
+解读：
+
+- **Decode 侧**：g6 的探针是跨 GPU 对的 NCCL（mlx5_0 → 交换机 → mlx5_4），和发往 g5
+  的 D→P 共用 g6 网卡的发送端口。D→P 在 g5 被 GPU PCIe 卡住，credit 反压传回 g6，
+  同一条 VL 上的 NCCL 被堵在后面。分到两条 VL 后各用各的 credit，干扰基本消失。
+  这证实了 627 中“Decode 慢 18～30 倍”来自 IB 层的 credit 反压。
+- **Prefill 侧**：g5 的 NCCL 和 D→P 都要写进 g5 的 GPU 显存，争用的是 GPU 的 Gen4
+  PCIe，VL 管不到这一段，倍数基本不变。
+- **NIC 回环 H2D**：不经过交换机，SL 对它没有帮助；Prefill 侧有 VL 时反而更慢
+  （1.43 → 1.82），原因未查明，可能是 HCA 内部对两条 VL 的调度，只跑了一次。
+- 本组只测了 `FORCE_NIC=0`。`=1` 时同一对 GPU 的 NCCL 也在 HCA 内部回环，是否受益
+  需要单独测。
+
+复现：
+
+```bash
+export DUAL_PATH_NCCL_FORCE_NIC=0 SCHEMES=d2p,nic_h2d LEVELS=0,10,20,100 \
+       CASE_SECONDS=25 EXTRA_ARGS="--measure-seconds 8"
+nic-test/run_allreduce_interference.sh                          # 无 VL
+PROBE_SL=0 TRAFFIC_SL=1 nic-test/run_allreduce_interference.sh  # 有 VL
+```
+
+---
+
 # KV 流量对 TP4 all-reduce 的干扰（g5/g6，CX8，无 VL QoS）
 
 测量 P→D RDMA、D→P RDMA、hicache H2D、NIC 回环 H2D 四类 KV 搬运流量，对同时进行的 TP4 通信的影响。有效数据：Job 627，2026-09-30，结果在 `results/627-allreduce-interference/`。
@@ -205,6 +254,7 @@ CASE_SECONDS=25 EXTRA_ARGS="--measure-seconds 8" nic-test/run_allreduce_interfer
 
 - 如果当前不在 Slurm 分配内，脚本会自己用 salloc 申请 g5、g6（`--exclusive`），全程约 20 分钟。
 - 可用环境变量 `SCHEMES`、`LEVELS`、`CASE_SECONDS`、`RESULT_DIR`、`DUAL_PATH_NCCL_FORCE_NIC`、`NCCL_DEBUG` 覆盖默认值。
+- `PROBE_SL` 设置 TP4 探针的 `NCCL_IB_SL`，`TRAFFIC_SL` 设置流量生成器的 `MC_IB_SL`（p2d、d2p、nic_h2d），取值 0～3，默认 -1 表示不设（SL0）。每个节点的取值记录在 `node<N>-config.json`。
 - 镜像使用 nich2d 版本：`sglang:26.01-py3-mooncake0.3.13.post1-dualpath-patched-l3bps-20260929-nich2d.sqsh`。
 - 依赖 `io-test/` 下的 `capture_path_counters.py` 和 `cluster_barrier.py`。
 
@@ -217,8 +267,11 @@ CASE_SECONDS=25 EXTRA_ARGS="--measure-seconds 8" nic-test/run_allreduce_interfer
 | `plot_allreduce_interference.py` | 生成 `interference.svg`、`summary.json`、`REPORT.md` |
 | `d2p_forward_bench.py`、`run_d2p_forward.sh`、`plot_d2p_forward.py` | D→P 对完整 forward 的影响（Job 635） |
 | `analyze_real_d2p.py` | 从真实运行的服务端日志和客户端结果重建时间线，检查 D→P 干扰 |
+| `summarize_vl_pd.py` | 按 Job 汇总 D→P / NIC H2D 的 TTFT 占比、占空比，以及 D→P 干扰折算到 JCT 的比例（结果见 `docs/vl-traffic-isolation.md` §6.1） |
+| `plot_vl_report.py` | 生成 `docs/vl_report.md` 用的三张图（`docs/figures/vl-report-*.{svg,png}`） |
 | `results/635-d2p-forward/` | D→P 对完整 forward 的结果；`635-d2p-forward-cal-t2`、`-t4` 和 `632-d2p-forward-cal-t1` 是不同线程数的最大速率校准；`632-d2p-forward-cal-t2`、`-t4` 是挂死作业的残留，作废 |
 | `results/627-allreduce-interference/` | 有效的完整矩阵结果 |
+| `results/649-allreduce-interference/`、`results/650-allreduce-interference/` | VL 隔离对照：无 VL / 探针 VL0 + 流量 VL1 |
 | `results/630-allreduce-interference-warmup-quick/` | 加入探针 warmup 后的 0%/100% 快速测试，基线正常 |
 | `results/631-tp4-net-only-baseline/` | `DUAL_PATH_NCCL_FORCE_NIC=1` 的无负载基线，附 `NCCL_DEBUG=INFO` 日志 |
 | `results/627-allreduce-interference-smoke/` | 截断逻辑的冒烟测试（D→P、NIC 回环 H2D，0% 和 20%） |

@@ -33,6 +33,7 @@
 25. [NIC 完成 H2D/D2H](nic-h2d.md)：`DUAL_PATH_CUDAMEMCPY=hicache|nic` 开关设计、mini bench 与实测。
 26. [前缀 KV 加载形态](kvtrans-mode.md)：`DUAL_PATH_KVTRANS=layer|full`（运行脚本默认 `full`），两条路径的逐层重叠与整块加载：实现、防死锁设计、控制 socket 锁修复与 Job 638–641 实测。
 27. [NCCL 路由控制](nccl-control.md)：`DUAL_PATH_NCCL_FORCE_NIC=1|0`（默认 1），TP 内 NCCL 全部走 CX8 或允许走 NVLink，以及验证方法。
+28. [VL 实验总结（汇报版）](vl_report.md)：nic-test 与 Job 651–675 端到端对照的结论、数据和图。
 
 ## 信息唯一来源
 

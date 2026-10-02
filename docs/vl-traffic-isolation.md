@@ -128,10 +128,10 @@ VL 仲裁发生在 IB **输出端口**：只有当报文在某个端口排队、
 | 类别 | 具体流量 | 端口 | 标记方式 | SL | VL | 仲裁 |
 |---|---|---|---|---:|---:|---|
 | 默认 / 控制 | IPoIB（Gloo、NCCL bootstrap、Harbor、SSH）、y2、Twin VM 的 SR-IOV VF（`.21–.24`）、SA/CM | `ibs3` 等 | SM 组播组默认 SL | 0 | 0 | high + low |
-| 模型执行 | 跨节点 NCCL；节点内跨对 NCCL（默认即走 NET/IB，§4.4） | `mlx5_0/4` | `NCCL_IB_SL=1` | 1 | 1 | high + low |
-| KV-Cache | Mooncake PD 传输、DE→PE 层级传输、CNIC 辅助 H2D/D2H | `mlx5_0/4` | `MC_IB_SL=2`；自研 QP 设 `ah_attr.sl=2` | 2 | 2 | **low only** |
+| 模型执行 | TP 内 NCCL（`DUAL_PATH_NCCL_FORCE_NIC=1` 时全部走 NET/IB，§4.4） | `mlx5_0/4` | `DUAL_PATH_VL_P_NCCL=1`、`DUAL_PATH_VL_D_NCCL=1` | 1 | 1 | high + low |
+| KV-Cache | P→D、D→P、NIC H2D/D2H | `mlx5_0/4` | `DUAL_PATH_VL_P2D=2`、`DUAL_PATH_VL_D2P=2`（§4.5） | 2 | 2 | **low only** |
 | 预留 | — | — | — | 3 | 3 | high + low |
-| 存储 | NFS / KV L3 读写 | CX7 `ibs4`（独立子网，已是现状） | — | — | — | — |
+| 存储 | NFS/RDMA（KV L3 读写） | CX7 `mlx5_1`（独立子网，已是现状） | — | — | — | — |
 | SM | SMP MAD | 全部 | — | — | 15 | — |
 
 保持 SL0 → VL0 并留在 high 表中，是为了让 y2、VF 和 IPoIB 的默认流量不受影响。
@@ -160,14 +160,14 @@ CX7 子网（SM 在 `h3`，LID 7）是多台主机共用的存储网，不在本
 
 ### 4.3 存储流量
 
-g6 的 `/data` 已经经 CX7（`192.168.11.5`）挂载，相当于论文里的 SNIC，VL 方案
-不需要为存储做任何改动。CX7 子网里只有存储流量，也不需要 QoS。
+g6 的 KV cache 自 2026-09-29 起走 NFS/RDMA（`/mnt/nfsrdma`，
+`192.168.11.5:/data`，`vers=3,proto=rdma,port=20049`，见 [pza100 环境](pza100.md)），
+仍在 CX7 上，相当于论文里的 SNIC。VL 方案不需要为存储做任何改动。
 
 仍需注意：
 
-- g5 上的 NFS 连接只有一条 TCP，说明仍是 `nconnect=1`，
-  [pza100 环境](pza100.md) 中记录的单连接瓶颈依然存在；改 `nconnect` 是独立变量，
-  对比实验中要单独控制。
+- CX7 子网由多台主机共用（SM 在 `h3`），其他主机的流量不受本方案控制。
+- L3 读带宽由 `DUALPATH_L3_READ_BPS` 软件限速决定，存储侧已经相当于做了整形。
 - CX7 位于 NUMA 1/3，而 GPU 在 NUMA 0/2，Host staging buffer 的 NUMA 绑定需要
   一起评估。
 - g5 本机读 L3 直接走本地 NVMe，不经过任何网卡；只有 g6 的读写经过 CX7。
@@ -176,9 +176,9 @@ g6 的 `/data` 已经经 CX7（`192.168.11.5`）挂载，相当于论文里的 S
 
 | 流量 | 现状 | 让它进入 VL 体系的办法 |
 |---|---|---|
-| NVLink 对内 NCCL（GPU0↔1、GPU2↔3） | NVLink | 不占 PCIe，本来就不冲突 |
-| 跨对 NCCL（GPU0↔2 等） | 默认即走 `NET/IB` GDRDMA（`mlx5_0`→交换机→`mlx5_4`） | 设置 `NCCL_IB_SL=1` 即可纳入 VL；也可以改用 TP2（NVLink 对）× DP2，让 NCCL 完全不占网卡，但 32B 模型在 2 × 40 GB 上显存很紧 |
-| HiCache H2D/D2H | `--hicache-io-backend direct`：`cudaMemcpyAsync`，走拷贝引擎 | 开关 `DUAL_PATH_CUDAMEMCPY=nic`：经配对 NIC 的 RDMA 回环，SL 取 `DUAL_PATH_NIC_SL=2`；设计与 mini bench 见 [nic-h2d.md](nic-h2d.md) |
+| 同一对 GPU 的 NCCL（GPU0↔1、GPU2↔3） | PD 脚本默认 `DUAL_PATH_NCCL_FORCE_NIC=1`：在 HCA 内部回环，不经过交换机（[nccl-control.md](nccl-control.md)）；`=0` 时走 NVLink | `DUAL_PATH_VL_P_NCCL` / `DUAL_PATH_VL_D_NCCL` 能设上 SL，但回环是否经过 HCA 端口的 VL 仲裁未验证 |
+| 跨对 NCCL（GPU0↔2 等） | 两种模式都走 `NET/IB` GDRDMA（`mlx5_0`→交换机→`mlx5_4`） | `DUAL_PATH_VL_P_NCCL` / `DUAL_PATH_VL_D_NCCL`；也可以改用 TP2（NVLink 对）× DP2，让 NCCL 完全不占网卡，但 32B 模型在 2 × 40 GB 上显存很紧 |
+| HiCache H2D/D2H | 默认 `hicache`：`cudaMemcpyAsync`，走拷贝引擎 | `DUAL_PATH_CUDAMEMCPY=nic`：经配对 NIC 的 RDMA 回环，SL 与同进程的 PD 传输相同（§4.5）；见 [nic-h2d.md](nic-h2d.md) |
 
 2026-09-29 在 g5 上用 `scripts/smoke/nccl_tp4_path_probe.py` 实测（镜像
 `sglang:26.01-py3`，NCCL 2.29.2，环境变量与 PD 脚本相同）。日志位于
@@ -205,34 +205,185 @@ PIX 网卡的路径优于 SYS。由于两块 CX8 的 LID 不同，这些报文�
 
 ### 4.5 应用侧环境变量
 
-在 `dualpath_export_common_env`（`scripts/tests/runtime/pd_benchmark_lib.sh`）中
-按开关注入：
+每条路径一个开关，取值 0–3。按 `opensm-qos-dualpath.conf` 配置 SM 后 SL0–3 →
+VL0–3，取值同时是 SL 和 VL 编号。
+
+当前 SM 的实际配置（探查 `results/ib-qos-probe/g5-20260929-015024` 与
+`g5-20260930-235715` 一致，CX8 全部平面端口和 Q3400 端口相同）：OperVLs 为 VL0–1；
+SL2VL 为 SL0 → VL0、SL1–7 → VL1、SL8–15 → VL15（会被丢弃）；low 表 VL0:0xA0、
+VL1:0x70，high 表为空，VLHighLimit 为 0。也就是说，现在 SL1、2、3 都落在 VL1，
+和 VL0 按 160:112 做加权轮转，没有严格优先级。不改 SM 就能做的隔离只有“两类流量
+分到 VL0 和 VL1、各用各的缓冲和 credit”。
+
+| 开关 | 流量 | 数据由谁发出 | 生效方式 |
+|---|---|---|---|
+| `DUAL_PATH_VL_P_NCCL` | Prefill 的 TP 内 NCCL（g5 节点内） | Prefill 进程 | `pd_prefill.sh` 导出 `NCCL_IB_SL` |
+| `DUAL_PATH_VL_D_NCCL` | Decode 的 TP 内 NCCL（g6 节点内） | Decode 进程 | `pd_decode.sh` 导出 `NCCL_IB_SL` |
+| `DUAL_PATH_VL_P2D` | P→D RDMA 写 | Prefill 进程 | `pd_prefill.sh` 导出 `MC_IB_SL` |
+| `DUAL_PATH_VL_D2P` | D→P RDMA 写（Decode path） | Decode 进程 | `pd_decode.sh` 导出 `MC_IB_SL` |
+| `DUAL_PATH_VL_P_NIC_H2D` | Prefill 的 NIC H2D/D2H | Prefill 进程 | 必须等于 `P2D`，不设时取 `P2D` 的值 |
+| `DUAL_PATH_VL_D_NIC_H2D` | Decode 的 NIC H2D/D2H | Decode 进程 | 必须等于 `D2P`，不设时取 `D2P` 的值 |
+
+规则：
+
+- 六个都不设时不导出任何变量，所有 QP 都在 SL0，与之前的实验完全相同。
+- 只要设了其中一个，就进入 QoS 模式：没设的 `P_NCCL`、`D_NCCL`、`P2D`、`D2P` 取 0，
+  不会从别的开关继承。
+- 旧的 `DUAL_PATH_VL_NCCL` 已删除，设置它会直接报错。TP4 的 NCCL 只在节点内，
+  Prefill 的只在 g5、Decode 的只在 g6，所以按角色分开设置没有歧义。
+- 只接受 0–3。SL 一旦映射到没有启用的 VL，报文会被直接丢弃，表现为传输卡死。
+- 校验在 `dualpath_export_common_env` 中完成，配置错误时服务器不会启动。
+  导出由 `pd_network_config.sh` 的 `dualpath_apply_ib_vl` 按角色完成，启动日志里
+  会打印一行 `IB VL: role=... NCCL_IB_SL=... MC_IB_SL=...`。
+- 结果元数据的 `dual_path_vl` 字段记录六个值，未启用时为 `null`。
+
+为什么 RDMA 写能按方向分开：RDMA WRITE 的数据包使用发起方 QP 的 SL。Mooncake 的
+被动端用自己进程的配置建立 QP，反方向发送时也复用这个 endpoint。因此 P→D 的 SL
+由 Prefill 进程决定，D→P 的由 Decode 进程决定，对端 ACK 用的是对端的 SL。
+
+为什么 NIC H2D 暂时不能单独设置：Mooncake 0.3.13.post1 通过 `std::call_once` 在每个
+进程里只读一次 `MC_IB_SL`，建立连接（进入 RTR）时写入 QP。同一进程里的 PD 引擎和
+NIC H2D 引擎只能拿到同一个 SL。镜像里没有重编 Mooncake 所需的 cmake 和 glog。
+以后如果要分开，保留的方案是一个 `LD_PRELOAD` 垫片，拦截 Mooncake `engine.so` 对
+`ibv_modify_qp` 的 RTR 调用，对本卡回环 QP（`dlid` 等于本端口 LID）改写 SL。
+
+当前 SM（2 条 VL）下的取值：NCCL 留在 VL0，KV 放到 VL1。两类流量各用各的缓冲和
+credit，D→P 被 GPU PCIe 卡住时不会再堵住 NCCL；但 160:112 的加权轮转没有优先级。
 
 ```bash
-if [[ ${DUALPATH_IB_QOS:-0} == 1 ]]; then
-  export NCCL_IB_SL=${NCCL_IB_SL:-1}
-  export MC_IB_SL=${MC_IB_SL:-2}
-fi
+DUAL_PATH_VL_P_NCCL=0 DUAL_PATH_VL_D_NCCL=0 DUAL_PATH_VL_P2D=1 DUAL_PATH_VL_D2P=1 \
+  scripts/pd_benchmark.sh ...
 ```
 
-默认关闭，以免在 SM 配置确认前改变现有实验。开启 QoS 的 run 需要在结果元数据中
-记录 `DUALPATH_IB_QOS`、`NCCL_IB_SL`、`MC_IB_SL` 和 SM 配置版本。
+按 `opensm-qos-dualpath.conf` 启用 4 条 VL 后的取值（与论文的分类一致）：
+
+```bash
+DUAL_PATH_VL_P_NCCL=1 DUAL_PATH_VL_D_NCCL=1 DUAL_PATH_VL_P2D=2 DUAL_PATH_VL_D2P=2 \
+  scripts/pd_benchmark.sh ...
+```
+
+想单独观察 D→P 时可以设 `DUAL_PATH_VL_D2P=3`。VL3 在 high 表里，只适合做对照实验。
 
 ## 5. 分阶段实施
 
 | 阶段 | 内容 | 需要 | 风险 |
 |---|---|---|---|
 | 0 探查 | 两节点分别 `sudo bash scripts/infra/ib_qos_probe.sh`；结果写入 `results/ib-qos-probe/` | root | 只读 |
-| 1 打标 | 确认当前 SL2VL 中 SL1/2 映射到运行中的 VL 后，开启 `DUALPATH_IB_QOS=1`，用 `perfquery -X/-S`（按 SL 的收发计数）确认 NCCL 和 Mooncake 分别计入 SL1 和 SL2 | 无 SM 改动 | 若 SL1/2 指向非运行 VL，报文会被丢弃，必须先看阶段 0 的结果 |
-| 2 存储分离 | 已是现状：g6 经 `ibs4`（CX7）挂载（§4.3） | — | — |
+| 1 打标 | 确认当前 SL2VL 中 SL1/2 映射到运行中的 VL 后，设置 `DUAL_PATH_VL_*`（§4.5），用 `perfquery -X/-S`（按 SL 的收发计数）确认 NCCL 和 Mooncake 分别计入预期的 SL | 已实现，无 SM 改动 | 若 SL 指向非运行 VL，报文会被丢弃，必须先看阶段 0 的结果 |
+| 2 存储分离 | 已完成：g6 经 CX7 挂载 NFS/RDMA（§4.3） | — | — |
 | 3 SM QoS | 合并 `opensm-qos-dualpath.conf`，复查全部相关端口的表 | SM 管理权限、与朋志协调 | 共享子网；OperVLs 变化可能导致断链 |
-| 4 节点内 | 在 §4.4 的 A/B 中选一个；实现或评估 CNIC 辅助的 H2D | 代码 | 性能回退需要量化 |
-| 5 验证 | 按 §6 的实验矩阵 | g6 恢复可调度 | — |
+| 4 节点内 | NIC H2D 已实现（[nic-h2d.md](nic-h2d.md)）；待验证 HCA 内部回环是否经过 VL 仲裁 | 实验 | 回环不受保护时只能靠限速 |
+| 5 验证 | 按 §6 的实验矩阵 | — | — |
 
-回滚顺序：先取消 `DUALPATH_IB_QOS`（立即生效，所有流量回到 SL0/VL0，而 VL0 在
-high 表里），再按需恢复 SM 的原配置文件。
+回滚顺序：先去掉所有 `DUAL_PATH_VL_*`（下一次启动即生效，所有流量回到 SL0/VL0，
+而 VL0 在 high 表里），再按需恢复 SM 的原配置文件。
 
 ## 6. 验证实验
+
+### 6.0 已完成：当前 2 条 VL 下的 TP4 干扰对照（Job 649 / 650）
+
+不改 SM，TP4 探针放在 VL0、Mooncake 流量放在 VL1（`FORCE_NIC=0`），与全部在 VL0
+对比。详细数据见 [nic-test/README.md](../nic-test/README.md) 的“VL 隔离对照”：
+
+| 干扰流量 | 受影响的一侧 | 无 VL | 有 VL |
+|---|---|---|---|
+| D→P 跑满 | Decode（g6，跨对 NCCL 与 D→P 共用发送端口） | 32.2 倍 | **1.12 倍** |
+| D→P 跑满 | Prefill（g5，NCCL 与 D→P 争用同一块 GPU 的 PCIe） | 4.09 倍 | 3.58 倍 |
+| NIC 回环 H2D 跑满 | Decode / Prefill | 3.72 / 1.43 倍 | 3.90 / 1.82 倍 |
+
+- credit 反压造成的队头阻塞，两条 VL 就能解决，不需要严格优先级。
+- GPU PCIe 上的争用和 HCA 内部回环，VL 都管不到，只能靠限速或调度来避开。
+
+### 6.1 已完成：端到端 1P1D 对照（Job 651–675）
+
+结论：VL 能消除 D→P 对 decode step 的拖慢，但这种干扰本来就只在 D→P 传输的
+几十毫秒内出现，摊到 JCT 上不到 1%，所以 VL 基本不改变 JCT。原因如下：
+
+- D→P 和 NIC H2D 都是单次突发（每次 55–80 ms / 75–150 ms），都处在发起请求自己的
+  TTFT 关键路径上，只占该请求 TTFT 的 0.6–5.4%。
+- `KVTRANS=full` 下，请求自己的 forward 不会和自己的 D→P、H2D 重叠；能被干扰的
+  只有恰好同时在跑的其他请求，干扰也只持续一个传输窗口。
+- D→P 的时间占空比只有 2.6–8.3%，6.5–13.4% 的 decode step 会与它重叠。无 VL 时，
+  这些 step 每步多 3–11 ms，折算到每个 agent 上只占 JCT 的 0.16–0.86%。
+
+配置：TP4、32K、`KVTRANS=full`、L3 限速 8 GB/s、NFS/RDMA、NIC H2D stream，
+hostpin 镜像。VL 配置为 `P_NCCL=D_NCCL=0`、`P2D=D2P=P_NIC_H2D=D_NIC_H2D=1`。
+651–663 使用默认 32K 数据集（cache hit 0.88），664–675 使用从 trace 255 起的
+94 turns 数据集（cache hit 0.95）。JCT 取最慢轨迹的完成时间。每个点只跑了 1 次。
+
+表中列的含义：
+
+- D→P、D 侧 H2D：每个请求在最慢 TP rank 上的耗时，括号内为占平均 TTFT 的比例。
+- 占空比：D→P 窗口并集占整个 run 时长的比例。
+- 重叠 step：与其他请求 D→P 窗口重叠的 decode step（ITL）的占比，以及它们相对
+  同一 run 中不重叠 step 的平均多出耗时。
+- 折算：这些多出耗时的总和除以 agent 数，再除以 JCT。
+
+| Job | 路径 | agents | VL | JCT (s) | TTFT (s) | D→P | D 侧 H2D | 占空比 | 重叠 step | 折算 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 651 | decode | 8 | off | 290.6 | 2.61 | 69 ms (2.7%) | 101 ms (3.9%) | 4.0% | 6.5%，+4.4 ms | 0.53% |
+| 652 | decode | 8 | on | 286.4 | 2.66 | 69 ms (2.6%) | 102 ms (3.8%) | 4.5% | 6.7%，+0.8 ms | 0.10% |
+| 655 | dynamic | 8 | off | 273.8 | 1.94 | 78 ms (4.0%) | 102 ms (5.2%) | 2.6% | 3.3%，+10.2 ms | 0.68% |
+| 656 | dynamic | 8 | on | 270.2 | 1.90 | 78 ms (4.1%) | 103 ms (5.4%) | 2.7% | 3.7%，+1.7 ms | 0.13% |
+| 658 | decode | 16 | off | 481.4 | 7.75 | 70 ms (0.9%) | 105 ms (1.4%) | 5.5% | 9.1%，+3.6 ms | 0.37% |
+| 659 | decode | 16 | on | 467.5 | 7.26 | 68 ms (0.9%) | 104 ms (1.4%) | 5.5% | 9.7%，−0.4 ms | 0 |
+| 662 | dynamic | 16 | off | 425.3 | 5.42 | 75 ms (1.4%) | 107 ms (2.0%) | 3.3% | 4.8%，+4.7 ms | 0.30% |
+| 663 | dynamic | 16 | on | 419.9 | 5.12 | 78 ms (1.5%) | 107 ms (2.1%) | 3.4% | 5.6%，−1.4 ms | 0 |
+| 666 | decode | 8 | off | 536.7 | 4.32 | 59 ms (1.4%) | 76 ms (1.8%) | 7.7% | 10.0%，+3.4 ms | 0.29% |
+| 669 | decode | 8 | on | 535.2 | 4.34 | 57 ms (1.3%) | 76 ms (1.8%) | 7.5% | 10.5%，−0.1 ms | 0 |
+| 665 | dynamic | 8 | off | 321.0 | 1.80 | 58 ms (3.2%) | 84 ms (4.7%) | 6.1% | 8.2%，+4.7 ms | 0.53% |
+| 668 | dynamic | 8 | on | 312.8 | 1.73 | 59 ms (3.4%) | 85 ms (4.9%) | 6.3% | 9.7%，−0.8 ms | 0 |
+| 672 | decode | 16 | off | 1111.7 | 10.33 | 63 ms (0.6%) | 81 ms (0.8%) | 8.3% | 12.6%，+3.1 ms | 0.16% |
+| 675 | decode | 16 | on | 1029.3 | 9.49 | 57 ms (0.6%) | 78 ms (0.8%) | 8.1% | 13.4%，+0.1 ms | 0.01% |
+| 671 | dynamic | 16 | off | 640.8* | 3.75 | 60 ms (1.6%) | 85 ms (2.3%) | 6.6% | 11.2%，+10.9 ms | 0.86% |
+| 674 | dynamic | 16 | on | 563.6 | 4.12 | 59 ms (1.4%) | 85 ms (2.1%) | 7.3% | 12.8%，+4.5 ms | 0.46% |
+
+\* 671 中轨迹 `32k-0256` 第 43 轮卡在 Prefill bootstrap，客户端等满 300 s 超时后
+重试，JCT 因此多出 300 s。这一对不能用于比较 JCT。
+
+Dynamic 路径上，Prefill 侧还有一次 NIC H2D，每次 105–151 ms，与 Decode 侧的 H2D
+一样只出现在发起请求自己的 TTFT 里。
+
+**VL 改变了什么。** 在所有 8 对中，与 D→P 重叠的 decode step 多出的耗时从
++3.1–10.9 ms 降到约 0（只有 674 剩 +4.5 ms）。>60 ms 的长 step 也明显减少：
+Decode 路径从 1.2–7.3% 降到 0.03–1.9%，Dynamic 路径从 11.8–13.3% 降到
+2.1–4.3%（统计方法见 `nic-test/analyze_real_d2p.py`）。这与 Job 650 中“D→P
+跑满时 Decode 的 32 倍拖慢降到 1.12 倍”是同一个机制。
+
+**VL 没有改变什么。**
+
+- D→P 自身的耗时不变（瓶颈是 g5 GPU 的 PCIe 写入），NIC H2D 的耗时也不变
+  （HCA 内部回环，见 §6.0）。
+- 被 D→P 重叠的 Prefill forward 只有 3–53 个，每 token 耗时与不重叠的 forward
+  相同。
+
+**JCT 的变化在噪声范围内。** 按机制估算，VL 能省下的 JCT 是上表“折算”列中
+off 与 on 的差值，在 0.15–0.64% 之间。实际测得的 JCT 变化（VL 相对 off）如下：
+
+| 路径 | 651 系列 a8 | 651 系列 a16 | trace255 a8 | trace255 a16 |
+|---|---|---|---|---|
+| decode | −1.4% | −2.9% | −0.3% | −7.4% |
+| dynamic | −1.3% | −1.3% | −2.6% | 不可比（671 有 300 s 卡顿） |
+| prefill（没有 D→P） | +0.9% / +2.5%（653 对 654 / 657） | +4.4% | 0.0% | −2.6% |
+
+完全没有 D→P 的 Prefill 路径，单次 run 之间也有 −2.6% 到 +4.4% 的波动，Decode
+和 Dynamic 的大多数差值都落在这个范围内。
+
+672 对 675 的 −7.4% 超出了这个范围，但不是 D→P 干扰造成的：两次 run 的 L3 读取
+总耗时都是 710 s（串行），JCT 的差值等于读取之间空闲时间的差值。这个空闲主要
+发生在“下一个请求已到达，但还没进入 L3 读取队列”这一段，p50 分别为 223 ms 和
+150 ms。其中只有约 11 ms 能用 VL 解释（最慢 rank 的 D→P 少 6 ms，rank 间偏差少
+5 ms），其余部分目前没有打点，原因待查。
+
+复现：
+
+```bash
+cd nic-test
+python3 summarize_vl_pd.py 651 652 655 656 658 659 662 663 666 669 665 668 672 675 671 674
+python3 analyze_real_d2p.py <run_dir> <decode-0.log> --prefill-log <prefill-0.log> --baseline <prefill-path run_dir>
+```
+
+### 6.2 待做的 perftest 矩阵
 
 所有 perftest 在 g5 → g6 之间运行，OOB 走 `ibs3`；每个实验分别在 QoS 关闭和开启
 两种状态下各跑一次。

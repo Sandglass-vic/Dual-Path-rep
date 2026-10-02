@@ -22,6 +22,7 @@ DECODE_OFFLOAD_KVCACHE=${DECODE_OFFLOAD_KVCACHE:-${ENABLE_HICACHE_L3:-0}}
 if [[ "$PD_TRANSFER_BACKEND" == mooncake || "$HICACHE_STORAGE_BACKEND" == mooncake ]]; then
   dualpath_validate_ib_devices
 fi
+dualpath_apply_ib_vl decode
 if [[ -n ${DECODE_ID:-} ]]; then
   DECODE_LOG="$LOG_DIR/decode-$DECODE_ID.log"
 else

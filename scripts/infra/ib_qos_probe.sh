@@ -91,7 +91,8 @@ done
 
 for ca in $CA_PORTS; do
   [[ -e /sys/class/infiniband/$ca/device ]] || continue
-  run "$ca-mlxconfig" mlxconfig -d "$ca" -e q
+  # mlxconfig segfaults on SMI sub-devices; query the parent HCA instead.
+  [[ $ca == smi* ]] || run "$ca-mlxconfig" mlxconfig -d "$ca" -e q
 done
 
 if [[ -n ${SUDO_UID:-} ]]; then

@@ -99,6 +99,8 @@ def probe_rank(rank: int, node: int, args, cases, barriers, release, results) ->
     bind_numa(rank)
     torch.cuda.set_device(rank)
     os.environ.update(MASTER_ADDR="127.0.0.1", MASTER_PORT=str(args.probe_port))
+    if args.probe_sl >= 0:
+        os.environ["NCCL_IB_SL"] = str(args.probe_sl)
     dist.init_process_group("nccl", rank=rank, world_size=4, device_id=torch.device("cuda", rank))
     role = ROLE[node]
     tokens = args.prefill_tokens if role == "prefill" else args.decode_batch
@@ -205,6 +207,9 @@ def probe_rank(rank: int, node: int, args, cases, barriers, release, results) ->
 # ----------------------------------------------------------------- generator
 class Generator:
     def __init__(self, gpu: int, node: int, args):
+        # Mooncake reads MC_IB_SL once per process, on first use of its config.
+        if args.traffic_sl >= 0:
+            os.environ["MC_IB_SL"] = str(args.traffic_sl)
         import torch
         from mooncake.engine import TransferEngine
 
@@ -367,6 +372,10 @@ def main() -> int:
     parser.add_argument("--buffer-bytes", type=int, default=512 << 20)
     parser.add_argument("--probe-port", type=int, default=29651)
     parser.add_argument("--barrier-port", type=int, default=29661)
+    parser.add_argument("--probe-sl", type=int, default=-1, choices=range(-1, 4),
+                        help="NCCL_IB_SL for the TP4 probes; -1 leaves NCCL's default (SL0)")
+    parser.add_argument("--traffic-sl", type=int, default=-1, choices=range(-1, 4),
+                        help="MC_IB_SL for the Mooncake generators (p2d, d2p, nic_h2d); -1 = SL0")
     args = parser.parse_args()
     args.schemes = [s for s in args.schemes.split(",") if s]
     args.levels = [int(v) for v in args.levels.split(",") if v]
@@ -374,6 +383,10 @@ def main() -> int:
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     cases = build_cases(args)
+    config = {"node": node, "probe_sl": args.probe_sl, "traffic_sl": args.traffic_sl,
+              "nccl_p2p_disable": os.environ.get("NCCL_P2P_DISABLE")}
+    (out / f"node{node}-config.json").write_text(json.dumps(config, sort_keys=True) + "\n")
+    print(f"node {node} config {json.dumps(config, sort_keys=True)}", flush=True)
 
     ctx = mp.get_context("spawn")
     # barriers[0]: every child initialized; barriers[1]: release instant published.

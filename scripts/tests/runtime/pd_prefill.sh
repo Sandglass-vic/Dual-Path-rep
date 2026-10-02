@@ -28,6 +28,7 @@ DISABLE_OVERLAP_SCHEDULE=${DISABLE_OVERLAP_SCHEDULE:-0}
 if [[ "$PD_TRANSFER_BACKEND" == mooncake || "$HICACHE_STORAGE_BACKEND" == mooncake ]]; then
   dualpath_validate_ib_devices
 fi
+dualpath_apply_ib_vl prefill
 if [[ -n ${PREFILL_ID:-} ]]; then
   PREFILL_LOG="$LOG_DIR/prefill-$PREFILL_ID.log"
 else
